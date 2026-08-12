@@ -446,7 +446,7 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 				#[cfg(feature = "katmos_slow_decompression")]
 				{
 					const DECOMP_REMOVE_RATIO: f32 = 4_f32;
-					cur_mixture.clear_vol((_average_moles / DECOMP_REMOVE_RATIO).abs());
+					cur_mixture.clear_moles((_average_moles / DECOMP_REMOVE_RATIO).abs());
 				}
 				let mut byond_turf = ByondValue::new_ref(ValueType::Turf, cur_mixture.id);
 				if byondapi::map::byond_locatein(&byond_turf, &hpd)?.is_null() {

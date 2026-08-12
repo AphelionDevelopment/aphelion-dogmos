@@ -140,6 +140,23 @@ pub struct GasType {
 	pub fire_products: Option<FireProductInfo>,
 }
 
+/// Reads a numeric gas property that the DM side may not declare at all.
+///
+/// `byond_string!` resolves a literal against BYOND's string tree and panics if it is not there,
+/// which for an optional property is the normal case - a codebase that never writes
+/// "oxidation_temperature" anywhere has no such string. Since the crate is built with
+/// `panic = "abort"`, that took the whole game down instead of leaving the field unset.
+fn read_optional_number(gas: &ByondValue, name: &str) -> Option<f32> {
+	let string_id = byondapi::byond_string::str_id_of(name).ok()?;
+	gas.read_number_id(string_id).ok()
+}
+
+/// As `read_optional_number`, for properties that are not numbers.
+fn read_optional_var(gas: &ByondValue, name: &str) -> Option<ByondValue> {
+	let string_id = byondapi::byond_string::str_id_of(name).ok()?;
+	gas.read_var_id(string_id).ok()
+}
+
 impl GasType {
 	// This absolute monster is what you want to override to add or remove certain gas properties, based on what a gas datum has.
 	fn new(gas: &ByondValue, idx: GasIDX) -> Result<Self> {
@@ -147,35 +164,26 @@ impl GasType {
 			idx,
 			id: gas.read_string_id(byond_string!("id"))?.into_boxed_str(),
 			name: gas.read_string_id(byond_string!("name"))?.into_boxed_str(),
-			flags: gas
-				.read_number_id(byond_string!("flags"))
-				.unwrap_or_default() as u32,
+			flags: read_optional_number(gas, "flags").unwrap_or_default() as u32,
 			specific_heat: gas.read_number_id(byond_string!("specific_heat"))?,
-			fusion_power: gas
-				.read_number_id(byond_string!("fusion_power"))
-				.unwrap_or_default(),
-			moles_visible: gas.read_number_id(byond_string!("moles_visible")).ok(),
+			fusion_power: read_optional_number(gas, "fusion_power").unwrap_or_default(),
+			moles_visible: read_optional_number(gas, "moles_visible"),
 			fire_info: {
-				if let Ok(temperature) = gas.read_number_id(byond_string!("oxidation_temperature"))
-				{
+				if let Some(temperature) = read_optional_number(gas, "oxidation_temperature") {
 					FireInfo::Oxidation(OxidationInfo {
 						temperature,
-						power: gas.read_number_id(byond_string!("oxidation_rate"))?,
+						power: read_optional_number(gas, "oxidation_rate").unwrap_or_default(),
 					})
-				} else if let Ok(temperature) =
-					gas.read_number_id(byond_string!("fire_temperature"))
-				{
+				} else if let Some(temperature) = read_optional_number(gas, "fire_temperature") {
 					FireInfo::Fuel(FuelInfo {
 						temperature,
-						burn_rate: gas.read_number_id(byond_string!("fire_burn_rate"))?,
+						burn_rate: read_optional_number(gas, "fire_burn_rate").unwrap_or_default(),
 					})
 				} else {
 					FireInfo::None
 				}
 			},
-			fire_products: gas
-				.read_var_id(byond_string!("fire_products"))
-				.ok()
+			fire_products: read_optional_var(gas, "fire_products")
 				.and_then(|product_info| {
 					if product_info.is_list() {
 						Some(FireProductInfo::Generic(
@@ -197,11 +205,8 @@ impl GasType {
 						None
 					}
 				}),
-			enthalpy: gas
-				.read_number_id(byond_string!("enthalpy"))
-				.unwrap_or_default(),
-			fire_radiation_released: gas
-				.read_number_id(byond_string!("fire_radiation_released"))
+			enthalpy: read_optional_number(gas, "enthalpy").unwrap_or_default(),
+			fire_radiation_released: read_optional_number(gas, "fire_radiation_released")
 				.unwrap_or_default(),
 		})
 	}
@@ -286,10 +291,13 @@ fn hook_init(gas_data: ByondValue) -> Result<ByondValue> {
 }
 
 fn get_reaction_info() -> BTreeMap<ReactionPriority, Reaction> {
+	// Meridian: SSair.gas_reactions is a nested assoc list (gas id -> per-priority-group lists) in
+	// modern /tg/, which is not iterable as a flat list of reaction datums. DM builds a separate
+	// flat, unique-priority list for us instead. See code/modules/atmospherics/gasmixtures/reactions.dm.
 	let gas_reactions = ByondValue::new_global_ref()
 		.read_var_id(byond_string!("SSair"))
 		.unwrap()
-		.read_var_id(byond_string!("gas_reactions"))
+		.read_var_id(byond_string!("dogmos_reactions"))
 		.unwrap();
 	let mut reaction_cache: BTreeMap<ReactionPriority, Reaction> = Default::default();
 	let sender = byond_callback_sender();
