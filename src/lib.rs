@@ -97,7 +97,9 @@ fn thermal_energy_hook(src: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (mixture). Merges the gas from the giver into src, without modifying the giver mix.
-#[byondapi::bind("/datum/gas_mixture/proc/merge")]
+/// Underscored because DM keeps a `merge()` wrapper of its own: it sends COMSIG_GASMIX_MERGED,
+/// which gas tanks and the atmos reaction recorder listen for, and returns a success boolean.
+#[byondapi::bind("/datum/gas_mixture/proc/__merge")]
 fn merge_hook(src: ByondValue, giver: ByondValue) -> Result<ByondValue> {
 	with_mixes_custom(&src, &giver, |src_mix, giver_mix| {
 		src_mix.write().merge(&giver_mix.read());
@@ -448,7 +450,10 @@ fn compare_hook(src: ByondValue, other: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (holder). Runs all reactions on this gas mixture. Holder is used by the reactions, and can be any arbitrary datum or null.
-#[byondapi::bind("/datum/gas_mixture/proc/react")]
+/// Underscored because DM keeps a `react()` wrapper of its own, carrying behaviour Dogmos has no
+/// equivalent for: the hypernoblium oppression gate that stops all reactions before any are
+/// considered, the reaction_results bookkeeping, and COMSIG_GASMIX_REACTED.
+#[byondapi::bind("/datum/gas_mixture/proc/__react")]
 fn react_hook(src: ByondValue, holder: ByondValue) -> Result<ByondValue> {
 	let mut ret = ReactionReturn::NO_REACTION;
 	let reactions = with_mix(&src, |mix| Ok(mix.all_reactable()))?;
