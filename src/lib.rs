@@ -19,6 +19,45 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 static _SIMD_DETECTED: ::std::sync::OnceLock<bool> = ::std::sync::OnceLock::new();
 
+/// Writes every panic's real message, location and thread to `dogmos_panic.log`. Added while
+/// chasing a boot-time abort that turned out to be caused by `panic = "abort"` swallowing panics
+/// raised on rayon worker threads (see the note on `[profile.release]` in Cargo.toml) - with that
+/// fixed, panics unwind and print normally, but rayon still catches panics per-task on its own
+/// worker threads, which can otherwise mean a worker-thread bug is silently dropped instead of
+/// surfacing anywhere. Kept permanently as a low-cost safety net for exactly that case.
+#[byondapi::init]
+pub fn install_diagnostic_panic_hook() {
+	std::panic::set_hook(Box::new(|info| {
+		let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+			(*s).to_string()
+		} else if let Some(s) = info.payload().downcast_ref::<String>() {
+			s.clone()
+		} else {
+			"<non-string panic payload>".to_string()
+		};
+		let location = info
+			.location()
+			.map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+			.unwrap_or_else(|| "<unknown location>".to_string());
+		let thread = std::thread::current();
+		let report = format!(
+			"[dogmos panic hook] thread {:?} panicked at {}: {}\n",
+			thread.name().unwrap_or("<unnamed>"),
+			location,
+			msg
+		);
+		use std::io::Write;
+		if let Ok(mut f) = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open("dogmos_panic.log")
+		{
+			let _ = f.write_all(report.as_bytes());
+			let _ = f.flush();
+		}
+	}));
+}
+
 #[cfg(feature = "tracy")]
 #[byondapi::init]
 pub fn init_eyre() {
@@ -164,7 +203,9 @@ fn temperature_share_hook() -> Result<ByondValue> {
 }
 
 /// Returns: a list of the gases in the mixture, associated with their IDs.
-#[byondapi::bind("/datum/gas_mixture/proc/get_gases")]
+/// Raw FFI bind - returns Dogmos' native string ids. Use get_gases() in gas_mixture.dm, which
+/// translates back to the typepaths every DM call site expects.
+#[byondapi::bind("/datum/gas_mixture/proc/__get_gases")]
 fn get_gases_hook(src: ByondValue) -> Result<ByondValue> {
 	with_mix(&src, |mix| {
 		let mut gases_list = ByondValue::new_list()?;
@@ -196,7 +237,8 @@ fn set_temperature_hook(src: ByondValue, arg_temp: ByondValue) -> Result<ByondVa
 }
 
 /// Args: (gas_id). Returns the heat capacity from the given gas, in J/K (probably).
-#[byondapi::bind("/datum/gas_mixture/proc/partial_heat_capacity")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use partial_heat_capacity() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__partial_heat_capacity")]
 fn partial_heat_capacity(src: ByondValue, gas_id: ByondValue) -> Result<ByondValue> {
 	with_mix(&src, |mix| {
 		Ok(mix
@@ -216,7 +258,8 @@ fn set_volume_hook(src: ByondValue, vol_arg: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (gas_id). Returns: the amount of substance of the given gas, in moles.
-#[byondapi::bind("/datum/gas_mixture/proc/get_moles")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use get_moles() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__get_moles")]
 fn get_moles_hook(src: ByondValue, gas_id: ByondValue) -> Result<ByondValue> {
 	with_mix(&src, |mix| {
 		Ok(mix.get_moles(gas_idx_from_value(&gas_id)?).into())
@@ -224,7 +267,8 @@ fn get_moles_hook(src: ByondValue, gas_id: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (gas_id, moles). Sets the amount of substance of the given gas, in moles.
-#[byondapi::bind("/datum/gas_mixture/proc/set_moles")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use set_moles() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__set_moles")]
 fn set_moles_hook(src: ByondValue, gas_id: ByondValue, amt_val: ByondValue) -> Result<ByondValue> {
 	let vf = amt_val.get_number()?;
 	if !vf.is_finite() {
@@ -239,7 +283,8 @@ fn set_moles_hook(src: ByondValue, gas_id: ByondValue, amt_val: ByondValue) -> R
 	})
 }
 /// Args: (gas_id, moles). Adjusts the given gas's amount by the given amount, e.g. (GAS_O2, -0.1) will remove 0.1 moles of oxygen from the mixture.
-#[byondapi::bind("/datum/gas_mixture/proc/adjust_moles")]
+/// Raw FFI bind - id_val must already be Dogmos' string form. Use adjust_moles() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__adjust_moles")]
 fn adjust_moles_hook(
 	src: ByondValue,
 	id_val: ByondValue,
@@ -253,7 +298,8 @@ fn adjust_moles_hook(
 }
 
 /// Args: (gas_id, moles, temp). Adjusts the given gas's amount by the given amount, with that gas being treated as if it is at the given temperature.
-#[byondapi::bind("/datum/gas_mixture/proc/adjust_moles_temp")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use adjust_moles_temp() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__adjust_moles_temp")]
 fn adjust_moles_temp_hook(
 	src: ByondValue,
 	id_val: ByondValue,
@@ -280,7 +326,8 @@ fn adjust_moles_temp_hook(
 }
 
 /// Args: (gas_id_1, amount_1, gas_id_2, amount_2, ...). As adjust_moles, but with variadic arguments.
-#[byondapi::bind_raw_args("/datum/gas_mixture/proc/adjust_multi")]
+/// Raw FFI bind - gas ids must already be Dogmos' string form. Use adjust_multi() in gas_mixture.dm.
+#[byondapi::bind_raw_args("/datum/gas_mixture/proc/__adjust_multi")]
 fn adjust_multi_hook() -> Result<ByondValue> {
 	if args.len() % 2 == 0 {
 		Err(eyre::eyre!(
@@ -428,6 +475,18 @@ fn mark_immutable_hook(src: ByondValue) -> Result<ByondValue> {
 		mix.mark_immutable();
 		Ok(ByondValue::null())
 	})
+}
+
+/// Returns: whether the mix has been marked immutable.
+///
+/// Meridian: added because remove_into/remove_ratio_into do not themselves check immutability -
+/// only merge and copy_from_mutable do - so removing gas from an immutable mixture (e.g. a space
+/// tile) would silently deplete it over time. DM's __remove/__remove_ratio wrappers check this
+/// first and return an inexhaustible copy instead of draining space, matching upstream tg's
+/// `/datum/gas_mixture/immutable/space/remove()` behaviour.
+#[byondapi::bind("/datum/gas_mixture/proc/is_immutable")]
+fn is_immutable_hook(src: ByondValue) -> Result<ByondValue> {
+	with_mix(&src, |mix| Ok(mix.is_immutable().into()))
 }
 
 /// Clears the gas mixture my removing all of its gases.

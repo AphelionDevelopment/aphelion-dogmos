@@ -290,6 +290,18 @@ fn hook_init(gas_data: ByondValue) -> Result<ByondValue> {
 	Ok(true.into())
 }
 
+/// Returns: the number of reactions Dogmos accepted at init. Meridian: exists purely so DM can
+/// assert across the FFI that the reaction table actually crossed, rather than only that DM built
+/// one - see /datum/unit_test/dogmos_registration.
+#[byondapi::bind("/proc/dogmos_reaction_count")]
+fn dogmos_reaction_count() -> Result<ByondValue> {
+	Ok((REACTION_INFO
+		.read()
+		.as_ref()
+		.map_or(0, |info| info.len()) as f32)
+		.into())
+}
+
 fn get_reaction_info() -> BTreeMap<ReactionPriority, Reaction> {
 	// Meridian: SSair.gas_reactions is a nested assoc list (gas id -> per-priority-group lists) in
 	// modern /tg/, which is not iterable as a flat list of reaction datums. DM builds a separate
@@ -455,16 +467,29 @@ pub fn gas_idx_from_string(id: &str) -> Result<GasIDX> {
 }
 
 /// Returns the appropriate index to be used by the game for a given Byond string.
+///
+/// Meridian: BYOND typepath *constants* (unlike live object instances) cannot have their vars read
+/// through `Byond_ReadVarByStrId` - `initial(path::var)` is a DM-compiler-time fold, not something the
+/// runtime C API resolves for a bare, unresolved type value. An earlier version of this function tried
+/// a read-var fallback for non-string input on that assumption and it corrupted the panic runtime
+/// instead of erroring cleanly. Gas identity must cross the FFI boundary as a string; DM-side callers
+/// that hold a typepath translate it (see `/datum/gas_mixture/proc/get_moles` and siblings in
+/// gas_mixture.dm) before it ever reaches here.
 /// # Errors
 /// If the given string is not a string or is not a valid gas ID.
 pub fn gas_idx_from_value(string_val: &ByondValue) -> Result<GasIDX> {
+	let Ok(strid) = string_val.get_strid() else {
+		return Err(eyre::eyre!(
+			"Expected a gas ID string, got a non-string value. Pass the gas's string id, not its typepath."
+		));
+	};
 	CACHED_GAS_IDS.with_borrow_mut(|cache| {
-		if let Some(idx) = cache.get(&string_val.get_strid().unwrap()) {
+		if let Some(idx) = cache.get(&strid) {
 			Ok(*idx)
 		} else {
 			let id = &string_val.get_string()?;
 			let idx = gas_idx_from_string(id)?;
-			cache.insert(string_val.get_strid().unwrap(), idx);
+			cache.insert(strid, idx);
 			Ok(idx)
 		}
 	})

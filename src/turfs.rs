@@ -500,8 +500,15 @@ fn determine_turf_flag(src: &ByondValue) -> i32 {
 }
 */
 /// Updates adjacency infos for turfs, only use this in immediateupdateturfs.
+///
+/// Meridian: max_x/max_y are passed in from DM (world.maxx/world.maxy) rather than fetched here via
+/// FFI - byondapi's generic read_number_id/Byond_ReadVarByStrId does not work against the World
+/// value type for its built-in intrinsic properties (maxx/maxy are not stored in the regular var
+/// table the way user-declared datum vars are), so a self-fetch inside supercond_update_adjacencies
+/// always failed with "Attempt to interpret non-number value as number". DM has these trivially as
+/// native properties, so passing them through avoids the broken read path entirely.
 #[byondapi::bind("/turf/proc/__update_auxtools_turf_adjacency_info")]
-fn hook_infos(src: ByondValue) -> Result<ByondValue> {
+fn hook_infos(src: ByondValue, max_x: ByondValue, max_y: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	with_turf_gases_write(|arena| -> Result<()> {
 		if let Some(adjacent_list) = src
@@ -517,7 +524,7 @@ fn hook_infos(src: ByondValue) -> Result<ByondValue> {
 	})?;
 
 	#[cfg(feature = "superconductivity")]
-	superconduct::supercond_update_adjacencies(id)?;
+	superconduct::supercond_update_adjacencies(id, max_x.get_number()? as i32, max_y.get_number()? as i32)?;
 	Ok(ByondValue::null())
 }
 

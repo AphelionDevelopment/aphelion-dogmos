@@ -184,28 +184,10 @@ pub fn supercond_update_ref(src: ByondValue) -> Result<()> {
 	Ok(())
 }
 
-pub fn supercond_update_adjacencies(id: u32) -> Result<()> {
-	let world = ByondValue::new_global_ref();
-	let max_x = world
-		.read_number_id(byond_string!("maxx"))
-		.map_err(|_| {
-			eyre::eyre!(
-				"Attempt to interpret non-number value as number {} {}:{}",
-				std::file!(),
-				std::line!(),
-				std::column!()
-			)
-		})? as i32;
-	let max_y = world
-		.read_number_id(byond_string!("maxy"))
-		.map_err(|_| {
-			eyre::eyre!(
-				"Attempt to interpret non-number value as number {} {}:{}",
-				std::file!(),
-				std::line!(),
-				std::column!()
-			)
-		})? as i32;
+// Meridian: max_x/max_y are passed in by the caller (hook_infos in turfs.rs) rather than fetched
+// here via world.maxx/world.maxy FFI reads, which don't work against the World value type's
+// built-in intrinsic properties - see the comment on hook_infos for the full explanation.
+pub fn supercond_update_adjacencies(id: u32, max_x: i32, max_y: i32) -> Result<()> {
 	let src_turf = ByondValue::new_ref(ValueType::Turf, id);
 	with_turf_heat_write(|arena| -> Result<()> {
 		if let Ok(blocked_dirs) =
@@ -221,7 +203,9 @@ pub fn supercond_update_adjacencies(id: u32) -> Result<()> {
 	Ok(())
 }
 
-#[byondapi::bind("/turf/proc/return_temperature")]
+// Meridian: /atom/proc/return_temperature() already exists downstream (code/game/atom/_atom.dm), so
+// emitting this with "proc/" would be a duplicate-definition compile error - this is an override.
+#[byondapi::bind("/turf/return_temperature")]
 fn hook_turf_temperature(src: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	with_turf_heat_read(|arena| -> Result<ByondValue> {

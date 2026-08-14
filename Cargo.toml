@@ -72,4 +72,15 @@ features = ["rustc_1_61", "alloc"]
 lto = 'fat'
 debug = true
 codegen-units = 1
-panic = 'abort'
+# Meridian: was 'abort' until 2026-08-13. rayon's worker threads (spawned for turf heat processing,
+# see turfs/superconduct.rs) wrap their closures in stdlib machinery that expects to be able to
+# unwind. Under panic = 'abort' any panic on one of those threads - even one that would otherwise be
+# harmless and locally recoverable - hits that wrapper's nounwind boundary and the whole process
+# aborts via core::panicking::panic_cannot_unwind, which prints only "panic in a function that cannot
+# unwind" with the real message and location discarded. This reproduced on every optimization level
+# (release, and a no-LTO/16-codegen-unit variant) but never under a debug build (panic = 'unwind' by
+# default there) - confirmed by bisecting on the panic strategy alone with LTO otherwise unchanged.
+# 'unwind' costs unwind-table size and a little codegen headroom; that's a better trade than a
+# DreamDaemon that dies silently and unrecoverably the first time gas or turf setup panics on a
+# worker thread.
+panic = 'unwind'
