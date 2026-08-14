@@ -530,13 +530,23 @@ fn hook_infos(src: ByondValue, max_x: ByondValue, max_y: ByondValue) -> Result<B
 
 /// Updates the visual overlays for the given turf.
 /// Will use a cached overlay list if one exists.
+///
+/// Meridian: gas_overlays is 3-level here (GAS_ID -> PLANE_OFFSET+1 -> VIS_FACTOR -> OVERLAY), not the
+/// 2-level (GAS_ID -> VIS_FACTOR) shape upstream auxmos expects, because this codebase renders each
+/// multiz z-level's gas overlays on a different plane (see code/__HELPERS/_planes.dm's
+/// GET_TURF_PLANE_OFFSET, which this mirrors) - a 2-level lookup would render every level's gas on
+/// whichever plane offset 0 uses. GLOB.gas_data.overlays is populated by SSdogmos.Initialize()
+/// (modular_aphelion/modules/dogmos/code/dogmos.dm) as a direct reference into the same pre-baked
+/// overlay objects GLOB.meta_gas_info[META_GAS_OVERLAY] already owns, not a duplicate set - including
+/// when SSmapping grows z_level_to_plane_offset for a new z-level after roundstart, since both point
+/// at the same underlying list.
 /// # Errors
 /// If auxgm wasn't implemented properly or there's an invalid gas mixture.
 fn update_visuals(src: ByondValue) -> Result<ByondValue> {
 	use super::gas;
 	match src.read_var_id(byond_string!("air")) {
 		Ok(air) if !air.is_null() => {
-			// gas_overlays: list( GAS_ID = list( VIS_FACTORS = OVERLAYS )) got it? I don't
+			// gas_overlays: list( GAS_ID = list( PLANE_OFFSET+1 = list( VIS_FACTORS = OVERLAYS ))) got it? I don't
 			let gas_overlays = ByondValue::new_global_ref()
 				.read_var_id(byond_string!("GLOB"))
 				.wrap_err("Unable to get GLOB from BYOND globals")?
@@ -544,6 +554,29 @@ fn update_visuals(src: ByondValue) -> Result<ByondValue> {
 				.wrap_err("gas_data is undefined on GLOB")?
 				.read_var_id(byond_string!("overlays"))
 				.wrap_err("overlays is undefined in GLOB.gas_data")?;
+
+			// Mirrors GET_TURF_PLANE_OFFSET(src) - only look at z_level_to_plane_offset at all if
+			// multiz plane offsetting is actually in use, matching that macro's own fast path for the
+			// common single-plane case.
+			let ssmapping = ByondValue::new_global_ref()
+				.read_var_id(byond_string!("SSmapping"))
+				.wrap_err("Unable to get SSmapping from BYOND globals")?;
+			let max_plane_offset = ssmapping
+				.read_number_id(byond_string!("max_plane_offset"))
+				.unwrap_or(0.0);
+			let plane_offset_index = if max_plane_offset > 0.0 {
+				let z = src.read_number_id(byond_string!("z")).unwrap_or(0.0);
+				let offset = ssmapping
+					.read_var_id(byond_string!("z_level_to_plane_offset"))
+					.ok()
+					.and_then(|list| list.read_list_index(z).ok())
+					.and_then(|v| v.get_number().ok())
+					.unwrap_or(0.0);
+				offset + 1.0
+			} else {
+				1.0
+			};
+
 			let ptr = air
 				.read_var_id(byond_string!("_extools_pointer_gasmixture"))
 				.wrap_err("air is undefined on turf")?
@@ -554,12 +587,16 @@ fn update_visuals(src: ByondValue) -> Result<ByondValue> {
 					.enumerate()
 					.filter_map(|(idx, moles)| Some((idx, moles, gas::types::gas_visibility(idx)?)))
 					.filter(|(_, moles, amt)| moles > amt)
-					// getting the list(VIS_FACTORS = OVERLAYS) with GAS_ID
+					// getting the list(PLANE_OFFSET+1 = list(VIS_FACTORS = OVERLAYS)) with GAS_ID
 					.filter_map(|(idx, moles, _)| {
 						Some((
 							gas_overlays.read_list_index(gas::gas_idx_to_id(idx)).ok()?,
 							moles,
 						))
+					})
+					// getting the list(VIS_FACTORS = OVERLAYS) with PLANE_OFFSET+1
+					.filter_map(|(per_offset_list, moles)| {
+						Some((per_offset_list.read_list_index(plane_offset_index).ok()?, moles))
 					})
 					// getting the OVERLAYS with VIS_FACTOR
 					.filter_map(|(this_overlay_list, moles)| {
