@@ -291,6 +291,15 @@ fn get_share_energy(delta: f32, cap_1: f32, cap_2: f32) -> f32 {
 	delta * ((cap_1 * cap_2) / (cap_1 + cap_2))
 }
 
+/// Returns: how many turfs are currently registered in Dogmos' heat graph. Meridian: DM's
+/// active_super_conductivity list (and the MC-tab "SC:" counter / TGUI conducting_size field that
+/// read its length) is deleted along with the rest of DM's superconduction system - this gives those
+/// two consumers a real number to show again instead of a hardcoded 0.
+#[byondapi::bind("/proc/dogmos_heat_graph_count")]
+fn dogmos_heat_graph_count() -> Result<ByondValue> {
+	Ok((with_turf_heat_read(|arena| arena.map.len()) as f32).into())
+}
+
 //Fires the task into the thread pool, once
 #[byondapi::init]
 fn process_heat_start() {
@@ -301,8 +310,8 @@ fn process_heat_start() {
 			let task_lock = TASKS.read();
 			let start_time = Instant::now();
 			let sender = byond_callback_sender();
-			let _emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * info.time_delta;
-			let _radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * info.time_delta;
+			let emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * info.time_delta;
+			let radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * info.time_delta;
 			with_turf_heat_read(|arena| {
 				with_turf_gases_read(|air_arena| {
 					let adjacencies_to_consider = arena
@@ -362,8 +371,11 @@ fn process_heat_start() {
 							let info = arena.get(node_index).unwrap();
 							let mut temp_write = info.temperature.try_write()?;
 
-							/*
-							//share w/ space
+							//share w/ space - real Stefan-Boltzmann blackbody radiation. Meridian: this was previously dead
+							// (commented out) code with a double-multiply bug - emissivity_constant is already
+							// STEFAN_BOLTZMANN_CONSTANT * time_delta, so multiplying by STEFAN_BOLTZMANN_CONSTANT again here
+							// collapsed the term to ~zero cooling, which is why it was retired in favor of the fake vacuum
+							// sink below. Restored correctly: net radiated energy is emissivity_constant * (T^4 - TCMB^4).
 							if info.adjacent_to_space && *temp_write > T0C {
 								/*
 									Straight up the standard blackbody radiation
@@ -372,22 +384,9 @@ fn process_heat_start() {
 									is ordinarily an f32, meaning that
 									this will never go into infinities.
 								*/
-								let blackbody_radiation: f64 = (emissivity_constant
-									* STEFAN_BOLTZMANN_CONSTANT
-									* (f64::from(*temp_write).powi(4)))
+								let blackbody_radiation: f64 = (emissivity_constant * f64::from(*temp_write).powi(4))
 									- radiation_from_space_tick;
 								*temp_write -= blackbody_radiation as f32 / info.heat_capacity;
-							}
-							*/
-							//share w/ space
-							if info.adjacent_to_space && *temp_write > T20C {
-								let delta = *temp_write - TCMB;
-								let energy = get_share_energy(
-									info.thermal_conductivity * delta,
-									HEAT_CAPACITY_VACUUM,
-									info.heat_capacity,
-								);
-								*temp_write -= energy / info.heat_capacity;
 							}
 
 							//share w/ air

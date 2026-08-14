@@ -57,8 +57,11 @@ pub const MINIMUM_TEMPERATURE_TO_MOVE: f32 = T20C + 100.0;
 pub const MINIMUM_TEMPERATURE_DELTA_TO_SUSPEND: f32 = 4.0;
 /// Minimum temperature difference before the gas temperatures are just set to be equal
 pub const MINIMUM_TEMPERATURE_DELTA_TO_CONSIDER: f32 = 0.5;
-pub const MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION: f32 = T20C + 10.0;
-pub const MINIMUM_TEMPERATURE_START_SUPERCONDUCTION: f32 = T20C + 200.0;
+// Meridian: aligned to match Meridian-Rift's DM tuning (code/__DEFINES/atmospherics/atmos_core.dm) -
+// upstream auxmos shipped different numbers here, which is accidental drift, not the intentional
+// gameplay divergence this fork otherwise accepts.
+pub const MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION: f32 = T20C + 80.0; // matches MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION
+pub const MINIMUM_TEMPERATURE_START_SUPERCONDUCTION: f32 = T20C + 400.0; // matches MINIMUM_TEMPERATURE_START_SUPERCONDUCTION
 
 /// The amount of gas that is diffused between tiles every tick. Must be less than 1/6.
 pub const GAS_DIFFUSION_CONSTANT: f32 = 0.125;
