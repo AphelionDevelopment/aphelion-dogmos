@@ -223,6 +223,37 @@ fn hook_turf_temperature(src: ByondValue) -> Result<ByondValue> {
 	})
 }
 
+// Meridian: added for Phase 3 of the Dogmos integration - the getter above existed since the auxmos
+// port, but nothing let DM push an updated temperature back in once a turf was registered. DM-side
+// call sites that used to write /turf/var/temperature directly now need this. Errors (rather than
+// silently no-opping) when the turf isn't in TurfHeat at all - every known DM call site targets a
+// turf that plausibly always has nonzero thermal_conductivity/heat_capacity, so silence here would
+// just hide a real registration bug.
+// Raw FFI bind, __-prefixed like gas_mixture's raw binds (see gas_mixture.dm) so a DM wrapper can
+// own the clean `set_temperature` name - a real /turf/proc/set_temperature(new_temp) would collide
+// with this generated proc otherwise. Use the wrapper in turf.dm, not this directly.
+#[byondapi::bind("/turf/proc/__set_temperature")]
+fn hook_turf_temperature_set(src: ByondValue, arg_temp: ByondValue) -> Result<ByondValue> {
+	let id = src.get_ref()?;
+	let v = arg_temp.get_number()?;
+	if !v.is_finite() {
+		return Err(eyre::eyre!(
+			"Attempted to set a turf's temperature to a number that is NaN or infinite."
+		));
+	}
+	with_turf_heat_read(|arena| -> Result<ByondValue> {
+		if let Some(&node_index) = arena.get_id(&id) {
+			let info = arena.get(node_index).unwrap();
+			*info.temperature.write() = v;
+			Ok(ByondValue::null())
+		} else {
+			Err(eyre::eyre!(
+				"Attempted to set the temperature of a turf that is not registered in TurfHeat."
+			))
+		}
+	})
+}
+
 // Expected function call: process_turf_heat()
 // Returns: TRUE if thread not done, FALSE otherwise
 #[byondapi::bind("/datum/controller/subsystem/air/proc/process_turf_heat")]
