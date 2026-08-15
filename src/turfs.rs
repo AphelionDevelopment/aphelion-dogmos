@@ -394,6 +394,20 @@ where
 	f(TURF_GASES.read().as_ref().unwrap())
 }
 
+/// Returns: how many space-boundary turfs are currently registered - i.e. how many specific space
+/// turfs some interior turf has discovered as a neighbor and registered on demand via the
+/// SPACE_BOUNDARY_FLAG path in hook_register_turf(). These are the only gas-graph nodes registered
+/// with empty SimulationFlags (every other registration in this codebase passes SIMULATION_ALL), so
+/// filtering on !enabled() identifies them precisely. Atmos Control Panel telemetry - lets an admin
+/// see at a glance that breach detection has real neighbors to work with, instead of the gap this
+/// counts existing silently the way it did until the 2026-08-14 playtest surfaced it.
+#[byondapi::bind("/proc/dogmos_space_boundary_count")]
+fn dogmos_space_boundary_count() -> Result<ByondValue> {
+	Ok((with_turf_gases_read(|arena| arena.graph.node_weights().filter(|mix| !mix.enabled()).count())
+		as f32)
+		.into())
+}
+
 fn with_turf_gases_write<T, F>(f: F) -> T
 where
 	F: FnOnce(&mut TurfGases) -> T,
@@ -415,11 +429,27 @@ where
 	f(PLANETARY_ATMOS.upgradable_read())
 }
 
+/// Meridian: sentinel passed by /turf/open/space/register_dogmos_air() (dogmos_defines.dm's
+/// DOGMOS_SIMULATION_SPACE_BOUNDARY) instead of a real SimulationFlags bit. Space turfs are never
+/// registered through the normal Initalize_Atmos() path (see the init_air gate on the base
+/// register_dogmos_air()) - this lets one specific space turf be registered on demand, the moment an
+/// interior turf's adjacency pass actually discovers it as a neighbor, as a node that's present in
+/// the gas graph (so FDM diffusion and katmos's explosively_depressurize() can see it) but never
+/// itself processed: SimulationFlags(0) doesn't intersect SIMULATION_ANY, so should_process() never
+/// selects it as the current cell. That matters because every space turf shares one DM-side
+/// gas_mixture datum - if Rust ever wrote diffusion results into it the way it does for a normal
+/// enabled turf, that write would corrupt "vacuum" for every other space tile sharing the same mix
+/// slot. mark_immutable() on that shared mix below is what explosively_depressurize() actually keys
+/// off of to detect a breach.
+const SPACE_BOUNDARY_FLAG: i32 = -2;
+
 /// Returns: null. Updates turf air infos, whether the turf is closed, is space or a regular turf, or even a planet turf is decided here.
 #[byondapi::bind("/turf/proc/update_air_ref")]
 fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
-	let flag = flag.get_number()? as i32;
+	let raw_flag = flag.get_number()? as i32;
+	let is_space_boundary = raw_flag == SPACE_BOUNDARY_FLAG;
+	let flag = if is_space_boundary { 0 } else { raw_flag };
 	if let Ok(blocks) = src.read_number_id(byond_string!("blocks_air")) {
 		if blocks > 0.0 {
 			with_turf_gases_write(|arena| arena.remove_turf(id));
@@ -435,39 +465,58 @@ fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 		to_insert.flags = SimulationFlags::from_bits_truncate(flag as u8);
 		to_insert.id = id;
 
-		if let Ok(is_planet) = src.read_number_id(byond_string!("planetary_atmos")) {
-			if is_planet != 0.0 {
-				if let Ok(at_str) = src.read_string_id(byond_string!("initial_gas_mix")) {
-					with_planetary_atmos_upgradeable_read(|lock| {
-						to_insert.planetary_atmos = Some({
-							let mut state = rustc_hash::FxHasher::default();
-							at_str.hash(&mut state);
-							state.finish() as u32
-						});
-						if lock
-							.as_ref()
-							.unwrap()
-							.contains_key(&to_insert.planetary_atmos.unwrap())
-						{
-							return;
-						}
-
-						let mut write =
-							parking_lot::lock_api::RwLockUpgradableReadGuard::upgrade(lock);
-
-						write
-							.as_mut()
-							.unwrap()
-							.insert(to_insert.planetary_atmos.unwrap(), {
-								let mut gas = to_insert.get_gas_copy();
-								gas.mark_immutable();
-								gas
+		if !is_space_boundary {
+			if let Ok(is_planet) = src.read_number_id(byond_string!("planetary_atmos")) {
+				if is_planet != 0.0 {
+					if let Ok(at_str) = src.read_string_id(byond_string!("initial_gas_mix")) {
+						with_planetary_atmos_upgradeable_read(|lock| {
+							to_insert.planetary_atmos = Some({
+								let mut state = rustc_hash::FxHasher::default();
+								at_str.hash(&mut state);
+								state.finish() as u32
 							});
-					});
+							if lock
+								.as_ref()
+								.unwrap()
+								.contains_key(&to_insert.planetary_atmos.unwrap())
+							{
+								return;
+							}
+
+							let mut write =
+								parking_lot::lock_api::RwLockUpgradableReadGuard::upgrade(lock);
+
+							write
+								.as_mut()
+								.unwrap()
+								.insert(to_insert.planetary_atmos.unwrap(), {
+									let mut gas = to_insert.get_gas_copy();
+									gas.mark_immutable();
+									gas
+								});
+						});
+					}
 				}
 			}
 		}
+
+		let mix_index = to_insert.mix;
 		with_turf_gases_write(|arena| arena.insert_turf(to_insert));
+
+		if is_space_boundary {
+			GasArena::with_all_mixtures(|all_mixtures| {
+				if let Some(entry) = all_mixtures.get(mix_index) {
+					entry.write().mark_immutable();
+				}
+			});
+			// Space never participates in Dogmos' heat graph - an ordinary open border to space
+			// already never gets a heat edge under the existing gas-adjacency-vs-conductivity-
+			// blocked-directions rule (superconduction only runs where gas can't flow), and this
+			// registration path is scoped to fixing gas diffusion/breach detection specifically,
+			// not to reopening the already-tested SSAIR_SUPERCONDUCTIVITY blackbody model to a new
+			// space-as-a-live-heat-node interaction this session hasn't verified.
+			return Ok(ByondValue::null());
+		}
 	} else {
 		with_turf_gases_write(|arena| arena.remove_turf(id));
 	}

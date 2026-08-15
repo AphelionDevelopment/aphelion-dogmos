@@ -48,6 +48,14 @@ where
 #[derive(Copy, Clone)]
 struct SSheatInfo {
 	time_delta: f64,
+	/// Meridian: mirrors SSair.realistic_space_radiation - a live, DM-settable toggle between real
+	/// Stefan-Boltzmann blackbody radiation (physically correct, but ~57x slower than the fake sink at
+	/// a representative 400K, since T^4 scaling makes it very weak near room temperature and only
+	/// aggressive at high temperatures) and a fake vacuum sink (linear conductive-style sharing against
+	/// a fixed large capacity - not physical, but fast and legible for players). See the two branches
+	/// below for the actual formulas. Read fresh from DM on every process_turf_heat() trigger, not
+	/// cached, so a server can flip it live without a Rust rebuild.
+	blackbody_enabled: bool,
 }
 
 #[derive(Default)]
@@ -283,11 +291,53 @@ fn process_heat_notify(src: ByondValue) -> Result<ByondValue> {
 			std::column!()
 		)
 	})? / 10.0) as f64;
-	_ = sender.try_send(SSheatInfo { time_delta });
+	// Meridian: defaults TRUE (physics-correct blackbody) if the var read fails for any reason -
+	// matching this bind's own existing convention of failing toward the safer/more-conservative
+	// option rather than silently reinterpreting a read error as "gameplay mode was requested."
+	let blackbody_enabled = src
+		.read_number_id(byond_string!("realistic_space_radiation"))
+		.map_or(true, |v| v != 0.0);
+	_ = sender.try_send(SSheatInfo {
+		time_delta,
+		blackbody_enabled,
+	});
 	Ok(ByondValue::null())
 }
 
+/// Meridian: BYOND's `INFINITY` constant is not IEEE-754 infinity - DM represents it as the finite
+/// sentinel value 1e31 (confirmed via a live turf's heat_capacity crossing the FFI boundary: reads as
+/// exactly 1e31 on the Rust side, not f32::INFINITY). citadel.rs's fusion() independently landed on the
+/// same convention ("1E+30, well, infinity in byond") - this matches that precedent rather than
+/// inventing a new threshold. Any real finite heat_capacity in this codebase (turf materials top out
+/// around 700000, aphelion-dogmos/../reactions.dm's own values are all far smaller) sits many orders of
+/// magnitude below this.
+const BYOND_INFINITY_THRESHOLD: f32 = 1e30;
+
+/// Meridian: fixed 2026-08-15, a real latent bug confirmed reachable by live station turfs (e.g. two
+/// /turf/open/floor/engine tiles - finite conductivity, "infinite" heat_capacity - separated by an
+/// ordinary window that doesn't override block_superconductivity()). `cap_1 * cap_2` with both at
+/// BYOND's ~1e31 sentinel overflows f32 (max ~3.4e38) to actual IEEE infinity, which then propagates
+/// into NaN or infinity in the temperature update and gets caught by the downstream sanity clamp,
+/// snapping both turfs to TCMB (2.7K) - a real, silent, physically wrong outcome for what should be two
+/// turfs that barely interact. A body with BYOND's "infinite" heat capacity is meant to be an ideal
+/// reservoir whose own temperature never meaningfully moves regardless of energy exchanged, so the
+/// correct behavior as either capacity approaches that sentinel is for the OTHER (finite) side's
+/// capacity to dominate alone - matching lim(cap_1->inf) of the harmonic-mean formula, which reduces to
+/// cap_2. When BOTH are at the sentinel, no finite energy quantity is physically meaningful; since the
+/// result is always eventually divided back by a capacity to produce a temperature delta, returning 0
+/// correctly leaves both reservoirs unchanged instead of overflowing.
 fn get_share_energy(delta: f32, cap_1: f32, cap_2: f32) -> f32 {
+	let cap_1_infinite = cap_1 >= BYOND_INFINITY_THRESHOLD;
+	let cap_2_infinite = cap_2 >= BYOND_INFINITY_THRESHOLD;
+	if cap_1_infinite && cap_2_infinite {
+		return 0.0;
+	}
+	if cap_1_infinite {
+		return delta * cap_2;
+	}
+	if cap_2_infinite {
+		return delta * cap_1;
+	}
 	delta * ((cap_1 * cap_2) / (cap_1 + cap_2))
 }
 
@@ -312,6 +362,9 @@ fn process_heat_start() {
 			let sender = byond_callback_sender();
 			let emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * info.time_delta;
 			let radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * info.time_delta;
+			// Extracted before the closures below, which shadow the name `info` with each turf's own
+			// ThermalInfo - this is SSheatInfo's toggle, not a per-turf value.
+			let blackbody_enabled = info.blackbody_enabled;
 			with_turf_heat_read(|arena| {
 				with_turf_gases_read(|air_arena| {
 					let adjacencies_to_consider = arena
@@ -371,22 +424,38 @@ fn process_heat_start() {
 							let info = arena.get(node_index).unwrap();
 							let mut temp_write = info.temperature.try_write()?;
 
-							//share w/ space - real Stefan-Boltzmann blackbody radiation. Meridian: this was previously dead
-							// (commented out) code with a double-multiply bug - emissivity_constant is already
-							// STEFAN_BOLTZMANN_CONSTANT * time_delta, so multiplying by STEFAN_BOLTZMANN_CONSTANT again here
-							// collapsed the term to ~zero cooling, which is why it was retired in favor of the fake vacuum
-							// sink below. Restored correctly: net radiated energy is emissivity_constant * (T^4 - TCMB^4).
+							// Meridian: 2026-08-15 - a live round found rooms genuinely not perceptibly cooling
+							// within a normal test session under real blackbody radiation (T^4 scaling makes it very
+							// weak near room temperature - ~0.036 K/cycle at 400K vs the fake sink's ~2.1 K/cycle,
+							// ~57x slower - and only becomes aggressive at high temperatures). Blackbody is the
+							// physically correct model; the fake sink is an explicit, acknowledged hack
+							// ("sacrificing realism for gameplay," see HEAT_CAPACITY_VACUUM's own doc comment) that
+							// trades accuracy for player-legible pacing. Rather than picking one, this is now a live
+							// SSair.realistic_space_radiation toggle (read fresh per process_turf_heat() trigger, see
+							// SSheatInfo above) so a server can choose - default TRUE (blackbody), matching the
+							// physically-correct behavior as the baseline.
 							if info.adjacent_to_space && *temp_write > T0C {
-								/*
-									Straight up the standard blackbody radiation
-									equation. All these are f64s because
-									f32::MAX^4 < f64::MAX, and t.temperature
-									is ordinarily an f32, meaning that
-									this will never go into infinities.
-								*/
-								let blackbody_radiation: f64 = (emissivity_constant * f64::from(*temp_write).powi(4))
-									- radiation_from_space_tick;
-								*temp_write -= blackbody_radiation as f32 / info.heat_capacity;
+								if blackbody_enabled {
+									/*
+										Straight up the standard blackbody radiation
+										equation. All these are f64s because
+										f32::MAX^4 < f64::MAX, and t.temperature
+										is ordinarily an f32, meaning that
+										this will never go into infinities.
+									*/
+									let blackbody_radiation: f64 = (emissivity_constant
+										* f64::from(*temp_write).powi(4))
+										- radiation_from_space_tick;
+									*temp_write -= blackbody_radiation as f32 / info.heat_capacity;
+								} else if *temp_write > T20C {
+									let delta = *temp_write - TCMB;
+									let energy = get_share_energy(
+										info.thermal_conductivity * delta,
+										HEAT_CAPACITY_VACUUM,
+										info.heat_capacity,
+									);
+									*temp_write -= energy / info.heat_capacity;
+								}
 							}
 
 							//share w/ air

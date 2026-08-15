@@ -439,6 +439,15 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 				if cur_info.curr_transfer_dir.is_none() {
 					continue;
 				}
+				// Meridian: measured directly (before vs. after) rather than assumed, because how much
+				// this call actually removes differs by feature flag (clear_air() takes everything;
+				// clear_moles() under katmos_slow_decompression takes at most _average_moles/4, or
+				// less if the turf had less than that to begin with) - this is what
+				// handle_decompression_floor_rip() below needs: how much THIS turf actually lost, not
+				// a downstream neighbor's unrelated moles count (see the `sum` var immediately after,
+				// which is a different quantity entirely - the spacewind pressure-accumulation amount,
+				// reused incorrectly for the floor-rip call in an earlier version of this function).
+				let pre_clear_moles = cur_mixture.total_moles();
 				#[cfg(not(feature = "katmos_slow_decompression"))]
 				{
 					cur_mixture.clear_air();
@@ -448,6 +457,7 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 					const DECOMP_REMOVE_RATIO: f32 = 4_f32;
 					cur_mixture.clear_moles((_average_moles / DECOMP_REMOVE_RATIO).abs());
 				}
+				let moles_lost = pre_clear_moles - cur_mixture.total_moles();
 				let mut byond_turf = ByondValue::new_ref(ValueType::Turf, cur_mixture.id);
 				if byondapi::map::byond_locatein(&byond_turf, &hpd)?.is_null() {
 					hpd.push_list(byond_turf)?;
@@ -494,7 +504,7 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 					)?;
 				}
 
-				floor_rip_turfs.push((byond_turf, sum.into()));
+				floor_rip_turfs.push((byond_turf, moles_lost.into()));
 			}
 			Ok(floor_rip_turfs)
 		})?;

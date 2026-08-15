@@ -12,7 +12,7 @@ use gas::{
 	with_gas_info, with_mix, with_mix_mut, with_mixes, with_mixes_custom, with_mixes_mut, GasArena,
 	Mixture,
 };
-use reaction::react_by_id;
+use reaction::{react_by_id, reaction_name_by_id};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -512,15 +512,50 @@ fn compare_hook(src: ByondValue, other: ByondValue) -> Result<ByondValue> {
 /// Underscored because DM keeps a `react()` wrapper of its own, carrying behaviour Dogmos has no
 /// equivalent for: the hypernoblium oppression gate that stops all reactions before any are
 /// considered, the reaction_results bookkeeping, and COMSIG_GASMIX_REACTED.
+///
+/// Meridian: Dogmos Kennel high-cost-zone profiling. SSair.kennel_profile_reactions is read fresh on
+/// every call (same "no rebuild needed to flip live" pattern as blackbody_enabled,
+/// turfs/superconduct.rs) rather than cached - this is the one Dogmos Kennel toggle with real per-call
+/// Rust-side overhead, so it defaults off and the entire Instant::now()/elapsed() path is skipped
+/// unless explicitly enabled. A reaction whose single react_by_id() call meets or exceeds
+/// kennel_high_cost_ms_threshold calls SSair.kennel_record_reaction_cost() directly - not queued
+/// through auxcallback, because react_hook already only ever runs on the main DM thread (either a
+/// direct DM `air.react()` call, or the queued callback post_process() already routes through,
+/// turfs/processing.rs) - no second hop needed.
 #[byondapi::bind("/datum/gas_mixture/proc/__react")]
 fn react_hook(src: ByondValue, holder: ByondValue) -> Result<ByondValue> {
 	let mut ret = ReactionReturn::NO_REACTION;
 	let reactions = with_mix(&src, |mix| Ok(mix.all_reactable()))?;
+
+	let ssair = ByondValue::new_global_ref().read_var_id(byond_string!("SSair"))?;
+	let profile_reactions = ssair
+		.read_number_id(byond_string!("kennel_profile_reactions"))
+		.map_or(false, |v| v != 0.0);
+	let cost_threshold_ms = profile_reactions
+		.then(|| {
+			ssair
+				.read_number_id(byond_string!("kennel_high_cost_ms_threshold"))
+				.unwrap_or(4.0)
+		})
+		.unwrap_or(0.0);
+
 	for reaction in reactions {
+		let started = profile_reactions.then(std::time::Instant::now);
+		let result = react_by_id(reaction, src, holder)?;
+		if let Some(started) = started {
+			let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
+			if elapsed_ms >= cost_threshold_ms {
+				let name = reaction_name_by_id(reaction).unwrap_or_else(|| "unknown".to_string());
+				if let Ok(name_val) = ByondValue::try_from(name) {
+					let _ = ssair.call_id(
+						byond_string!("kennel_record_reaction_cost"),
+						&[name_val, holder, elapsed_ms.into()],
+					);
+				}
+			}
+		}
 		ret |= ReactionReturn::from_bits_truncate(
-			react_by_id(reaction, src, holder)?
-				.get_number()
-				.unwrap_or_default() as u32,
+			result.get_number().unwrap_or_default() as u32,
 		);
 		if ret.contains(ReactionReturn::STOP_REACTIONS) {
 			return Ok((ret.bits() as f32).into());

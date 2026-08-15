@@ -4,6 +4,9 @@ mod citadel;
 #[cfg(feature = "yogs_reactions")]
 mod yogs;
 
+#[cfg(feature = "aphelion_reactions")]
+mod aphelion;
+
 use crate::gas::{gas_idx_to_id, total_num_gases, GasIDX, Mixture};
 use byondapi::prelude::*;
 use eyre::{Context, Result};
@@ -37,7 +40,11 @@ enum ReactionSide {
 }
 
 thread_local! {
-	static REACTION_VALUES: RefCell<HashMap<ReactionIdentifier, ReactionSide, FxBuildHasher>> = Default::default();
+	// Meridian: the String alongside each ReactionSide is the reaction's own "id" string (the same
+	// value from_byond_reaction() hashed to get the ReactionIdentifier key) - kept here so Dogmos
+	// Kennel's high-cost-zone profiling (react_hook, lib.rs) can report a human-readable reaction name
+	// for a slow call without needing a second, hash-coupled DM-side lookup table.
+	static REACTION_VALUES: RefCell<HashMap<ReactionIdentifier, (ReactionSide, String), FxBuildHasher>> = Default::default();
 }
 
 /// Runs a reaction given a `ReactionIdentifier`. Returns the result of the reaction, error or success.
@@ -51,7 +58,7 @@ pub fn react_by_id(
 	REACTION_VALUES.with_borrow(|r| {
 		r.get(&id).map_or_else(
 			|| Err(eyre::eyre!("Reaction with invalid id")),
-			|reaction| match reaction {
+			|(reaction, _name)| match reaction {
 				ReactionSide::ByondSide(val) => val
 					.call_id(byond_string!("react"), &[src, holder])
 					.wrap_err("calling byond side react in react_by_id"),
@@ -61,6 +68,12 @@ pub fn react_by_id(
 			},
 		)
 	})
+}
+
+/// Meridian: the reaction's own "id" string, for Dogmos Kennel's high-cost-zone profiling
+/// (react_hook, lib.rs) to report which reaction was slow. None for an invalid/unregistered id.
+pub fn reaction_name_by_id(id: ReactionIdentifier) -> Option<String> {
+	REACTION_VALUES.with_borrow(|r| r.get(&id).map(|(_side, name)| name.clone()))
 }
 
 impl Reaction {
@@ -82,6 +95,10 @@ impl Reaction {
 			#[cfg(feature = "yogs_reactions")]
 			{
 				yogs::func_from_id(string_id.as_str())
+			}
+			#[cfg(feature = "aphelion_reactions")]
+			{
+				aphelion::func_from_id(string_id.as_str())
 			}
 			#[cfg(not(feature = "reaction_hooks"))]
 			{
@@ -142,12 +159,11 @@ impl Reaction {
 		}?;
 
 		REACTION_VALUES.with_borrow_mut(|reaction_map| -> Result<()> {
-			match func {
-				Some(function) => {
-					reaction_map.insert(our_reaction.id, ReactionSide::RustSide(function))
-				}
-				None => reaction_map.insert(our_reaction.id, ReactionSide::ByondSide(reaction)),
+			let side = match func {
+				Some(function) => ReactionSide::RustSide(function),
+				None => ReactionSide::ByondSide(reaction),
 			};
+			reaction_map.insert(our_reaction.id, (side, string_id));
 			Ok(())
 		})?;
 		Ok(our_reaction)

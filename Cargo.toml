@@ -21,7 +21,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["turf_processing", "katmos", "superconductivity", "katmos_slow_decompression"]
+default = ["turf_processing", "katmos", "superconductivity", "katmos_slow_decompression", "aphelion_reactions"]
 zas_hooks = []
 turf_processing = []
 superconductivity = ["turf_processing"]
@@ -31,6 +31,16 @@ katmos_slow_decompression = ["fastmos"]
 reaction_hooks = []
 citadel_reactions = ["reaction_hooks"]
 yogs_reactions = ["reaction_hooks"]
+# Meridian: native Rust implementations of this codebase's own fire reactions (plasmafire, h2fire,
+# tritfire, freonfire - see src/reaction/aphelion.rs), faithfully ported from
+# code/modules/atmospherics/gasmixtures/reactions.dm rather than reusing citadel_reactions/
+# yogs_reactions, whose formulas and gas byproducts genuinely differ from this codebase's tuning
+# (confirmed 2026-08-15: citadel's plasmafire drops the water_vapor byproduct entirely, and its
+# tritfire is a completely different "trit bomb" model, not this codebase's measured fuel/oxidizer
+# combustion). Without this, every fire reaction falls back to calling back into DM's own react()
+# per-reaction-per-cycle (ReactionSide::ByondSide) - correct, but the callback overhead itself was
+# part of what this phase exists to remove.
+aphelion_reactions = ["reaction_hooks"]
 
 # Tracing will expose this application to a local port, use with care
 tracy = ["dep:tracing-tracy", "dep:tracing-subscriber", "dep:tracing"]
