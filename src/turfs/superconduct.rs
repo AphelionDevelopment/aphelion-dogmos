@@ -6,7 +6,15 @@ use auxcallback::byond_callback_sender;
 use coarsetime::Instant;
 use eyre::Result;
 use parking_lot::Once;
-use std::sync::LazyLock;
+use std::{
+	collections::HashSet,
+	sync::{
+		atomic::{AtomicUsize, Ordering},
+		LazyLock,
+	},
+};
+
+type HeatNodeIndex = petgraph::graph::NodeIndex<usize>;
 
 static INIT_HEAT: Once = Once::new();
 
@@ -14,6 +22,8 @@ static TURF_HEAT: RwLock<Option<TurfHeat>> = const_rwlock(None);
 
 static HEAT_CHANNEL: LazyLock<(flume::Sender<SSheatInfo>, flume::Receiver<SSheatInfo>)> =
 	LazyLock::new(|| flume::bounded(1));
+
+static HEAT_REGISTRATION_CHANGES: AtomicUsize = AtomicUsize::new(0);
 
 #[byondapi::init]
 fn initialize_heat_statics() {
@@ -85,20 +95,25 @@ struct TurfHeat {
 }
 
 impl TurfHeat {
-	pub fn insert_turf(&mut self, info: ThermalInfo) {
+	pub fn insert_turf(&mut self, info: ThermalInfo) -> bool {
 		if let Some(&node_id) = self.map.get(&info.id) {
 			let thin = self.graph.node_weight_mut(node_id).unwrap();
 			thin.thermal_conductivity = info.thermal_conductivity;
 			thin.heat_capacity = info.heat_capacity;
 			thin.adjacent_to_space = info.adjacent_to_space;
+			false
 		} else {
 			self.map.insert(info.id, self.graph.add_node(info));
+			true
 		}
 	}
 
-	pub fn remove_turf(&mut self, id: TurfID) {
+	pub fn remove_turf(&mut self, id: TurfID) -> bool {
 		if let Some(index) = self.map.shift_remove(&id) {
 			self.graph.remove_node(index);
+			true
+		} else {
+			false
 		}
 	}
 
@@ -142,7 +157,8 @@ impl TurfHeat {
 				max_y,
 			) {
 				if let Some(&adjacent_node) = self.get_id(&adj_idx) {
-					//this fucking happens, I don't even know anymore
+					// Coordinate reuse can resolve a neighbor to the current node; a self-edge cannot
+					// exchange heat and must not enter the graph.
 					if adjacent_node != this_node {
 						self.graph.add_edge(this_node, adjacent_node, ());
 					}
@@ -171,7 +187,7 @@ pub fn supercond_update_ref(src: ByondValue) -> Result<()> {
 	let therm_cap = src
 		.read_number_id(byond_string!("heat_capacity"))
 		.unwrap_or(0.0);
-	if therm_cond > 0.0 && therm_cap > 0.0 {
+	let registration_changed = if therm_cond > 0.0 && therm_cap > 0.0 {
 		let therm_info = ThermalInfo {
 			id,
 			adjacent_to_space: src
@@ -185,9 +201,12 @@ pub fn supercond_update_ref(src: ByondValue) -> Result<()> {
 					.unwrap_or(TCMB),
 			),
 		};
-		with_turf_heat_write(|arena| arena.insert_turf(therm_info));
+		with_turf_heat_write(|arena| arena.insert_turf(therm_info))
 	} else {
-		with_turf_heat_write(|arena| arena.remove_turf(id));
+		with_turf_heat_write(|arena| arena.remove_turf(id))
+	};
+	if registration_changed {
+		HEAT_REGISTRATION_CHANGES.fetch_add(1, Ordering::Relaxed);
 	}
 	Ok(())
 }
@@ -231,15 +250,37 @@ fn hook_turf_temperature(src: ByondValue) -> Result<ByondValue> {
 	})
 }
 
+// Meridian: returns a safe, non-fabricating heat-graph read for blocked-turf consumers. The existing
+// return_temperature() bind preserves auxmos compatibility and returns 102K for an unregistered id;
+// that sentinel must not become a temperature authority. DM calls this bind through a wrapper which
+// falls back to /turf/var/temperature when it returns null.
+#[byondapi::bind("/turf/proc/__dogmos_heat_temperature")]
+fn hook_dogmos_heat_temperature(src: ByondValue) -> Result<ByondValue> {
+	let id = src.get_ref()?;
+	with_turf_heat_read(|arena| -> Result<ByondValue> {
+		let Some(&node_index) = arena.get_id(&id) else {
+			return Ok(ByondValue::null());
+		};
+		let info = arena.get(node_index).unwrap();
+		let read = info.temperature.read();
+		if read.is_finite() {
+			Ok((*read).into())
+		} else {
+			Ok(ByondValue::null())
+		}
+	})
+}
+
 // Meridian: added for Phase 3 of the Dogmos integration - the getter above existed since the auxmos
 // port, but nothing let DM push an updated temperature back in once a turf was registered. DM-side
-// call sites that used to write /turf/var/temperature directly now need this. Errors (rather than
-// silently no-opping) when the turf isn't in TurfHeat at all - every known DM call site targets a
-// turf that plausibly always has nonzero thermal_conductivity/heat_capacity, so silence here would
-// just hide a real registration bug.
+// call sites that used to write /turf/var/temperature directly now need this. The DM wrapper owns the
+// compatibility value and the Rust side safely ignores writes before a turf is registered, which is
+// required for deferred map-load hooks that can run before TurfHeat registration.
 // Raw FFI bind, __-prefixed like gas_mixture's raw binds (see gas_mixture.dm) so a DM wrapper can
 // own the clean `set_temperature` name - a real /turf/proc/set_temperature(new_temp) would collide
-// with this generated proc otherwise. Use the wrapper in turf.dm, not this directly.
+// with this generated proc otherwise. Use the wrapper in turf.dm, not this directly. A write to an
+// unregistered turf is intentionally a safe no-op: the DM wrapper always updates its compatibility
+// value, while map-load ordering can legitimately call it before TurfHeat registration.
 #[byondapi::bind("/turf/proc/__set_temperature")]
 fn hook_turf_temperature_set(src: ByondValue, arg_temp: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
@@ -255,9 +296,7 @@ fn hook_turf_temperature_set(src: ByondValue, arg_temp: ByondValue) -> Result<By
 			*info.temperature.write() = v;
 			Ok(ByondValue::null())
 		} else {
-			Err(eyre::eyre!(
-				"Attempted to set the temperature of a turf that is not registered in TurfHeat."
-			))
+			Ok(ByondValue::null())
 		}
 	})
 }
@@ -341,6 +380,101 @@ fn get_share_energy(delta: f32, cap_1: f32, cap_2: f32) -> f32 {
 	delta * ((cap_1 * cap_2) / (cap_1 + cap_2))
 }
 
+fn unique_heat_edges(
+	edges: impl IntoIterator<Item = (HeatNodeIndex, HeatNodeIndex)>,
+) -> Vec<(HeatNodeIndex, HeatNodeIndex)> {
+	let mut seen: HashSet<(usize, usize), FxBuildHasher> = Default::default();
+	edges
+		.into_iter()
+		.filter_map(|(first, second)| {
+			if first == second {
+				return None;
+			}
+			let edge = if first.index() < second.index() {
+				(first, second)
+			} else {
+				(second, first)
+			};
+			seen.insert((edge.0.index(), edge.1.index()))
+				.then_some(edge)
+		})
+		.collect()
+}
+
+fn accumulate_heat_edge_deltas(
+	edges: &[(HeatNodeIndex, HeatNodeIndex)],
+	temperatures: &[f32],
+	conductivities: &[f32],
+	heat_capacities: &[f32],
+) -> Vec<f32> {
+	let mut deltas = vec![0.0; temperatures.len()];
+	for &(first, second) in edges {
+		let first_index = first.index();
+		let second_index = second.index();
+		let shared_energy = conductivities[first_index].min(conductivities[second_index])
+			* get_share_energy(
+				temperatures[second_index] - temperatures[first_index],
+				heat_capacities[first_index],
+				heat_capacities[second_index],
+			);
+		deltas[first_index] += shared_energy / heat_capacities[first_index];
+		deltas[second_index] -= shared_energy / heat_capacities[second_index];
+	}
+	deltas
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn heat_edge_accumulation_visits_each_undirected_edge_once() {
+		let edges = vec![
+			(HeatNodeIndex::new(0), HeatNodeIndex::new(1)),
+			(HeatNodeIndex::new(1), HeatNodeIndex::new(0)),
+			(HeatNodeIndex::new(1), HeatNodeIndex::new(2)),
+			(HeatNodeIndex::new(2), HeatNodeIndex::new(1)),
+		];
+
+		let unique_edges = unique_heat_edges(edges);
+		assert_eq!(
+			unique_edges,
+			vec![
+				(HeatNodeIndex::new(0), HeatNodeIndex::new(1)),
+				(HeatNodeIndex::new(1), HeatNodeIndex::new(2)),
+			]
+		);
+	}
+
+	#[test]
+	fn heat_edge_accumulation_conserves_finite_temperature_energy() {
+		let edges = vec![(HeatNodeIndex::new(0), HeatNodeIndex::new(1))];
+		let temperatures = vec![1000.0, 300.0];
+		let conductivities = vec![0.05, 0.05];
+		let heat_capacities = vec![100.0, 200.0];
+
+		let deltas =
+			accumulate_heat_edge_deltas(&edges, &temperatures, &conductivities, &heat_capacities);
+
+		assert_eq!(deltas.len(), 2);
+		let energy_delta = deltas[0] * heat_capacities[0] + deltas[1] * heat_capacities[1];
+		assert!(energy_delta.abs() < f32::EPSILON);
+		assert!(deltas[0] < 0.0);
+		assert!(deltas[1] > 0.0);
+	}
+
+	#[test]
+	fn infinite_heat_capacity_does_not_overflow_edge_energy() {
+		let finite_side_energy = get_share_energy(500.0, BYOND_INFINITY_THRESHOLD, 100.0);
+		assert_eq!(finite_side_energy, 50_000.0);
+		assert!(finite_side_energy.is_finite());
+		assert_eq!(
+			get_share_energy(500.0, BYOND_INFINITY_THRESHOLD, BYOND_INFINITY_THRESHOLD),
+			0.0,
+		);
+	}
+}
+
 /// Returns: how many turfs are currently registered in Dogmos' heat graph. Meridian: DM's
 /// active_super_conductivity list (and the MC-tab "SC:" counter / TGUI conducting_size field that
 /// read its length) is deleted along with the rest of DM's superconduction system - this gives those
@@ -365,7 +499,12 @@ fn process_heat_start() {
 			// Extracted before the closures below, which shadow the name `info` with each turf's own
 			// ThermalInfo - this is SSheatInfo's toggle, not a per-turf value.
 			let blackbody_enabled = info.blackbody_enabled;
+			let mut heat_graph_nodes = 0;
+			let mut heat_edge_attempts = 0;
+			let mut heat_edges_applied = 0;
+			let mut heat_lock_contention = 0;
 			with_turf_heat_read(|arena| {
+				heat_graph_nodes = arena.map.len();
 				with_turf_gases_read(|air_arena| {
 					let adjacencies_to_consider = arena
 						.map
@@ -504,38 +643,60 @@ fn process_heat_start() {
 						})
 						.collect::<Vec<_>>();
 
-					adjacencies_to_consider
-						.par_iter()
-						.for_each(|&cur_index| {
-							let info = arena.get(cur_index).unwrap();
-							if let Some(mut temp_write) = info.temperature.try_write() {
-								//share w/ adjacents that are strictly in zone
-								for other in arena
-									.adjacent_node_ids(cur_index)
-									.filter_map(|idx| arena.get(idx))
-								{
-									/*
-										The horrible line below is essentially
-										sharing between solids--making it the minimum of both
-										conductivities makes this consistent, funnily enough.
-									*/
-									if let Some(mut other_write) = other.temperature.try_write() {
-										let shareds =
-											info.thermal_conductivity
-												.min(other.thermal_conductivity) * get_share_energy(
-												*other_write - *temp_write,
-												info.heat_capacity,
-												other.heat_capacity,
-											);
-										*temp_write += shareds / info.heat_capacity;
-										*other_write -= shareds / other.heat_capacity;
-									}
-								}
-							}
-						});
+					// Read every undirected edge from a stable snapshot, accumulate each endpoint's
+					// temperature delta, then write each node once. The old parallel loop held one
+					// endpoint's write lock and used try_write() for the other endpoint, so two opposing
+					// tasks could silently skip the same valid edge under contention.
+					let unique_edges =
+						unique_heat_edges(adjacencies_to_consider.iter().flat_map(|&cur_index| {
+							arena
+								.adjacent_node_ids(cur_index)
+								.map(move |other_index| (cur_index, other_index))
+						}));
+					heat_edge_attempts = unique_edges.len();
+					heat_edges_applied = unique_edges.len();
+					let mut touched_nodes = unique_edges
+						.iter()
+						.flat_map(|&(first, second)| [first, second])
+						.collect::<Vec<_>>();
+					touched_nodes.sort_by_key(|node_index| node_index.index());
+					touched_nodes.dedup();
+
+					let node_bound = touched_nodes
+						.last()
+						.map_or(0, |node_index| node_index.index() + 1);
+					let mut temperatures = vec![0.0; node_bound];
+					let mut conductivities = vec![0.0; node_bound];
+					let mut heat_capacities = vec![0.0; node_bound];
+					for &node_index in &touched_nodes {
+						let info = arena.get(node_index).unwrap();
+						let index = node_index.index();
+						temperatures[index] = *info.temperature.read();
+						conductivities[index] = info.thermal_conductivity;
+						heat_capacities[index] = info.heat_capacity;
+					}
+
+					let deltas = accumulate_heat_edge_deltas(
+						&unique_edges,
+						&temperatures,
+						&conductivities,
+						&heat_capacities,
+					);
+					for node_index in touched_nodes {
+						let info = arena.get(node_index).unwrap();
+						if info.temperature.try_write().is_none() {
+							heat_lock_contention += 1;
+						}
+						let mut temp_write = info.temperature.write();
+						*temp_write += deltas[node_index.index()];
+						if !temp_write.is_normal() {
+							*temp_write = TCMB;
+						}
+					}
 				});
 			});
 			let bench = start_time.elapsed().as_millis();
+			let registration_changes = HEAT_REGISTRATION_CHANGES.swap(0, Ordering::Relaxed);
 			drop(sender.try_send(Box::new(move || {
 				let mut ssair = ByondValue::new_global_ref().read_var_id(byond_string!("SSair"))?;
 				let prev_cost = ssair
@@ -551,6 +712,26 @@ fn process_heat_start() {
 				ssair.write_var_id(
 					byond_string!("cost_superconductivity"),
 					&(0.8 * prev_cost + 0.2 * (bench as f32)).into(),
+				)?;
+				ssair.write_var_id(
+					byond_string!("dogmos_heat_graph_nodes"),
+					&(heat_graph_nodes as f32).into(),
+				)?;
+				ssair.write_var_id(
+					byond_string!("dogmos_heat_edge_attempts"),
+					&(heat_edge_attempts as f32).into(),
+				)?;
+				ssair.write_var_id(
+					byond_string!("dogmos_heat_edges_applied"),
+					&(heat_edges_applied as f32).into(),
+				)?;
+				ssair.write_var_id(
+					byond_string!("dogmos_heat_lock_contention"),
+					&(heat_lock_contention as f32).into(),
+				)?;
+				ssair.write_var_id(
+					byond_string!("dogmos_heat_registration_changes"),
+					&(registration_changes as f32).into(),
 				)?;
 				Ok(())
 			})));

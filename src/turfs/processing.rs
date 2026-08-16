@@ -7,6 +7,9 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use tinyvec::TinyVec;
 
+const EQUALIZE_PROFILE_FDM_ONLY: i32 = 0;
+const EQUALIZE_PROFILE_FAST_ZONE: i32 = 1;
+
 /// Returns: If a processing thread is running or not.
 #[byondapi::bind("/datum/controller/subsystem/air/proc/thread_running")]
 fn thread_running_hook() -> Result<ByondValue> {
@@ -25,8 +28,12 @@ fn process_turf_hook(src: ByondValue, remaining: ByondValue) -> Result<ByondValu
 	let fdm_max_steps = src
 		.read_number_id(byond_string!("share_max_steps"))
 		.unwrap_or(1.0) as i32;
-	let equalize_enabled =
-		cfg!(feature = "fastmos") && src.read_number_id(byond_string!("equalize_enabled"))? != 0.0;
+	let equalize_master_enabled = src.read_number_id(byond_string!("equalize_enabled"))? != 0.0;
+	let equalize_profile = src
+		.read_number_id(byond_string!("dogmos_equalize_performance_profile"))
+		.unwrap_or(EQUALIZE_PROFILE_FAST_ZONE as f32) as i32;
+	let equalize_enabled = cfg!(feature = "fastmos")
+		&& equalize_enabled_for_profile(equalize_master_enabled, equalize_profile);
 
 	let planet_share_ratio = src
 		.read_number_id(byond_string!("planet_share_ratio"))
@@ -89,6 +96,43 @@ fn process_turf(
 		}
 	}
 	Ok(())
+}
+
+/// Applies the DM master switch and the explicit Katmos/FDM performance profile. Unknown profiles
+/// preserve the current Katmos behavior so an older or partially initialized SSair cannot silently
+/// change the server's pressure-processing model.
+fn equalize_enabled_for_profile(master_enabled: bool, profile: i32) -> bool {
+	master_enabled && profile != EQUALIZE_PROFILE_FDM_ONLY
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn equalize_profile_keeps_master_switch_authoritative() {
+		assert!(!equalize_enabled_for_profile(
+			false,
+			EQUALIZE_PROFILE_FAST_ZONE
+		));
+		assert!(!equalize_enabled_for_profile(
+			false,
+			EQUALIZE_PROFILE_FDM_ONLY
+		));
+	}
+
+	#[test]
+	fn equalize_profile_selects_fdm_only_or_fast_zone() {
+		assert!(!equalize_enabled_for_profile(
+			true,
+			EQUALIZE_PROFILE_FDM_ONLY
+		));
+		assert!(equalize_enabled_for_profile(
+			true,
+			EQUALIZE_PROFILE_FAST_ZONE
+		));
+		assert!(equalize_enabled_for_profile(true, 99));
+	}
 }
 
 #[cfg_attr(not(target_feature = "avx2"), auxmacros::generate_simd_functions)]
