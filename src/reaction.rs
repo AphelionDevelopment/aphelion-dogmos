@@ -40,10 +40,8 @@ enum ReactionSide {
 }
 
 thread_local! {
-	// Meridian: the String alongside each ReactionSide is the reaction's own "id" string (the same
-	// value from_byond_reaction() hashed to get the ReactionIdentifier key) - kept here so Dogmos
-	// Kennel's high-cost-zone profiling (react_hook, lib.rs) can report a human-readable reaction name
-	// for a slow call without needing a second, hash-coupled DM-side lookup table.
+	// Keep the source id beside each reaction so profiling can report a readable name without a
+	// second lookup table.
 	static REACTION_VALUES: RefCell<HashMap<ReactionIdentifier, (ReactionSide, String), FxBuildHasher>> = Default::default();
 }
 
@@ -70,8 +68,7 @@ pub fn react_by_id(
 	})
 }
 
-/// Meridian: the reaction's own "id" string, for Dogmos Kennel's high-cost-zone profiling
-/// (react_hook, lib.rs) to report which reaction was slow. None for an invalid/unregistered id.
+/// Returns the source id for profiling, or `None` for an invalid reaction id.
 pub fn reaction_name_by_id(id: ReactionIdentifier) -> Option<String> {
 	REACTION_VALUES.with_borrow(|r| r.get(&id).map(|(_side, name)| name.clone()))
 }

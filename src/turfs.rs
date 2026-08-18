@@ -1,17 +1,11 @@
 pub mod groups;
 pub mod processing;
-/*
-#[cfg(feature = "monstermos")]
-mod monstermos;
-#[cfg(feature = "putnamos")]
-mod putnamos;
-*/
 #[cfg(feature = "katmos")]
 pub mod katmos;
 #[cfg(feature = "superconductivity")]
 mod superconduct;
 
-use crate::{constants::*, gas::Mixture, GasArena};
+use crate::{constants::*, gas::{gas_slot_for_mix, Mixture}, GasArena};
 use bitflags::bitflags;
 use byondapi::prelude::*;
 use eyre::{Context, Result};
@@ -90,6 +84,7 @@ type TurfID = u32;
 struct TurfMixture {
 	pub mix: usize,
 	pub id: TurfID,
+	pub generation: u32,
 	pub flags: SimulationFlags,
 	pub planetary_atmos: Option<u32>,
 	pub vis_hash: AtomicU64,
@@ -188,18 +183,19 @@ impl TurfMixture {
 			}
 		});
 	}
-	/// Gets a copy of the turf's airs, see [`super::gas::Mixture`]
-	pub fn get_gas_copy(&self) -> Mixture {
+	/// Gets a copy of the turf's air, or reports a stale gas-arena slot.
+	pub fn get_gas_copy(&self) -> Result<Mixture> {
 		let mut ret: Mixture = Mixture::new();
-		GasArena::with_all_mixtures(|all_mixtures| {
+		GasArena::with_all_mixtures(|all_mixtures| -> Result<()> {
 			let to_copy = all_mixtures
 				.get(self.mix)
-				.unwrap_or_else(|| panic!("Gas mixture not found for turf: {}", self.mix))
+				.ok_or_else(|| eyre::eyre!("Gas mixture not found for turf: {}", self.mix))?
 				.read();
 			ret.copy_from_mutable(&to_copy);
 			ret.volume = to_copy.volume;
-		});
-		ret
+			Ok(())
+		})?;
+		Ok(ret)
 	}
 	/// Invalidates the turf's visibility cache
 	/// This turf will most likely be visually updated the next processing cycle
@@ -373,7 +369,7 @@ pub fn wait_for_tasks() {
 #[byondapi::init]
 pub fn initialize_turfs() {
 	// 10x 255x255 zlevels
-	// double that for edges since each turf can have up to 6 edges but eehhhh
+	// Reserve room for the graph's expected node and edge counts.
 	*TURF_GASES.write() = Some(TurfGases {
 		graph: StableDiGraph::with_capacity(650_250, 1_300_500),
 		map: IndexMap::with_capacity_and_hasher(650_250, FxBuildHasher),
@@ -383,8 +379,22 @@ pub fn initialize_turfs() {
 
 pub fn shutdown_turfs() {
 	wait_for_tasks();
-	TURF_GASES.write().as_mut().unwrap().clear();
-	PLANETARY_ATMOS.write().as_mut().unwrap().clear();
+	if let Some(turf_gases) = TURF_GASES.write().as_mut() {
+		turf_gases.clear();
+	}
+	if let Some(planetary_atmos) = PLANETARY_ATMOS.write().as_mut() {
+		planetary_atmos.clear();
+	}
+}
+
+#[cfg(feature = "superconductivity")]
+pub fn shutdown_turf_heat() {
+	superconduct::shutdown_turf_heat();
+}
+
+#[cfg(feature = "superconductivity")]
+pub fn prepare_turf_heat_for_world() {
+	superconduct::prepare_turf_heat_for_world();
 }
 
 fn with_turf_gases_read<T, F>(f: F) -> T
@@ -394,13 +404,15 @@ where
 	f(TURF_GASES.read().as_ref().unwrap())
 }
 
-/// Returns: how many space-boundary turfs are currently registered - i.e. how many specific space
-/// turfs some interior turf has discovered as a neighbor and registered on demand via the
-/// SPACE_BOUNDARY_FLAG path in hook_register_turf(). These are the only gas-graph nodes registered
-/// with empty SimulationFlags (every other registration in this codebase passes SIMULATION_ALL), so
-/// filtering on !enabled() identifies them precisely. Atmos Control Panel telemetry - lets an admin
-/// see at a glance that breach detection has real neighbors to work with, instead of the gap this
-/// counts existing silently the way it did until the 2026-08-14 playtest surfaced it.
+/// Returns whether a gas-arena slot is still named by a turf graph node.
+pub(crate) fn gas_mix_is_referenced(mix: usize) -> bool {
+	TURF_GASES
+		.read()
+		.as_ref()
+		.map_or(false, |arena| arena.graph.node_weights().any(|turf| turf.mix == mix))
+}
+
+/// Returns the number of on-demand space-boundary nodes in the gas graph.
 #[byondapi::bind("/proc/dogmos_space_boundary_count")]
 fn dogmos_space_boundary_count() -> Result<ByondValue> {
 	Ok((with_turf_gases_read(|arena| arena.graph.node_weights().filter(|mix| !mix.enabled()).count())
@@ -415,6 +427,13 @@ where
 	f(TURF_GASES.write().as_mut().unwrap())
 }
 
+/// Returns whether a queued callback still targets the current occupant of a stable turf ref.
+pub(crate) fn turf_callback_is_current(id: TurfID, generation: u32) -> bool {
+	ByondValue::new_ref(ValueType::Turf, id)
+		.read_number_id(byond_string!("dogmos_registration_generation"))
+		.map_or(false, |current| current >= 0.0 && current as u32 == generation)
+}
+
 fn with_planetary_atmos<T, F>(f: F) -> T
 where
 	F: FnOnce(&IndexMap<u32, Mixture, FxBuildHasher>) -> T,
@@ -422,32 +441,31 @@ where
 	f(PLANETARY_ATMOS.read().as_ref().unwrap())
 }
 
-fn with_planetary_atmos_upgradeable_read<T, F>(f: F) -> T
+fn with_planetary_atmos_upgradeable_read<T, F>(f: F) -> Result<T>
 where
-	F: FnOnce(RwLockUpgradableReadGuard<'_, Option<IndexMap<u32, Mixture, FxBuildHasher>>>) -> T,
+	F: FnOnce(RwLockUpgradableReadGuard<'_, Option<IndexMap<u32, Mixture, FxBuildHasher>>>) -> Result<T>,
 {
 	f(PLANETARY_ATMOS.upgradable_read())
 }
 
-/// Meridian: sentinel passed by /turf/open/space/register_dogmos_air() (dogmos_defines.dm's
-/// DOGMOS_SIMULATION_SPACE_BOUNDARY) instead of a real SimulationFlags bit. Space turfs are never
-/// registered through the normal Initalize_Atmos() path (see the init_air gate on the base
-/// register_dogmos_air()) - this lets one specific space turf be registered on demand, the moment an
-/// interior turf's adjacency pass actually discovers it as a neighbor, as a node that's present in
-/// the gas graph (so FDM diffusion and katmos's explosively_depressurize() can see it) but never
-/// itself processed: SimulationFlags(0) doesn't intersect SIMULATION_ANY, so should_process() never
-/// selects it as the current cell. That matters because every space turf shares one DM-side
-/// gas_mixture datum - if Rust ever wrote diffusion results into it the way it does for a normal
-/// enabled turf, that write would corrupt "vacuum" for every other space tile sharing the same mix
-/// slot. mark_immutable() on that shared mix below is what explosively_depressurize() actually keys
-/// off of to detect a breach.
+/// Sentinel used to register a discovered space turf as a gas-graph boundary without processing it.
+/// All space turfs share one immutable DM mixture, so boundary nodes must never receive diffusion
+/// writes.
 const SPACE_BOUNDARY_FLAG: i32 = -2;
+/// Mirrors DOGMOS_SIMULATION_REMOVE in code/__DEFINES/dogmos_defines.dm.
+const REMOVE_TURF_FLAG: i32 = -3;
 
 /// Returns: null. Updates turf air infos, whether the turf is closed, is space or a regular turf, or even a planet turf is decided here.
 #[byondapi::bind("/turf/proc/update_air_ref")]
 fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	let raw_flag = flag.get_number()? as i32;
+	if raw_flag == REMOVE_TURF_FLAG {
+		with_turf_gases_write(|arena| arena.remove_turf(id));
+		#[cfg(feature = "superconductivity")]
+		superconduct::remove_turf(id);
+		return Ok(ByondValue::null());
+	}
 	let is_space_boundary = raw_flag == SPACE_BOUNDARY_FLAG;
 	let flag = if is_space_boundary { 0 } else { raw_flag };
 	if let Ok(blocks) = src.read_number_id(byond_string!("blocks_air")) {
@@ -461,9 +479,12 @@ fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 	if flag >= 0 {
 		let mut to_insert: TurfMixture = TurfMixture::default();
 		let air = src.read_var_id(byond_string!("air"))?;
-		to_insert.mix = air.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize;
+		to_insert.mix = gas_slot_for_mix(&air)?;
 		to_insert.flags = SimulationFlags::from_bits_truncate(flag as u8);
 		to_insert.id = id;
+		to_insert.generation = src
+			.read_number_id(byond_string!("dogmos_registration_generation"))
+			.unwrap_or(0.0) as u32;
 
 		if !is_space_boundary {
 			if let Ok(is_planet) = src.read_number_id(byond_string!("planetary_atmos")) {
@@ -480,7 +501,7 @@ fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 								.unwrap()
 								.contains_key(&to_insert.planetary_atmos.unwrap())
 							{
-								return;
+								return Ok(());
 							}
 
 							let mut write =
@@ -490,11 +511,12 @@ fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 								.as_mut()
 								.unwrap()
 								.insert(to_insert.planetary_atmos.unwrap(), {
-									let mut gas = to_insert.get_gas_copy();
+									let mut gas = to_insert.get_gas_copy()?;
 									gas.mark_immutable();
 									gas
 								});
-						});
+							Ok(())
+						})?;
 					}
 				}
 			}
@@ -526,45 +548,18 @@ fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 	Ok(ByondValue::null())
 }
 
-/* will come back to you later
-const PLANET_TURF: i32 = 1;
-const SPACE_TURF: i32 = 0;
-const CLOSED_TURF: i32 = -1;
-const OPEN_TURF: i32 = 2;
-
-//hardcoded because we can't have nice things
-fn determine_turf_flag(src: &ByondValue) -> i32 {
-	let path = src
-		.read_string_id(byond_string!("("type")
-		.unwrap_or_else(|_| "TYPPENOTFOUND".to_string());
-	if !path.as_str().starts_with("/turf/open") {
-		CLOSED_TURF
-	} else if src.read_number_id(byond_string!("planetary_atmos")).unwrap_or(0.0) > 0.0 {
-		PLANET_TURF
-	} else if path.as_str().starts_with("/turf/open/space") {
-		SPACE_TURF
-	} else {
-		OPEN_TURF
-	}
-}
-*/
 /// Updates adjacency infos for turfs, only use this in immediateupdateturfs.
 ///
-/// Meridian: max_x/max_y are passed in from DM (world.maxx/world.maxy) rather than fetched here via
-/// FFI - byondapi's generic read_number_id/Byond_ReadVarByStrId does not work against the World
-/// value type for its built-in intrinsic properties (maxx/maxy are not stored in the regular var
-/// table the way user-declared datum vars are), so a self-fetch inside supercond_update_adjacencies
-/// always failed with "Attempt to interpret non-number value as number". DM has these trivially as
-/// native properties, so passing them through avoids the broken read path entirely.
+/// The map bounds are passed from DM because World intrinsic properties are not regular FFI vars.
 #[byondapi::bind("/turf/proc/__update_auxtools_turf_adjacency_info")]
 fn hook_infos(src: ByondValue, max_x: ByondValue, max_y: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
+	let adjacent_list = src
+		.read_var_id(byond_string!("atmos_adjacent_turfs"))
+		.ok()
+		.and_then(|adjs| adjs.is_list().then_some(adjs));
 	with_turf_gases_write(|arena| -> Result<()> {
-		if let Some(adjacent_list) = src
-			.read_var_id(byond_string!("atmos_adjacent_turfs"))
-			.ok()
-			.and_then(|adjs| adjs.is_list().then_some(adjs))
-		{
+		if let Some(adjacent_list) = adjacent_list {
 			arena.update_adjacencies(id, adjacent_list)?;
 		} else if let Some(&idx) = arena.map.get(&id) {
 			arena.remove_adjacencies(idx);
@@ -580,15 +575,8 @@ fn hook_infos(src: ByondValue, max_x: ByondValue, max_y: ByondValue) -> Result<B
 /// Updates the visual overlays for the given turf.
 /// Will use a cached overlay list if one exists.
 ///
-/// Meridian: gas_overlays is 3-level here (GAS_ID -> PLANE_OFFSET+1 -> VIS_FACTOR -> OVERLAY), not the
-/// 2-level (GAS_ID -> VIS_FACTOR) shape upstream auxmos expects, because this codebase renders each
-/// multiz z-level's gas overlays on a different plane (see code/__HELPERS/_planes.dm's
-/// GET_TURF_PLANE_OFFSET, which this mirrors) - a 2-level lookup would render every level's gas on
-/// whichever plane offset 0 uses. GLOB.gas_data.overlays is populated by SSdogmos.Initialize()
-/// (modular_aphelion/modules/dogmos/code/dogmos.dm) as a direct reference into the same pre-baked
-/// overlay objects GLOB.meta_gas_info[META_GAS_OVERLAY] already owns, not a duplicate set - including
-/// when SSmapping grows z_level_to_plane_offset for a new z-level after roundstart, since both point
-/// at the same underlying list.
+/// Gas overlays are indexed by gas id, plane offset, and visibility factor because each z-level uses
+/// a distinct render plane. The overlay objects are shared with the DM gas metadata.
 /// # Errors
 /// If auxgm wasn't implemented properly or there's an invalid gas mixture.
 fn update_visuals(src: ByondValue) -> Result<ByondValue> {
@@ -626,11 +614,7 @@ fn update_visuals(src: ByondValue) -> Result<ByondValue> {
 				1.0
 			};
 
-			let ptr = air
-				.read_var_id(byond_string!("_extools_pointer_gasmixture"))
-				.wrap_err("air is undefined on turf")?
-				.get_number()
-				.wrap_err("Gas mixture has invalid pointer")? as usize;
+			let ptr = gas_slot_for_mix(&air).wrap_err("air has an invalid gas mixture slot")?;
 			let overlay_types = GasArena::with_gas_mixture(ptr, |mix| {
 				Ok(mix
 					.enumerate()

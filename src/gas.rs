@@ -11,19 +11,45 @@ pub use types::*;
 
 pub type GasIDX = usize;
 
-/// A static container, with a bunch of helper functions for accessing global data. It's horrible, I know, but video games.
+/// Accessors for the shared gas-mixture arena.
 pub struct GasArena {}
 
-/*
-	This is where the gases live.
-	This is just a big vector, acting as a gas mixture pool.
-	As you can see, it can be accessed by any thread at any time;
-	of course, it has a RwLock preventing this, and you can't access the
-	vector directly. Seriously, please don't. I have the wrapper functions for a reason.
-*/
+// Gas mixtures live in a lock-protected pool so worker threads can process them concurrently.
 static GAS_MIXTURES: RwLock<Option<Vec<RwLock<Mixture>>>> = const_rwlock(None);
 
 static NEXT_GAS_IDS: RwLock<Option<Vec<usize>>> = const_rwlock(None);
+
+fn gas_slot_from_number(raw_slot: f32, arena_len: usize) -> Result<usize> {
+	if !raw_slot.is_finite() || raw_slot < 0.0 || raw_slot.fract() != 0.0 {
+		return Err(eyre::eyre!("Gas mixture has an invalid arena slot: {raw_slot}"));
+	}
+	let slot = raw_slot as usize;
+	if slot >= arena_len {
+		return Err(eyre::eyre!(
+			"Gas mixture arena slot {slot} is outside the arena (length {arena_len})"
+		));
+	}
+	Ok(slot)
+}
+
+fn ensure_distinct_mixture_slots(src: usize, arg: usize) -> Result<()> {
+	if src == arg {
+		return Err(eyre::eyre!(
+			"Cannot operate on the same gas mixture as both arguments"
+		));
+	}
+	Ok(())
+}
+
+pub(crate) fn gas_slot_for_mix(mix: &ByondValue) -> Result<usize> {
+	let raw_slot = mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))?;
+	let arena_len = GAS_MIXTURES
+		.read()
+		.as_ref()
+		.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?
+		.len();
+	gas_slot_from_number(raw_slot, arena_len)
+}
 
 #[byondapi::init]
 pub fn initialize_gases() {
@@ -32,9 +58,14 @@ pub fn initialize_gases() {
 }
 
 pub fn shut_down_gases() {
+	#[cfg(feature = "turf_processing")]
 	crate::turfs::wait_for_tasks();
-	GAS_MIXTURES.write().as_mut().unwrap().clear();
-	NEXT_GAS_IDS.write().as_mut().unwrap().clear();
+	if let Some(gas_mixtures) = GAS_MIXTURES.write().as_mut() {
+		gas_mixtures.clear();
+	}
+	if let Some(next_gas_ids) = NEXT_GAS_IDS.write().as_mut() {
+		next_gas_ids.clear();
+	}
 }
 
 impl GasArena {
@@ -48,16 +79,6 @@ impl GasArena {
 		f(GAS_MIXTURES.read().as_ref().unwrap())
 	}
 
-	/// Locks the gas arena and and runs the given closure with it locked, fails if it can't acquire a lock in 30ms.
-	/// # Panics
-	/// if `GAS_MIXTURES` hasn't been initialized, somehow.
-	pub fn with_all_mixtures_fallible<T, F>(f: F) -> T
-	where
-		F: FnOnce(Option<&[RwLock<Mixture>]>) -> T,
-	{
-		let gases = GAS_MIXTURES.try_read_for(std::time::Duration::from_millis(30));
-		f(gases.as_ref().unwrap().as_ref().map(|vec| vec.as_slice()))
-	}
 	/// Read locks the given gas mixture and runs the given closure on it.
 	/// # Errors
 	/// If no such gas mixture exists or the closure itself errors.
@@ -124,25 +145,21 @@ impl GasArena {
 	{
 		let lock = GAS_MIXTURES.read();
 		let gas_mixtures = lock.as_ref().unwrap();
-		if src == arg {
-			let mut entry = gas_mixtures
-				.get(src)
-				.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?
-				.write();
-			let mix = &mut entry;
-			let mut copied = mix.clone();
-			f(mix, &mut copied)
+		let src_lock = gas_mixtures
+			.get(src)
+			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?;
+		let arg_lock = gas_mixtures
+			.get(arg)
+			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {arg} exists!"))?;
+		ensure_distinct_mixture_slots(src, arg)?;
+		if src < arg {
+			let mut src_mix = src_lock.write();
+			let mut arg_mix = arg_lock.write();
+			f(&mut src_mix, &mut arg_mix)
 		} else {
-			f(
-				&mut gas_mixtures
-					.get(src)
-					.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?
-					.write(),
-				&mut gas_mixtures
-					.get(arg)
-					.ok_or_else(|| eyre::eyre!("No gas mixture with ID {arg} exists!"))?
-					.write(),
-			)
+			let mut arg_mix = arg_lock.write();
+			let mut src_mix = src_lock.write();
+			f(&mut src_mix, &mut arg_mix)
 		}
 	}
 	/// Runs the given closure on the gas mixture *locks* rather than an already-locked version.
@@ -156,32 +173,66 @@ impl GasArena {
 	{
 		let lock = GAS_MIXTURES.read();
 		let gas_mixtures = lock.as_ref().unwrap();
-		if src == arg {
-			let entry = gas_mixtures
-				.get(src)
-				.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?;
-			let gas_copy = entry.read().clone();
-			f(entry, &RwLock::new(gas_copy))
-		} else {
-			f(
-				gas_mixtures
-					.get(src)
-					.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?,
-				gas_mixtures
-					.get(arg)
-					.ok_or_else(|| eyre::eyre!("No gas mixture with ID {arg} exists!"))?,
-			)
-		}
+		let src_lock = gas_mixtures
+			.get(src)
+			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?;
+		let arg_lock = gas_mixtures
+			.get(arg)
+			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {arg} exists!"))?;
+		ensure_distinct_mixture_slots(src, arg)?;
+		f(src_lock, arg_lock)
 	}
 	/// Fills in the first unused slot in the gas mixtures vector, or adds another one, then sets the argument ByondValue to point to it.
 	/// # Errors
-	/// If `initial_volume` is incorrect or `_extools_pointer_gasmixture` doesn't exist, somehow.
-	/// # Panics
-	/// If not called from the main thread
-	/// If `NEXT_GAS_IDS` is not initialized, somehow.
+	/// If `initial_volume` is incorrect, either gas arena is not initialized, or
+	/// `_extools_pointer_gasmixture` doesn't exist.
 	pub fn register_mix(mut mix: ByondValue) -> Result<ByondValue> {
 		let init_volume = mix.read_number_id(byond_string!("initial_volume"))?;
-		if NEXT_GAS_IDS.read().as_ref().unwrap().is_empty() {
+		if !init_volume.is_finite() || init_volume < 0.0 {
+			return Err(eyre::eyre!(
+				"Gas mixture volume must be finite and non-negative, got {init_volume}"
+			));
+		}
+		let arena_len = GAS_MIXTURES
+			.read()
+			.as_ref()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?
+			.len();
+		let reusable_idx = {
+			let mut next_gas_ids = NEXT_GAS_IDS.write();
+			let next_gas_ids = next_gas_ids
+			.as_mut()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
+			let reusable_position = (0..next_gas_ids.len()).rev().find(|position| {
+				if next_gas_ids[*position] >= arena_len {
+					return false;
+				}
+				#[cfg(feature = "turf_processing")]
+				let referenced = crate::turfs::gas_mix_is_referenced(next_gas_ids[*position]);
+				#[cfg(not(feature = "turf_processing"))]
+				let referenced = {
+					let _ = position;
+					false
+				};
+				!referenced
+			});
+			reusable_position.map(|position| next_gas_ids.swap_remove(position))
+		};
+
+		if let Some(idx) = reusable_idx {
+			GAS_MIXTURES
+				.read()
+				.as_ref()
+				.unwrap()
+				.get(idx)
+				.ok_or_else(|| eyre::eyre!("Reusable gas mixture ID {idx} is outside the gas arena"))?
+				.write()
+				.clear_with_vol(init_volume);
+			mix.write_var_id(
+				byond_string!("_extools_pointer_gasmixture"),
+				&(idx as f32).into(),
+			)?;
+		} else {
 			let mut gas_lock = GAS_MIXTURES.write();
 			let gas_mixtures = gas_lock.as_mut().unwrap();
 			let next_idx = gas_mixtures.len();
@@ -190,54 +241,39 @@ impl GasArena {
 			mix.write_var_id(
 				byond_string!("_extools_pointer_gasmixture"),
 				&(next_idx as f32).into(),
-			)
-			.unwrap();
+			)?;
 
 			let mut ids_lock = NEXT_GAS_IDS.write();
 			let cur_last = gas_mixtures.len();
 			let next_gas_ids = ids_lock.as_mut().unwrap();
 			let cap = {
-				let to_cap = gas_mixtures.capacity() - cur_last;
+				let to_cap = gas_mixtures.capacity().saturating_sub(cur_last);
 				if to_cap == 0 {
-					next_gas_ids.capacity() - 100
+					next_gas_ids.capacity().saturating_sub(100)
 				} else {
-					(next_gas_ids.capacity() - 100).min(to_cap)
+					(next_gas_ids.capacity().saturating_sub(100)).min(to_cap)
 				}
 			};
 			next_gas_ids.extend(cur_last..(cur_last + cap));
 			gas_mixtures.resize_with(cur_last + cap, Default::default);
-		} else {
-			let idx = {
-				let mut next_gas_ids = NEXT_GAS_IDS.write();
-				next_gas_ids.as_mut().unwrap().pop().unwrap()
-			};
-			GAS_MIXTURES
-				.read()
-				.as_ref()
-				.unwrap()
-				.get(idx)
-				.unwrap()
-				.write()
-				.clear_with_vol(init_volume);
-			mix.write_var_id(
-				byond_string!("_extools_pointer_gasmixture"),
-				&(idx as f32).into(),
-			)
-			.unwrap();
 		}
 		Ok(ByondValue::null())
 	}
 	/// Marks the ByondValue's gas mixture as unused, allowing it to be reallocated to another.
-	/// # Panics
-	/// If not called from the main thread
-	/// If `NEXT_GAS_IDS` hasn't been initialized, somehow.
-	pub fn unregister_mix(mix: &ByondValue) {
-		if let Ok(idx) = mix.read_number_id(byond_string!("_extools_pointer_gasmixture")) {
-			let mut next_gas_ids = NEXT_GAS_IDS.write();
-			next_gas_ids.as_mut().unwrap().push(idx as usize);
-		} else {
-			panic!("Tried to unregister uninitialized mix")
+	///
+	/// # Errors
+	/// If the mix has no valid arena slot or the arena has not been initialized.
+	pub fn unregister_mix(mix: &ByondValue) -> Result<()> {
+		let idx = gas_slot_for_mix(mix)?;
+
+		let mut next_gas_ids = NEXT_GAS_IDS.write();
+		let next_gas_ids = next_gas_ids
+			.as_mut()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
+		if !next_gas_ids.contains(&idx) {
+			next_gas_ids.push(idx);
 		}
+		Ok(())
 	}
 }
 
@@ -248,10 +284,7 @@ pub fn with_mix<T, F>(mix: &ByondValue, f: F) -> Result<T>
 where
 	F: FnOnce(&Mixture) -> Result<T>,
 {
-	GasArena::with_gas_mixture(
-		mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
-		f,
-	)
+	GasArena::with_gas_mixture(gas_slot_for_mix(mix)?, f)
 }
 
 /// As `with_mix`, but mutable.
@@ -261,10 +294,7 @@ pub fn with_mix_mut<T, F>(mix: &ByondValue, f: F) -> Result<T>
 where
 	F: FnOnce(&mut Mixture) -> Result<T>,
 {
-	GasArena::with_gas_mixture_mut(
-		mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
-		f,
-	)
+	GasArena::with_gas_mixture_mut(gas_slot_for_mix(mix)?, f)
 }
 
 /// As `with_mix`, but with two mixes.
@@ -275,8 +305,8 @@ where
 	F: FnOnce(&Mixture, &Mixture) -> Result<T>,
 {
 	GasArena::with_gas_mixtures(
-		src_mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
-		arg_mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
+		gas_slot_for_mix(src_mix)?,
+		gas_slot_for_mix(arg_mix)?,
 		f,
 	)
 }
@@ -289,8 +319,8 @@ where
 	F: FnOnce(&mut Mixture, &mut Mixture) -> Result<T>,
 {
 	GasArena::with_gas_mixtures_mut(
-		src_mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
-		arg_mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
+		gas_slot_for_mix(src_mix)?,
+		gas_slot_for_mix(arg_mix)?,
 		f,
 	)
 }
@@ -303,8 +333,8 @@ where
 	F: FnMut(&RwLock<Mixture>, &RwLock<Mixture>) -> Result<T>,
 {
 	GasArena::with_gas_mixtures_custom(
-		src_mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
-		arg_mix.read_number_id(byond_string!("_extools_pointer_gasmixture"))? as usize,
+		gas_slot_for_mix(src_mix)?,
+		gas_slot_for_mix(arg_mix)?,
 		f,
 	)
 }
@@ -321,4 +351,24 @@ pub fn amt_gases() -> usize {
 /// if `GAS_MIXTURES` hasn't been initialized, somehow.
 pub fn tot_gases() -> usize {
 	GAS_MIXTURES.read().as_ref().unwrap().len()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ensure_distinct_mixture_slots, gas_slot_from_number};
+
+	#[test]
+	fn rejects_invalid_or_stale_gas_arena_slots() {
+		assert!(gas_slot_from_number(f32::NAN, 4).is_err());
+		assert!(gas_slot_from_number(-1.0, 4).is_err());
+		assert!(gas_slot_from_number(1.5, 4).is_err());
+		assert!(gas_slot_from_number(4.0, 4).is_err());
+		assert_eq!(gas_slot_from_number(3.0, 4).unwrap(), 3);
+	}
+
+	#[test]
+	fn rejects_aliased_mutation_slots() {
+		assert!(ensure_distinct_mixture_slots(4, 4).is_err());
+		assert!(ensure_distinct_mixture_slots(4, 5).is_ok());
+	}
 }

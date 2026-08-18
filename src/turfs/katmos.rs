@@ -1,7 +1,6 @@
 //Monstermos, but zoned, and multithreaded!
 
 use super::*;
-use auxcallback::byond_callback_sender;
 use coarsetime::{Duration, Instant};
 use indexmap::IndexSet;
 use petgraph::{graph::NodeIndex, graphmap::DiGraphMap};
@@ -87,15 +86,16 @@ fn finalize_eq(
 	index: NodeIndex,
 	arena: &TurfGases,
 	eq_movement_graph: &DiGraphMap<NodeIndex, Cell<f32>>,
-	pressures: &mut Vec<(f32, u32, u32)>,
+	pressures: &mut Vec<(f32, u32, u32, u32, u32)>,
 ) {
-	//null it out lol
+	// Consume the pending movement for this node.
 	let pairs = eq_movement_graph
 		.edges(index)
 		.map(|edge| (edge.target(), edge.weight().replace(0.0)))
 		.collect::<Vec<_>>();
 	let turf = arena.get(index).unwrap();
 	let cur_turf_id = turf.id;
+	let cur_turf_generation = turf.generation;
 
 	pairs
 		.iter()
@@ -119,7 +119,13 @@ fn finalize_eq(
 				));
 			}
 			let adj_turf_id = adj_mix.id;
-			pressures.push((amount, cur_turf_id, adj_turf_id));
+			pressures.push((
+				amount,
+				cur_turf_id,
+				cur_turf_generation,
+				adj_turf_id,
+				adj_mix.generation,
+			));
 		});
 }
 
@@ -127,7 +133,7 @@ fn finalize_eq_neighbors(
 	arena: &TurfGases,
 	pairs: &[(NodeIndex, f32)],
 	eq_movement_graph: &DiGraphMap<NodeIndex, Cell<f32>>,
-	pressures: &mut Vec<(f32, u32, u32)>,
+	pressures: &mut Vec<(f32, u32, u32, u32, u32)>,
 ) {
 	pairs
 		.iter()
@@ -199,14 +205,14 @@ fn give_to_takers(
 						adj_info.curr_transfer_dir = Some(cur_index);
 						adj_info.curr_transfer_amount = 0.0;
 						if adj_info.mole_delta < 0.0 {
-							// this turf needs gas. Let's give it to 'em.
+							// This turf needs gas.
 							if -adj_info.mole_delta > giver_info.mole_delta {
-								// we don't have enough gas
+								// The source does not have enough gas.
 								adj_info.curr_transfer_amount -= giver_info.mole_delta;
 								adj_info.mole_delta += giver_info.mole_delta;
 								giver_info.mole_delta = 0.0;
 							} else {
-								// we have enough gas.
+								// The source has enough gas.
 								adj_info.curr_transfer_amount += adj_info.mole_delta;
 								giver_info.mole_delta += adj_info.mole_delta;
 								adj_info.mole_delta = 0.0;
@@ -270,14 +276,14 @@ fn take_from_givers(
 						adj_info.curr_transfer_dir = Some(cur_index);
 						adj_info.curr_transfer_amount = 0.0;
 						if adj_info.mole_delta > 0.0 {
-							// this turf has gas we can succ. Time to succ.
+							// This turf has gas available.
 							if adj_info.mole_delta > -taker_info.mole_delta {
-								// they have enough gase
+								// The source has enough gas.
 								adj_info.curr_transfer_amount -= taker_info.mole_delta;
 								adj_info.mole_delta += taker_info.mole_delta;
 								taker_info.mole_delta = 0.0;
 							} else {
-								// they don't have neough gas
+								// The source does not have enough gas.
 								adj_info.curr_transfer_amount += adj_info.mole_delta;
 								taker_info.mole_delta += adj_info.mole_delta;
 								adj_info.mole_delta = 0.0;
@@ -424,7 +430,12 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 				}
 			}
 
-			let _average_moles = total_moles / (progression_order.len() - space_turf_len) as f32;
+			let non_space_turf_len = progression_order.len().saturating_sub(space_turf_len);
+			let average_moles = if non_space_turf_len == 0 {
+				0.0
+			} else {
+				total_moles / non_space_turf_len as f32
+			};
 
 			let mut hpd = ByondValue::new_global_ref()
 				.read_var_id(byond_string!("SSair"))
@@ -439,14 +450,7 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 				if cur_info.curr_transfer_dir.is_none() {
 					continue;
 				}
-				// Meridian: measured directly (before vs. after) rather than assumed, because how much
-				// this call actually removes differs by feature flag (clear_air() takes everything;
-				// clear_moles() under katmos_slow_decompression takes at most _average_moles/4, or
-				// less if the turf had less than that to begin with) - this is what
-				// handle_decompression_floor_rip() below needs: how much THIS turf actually lost, not
-				// a downstream neighbor's unrelated moles count (see the `sum` var immediately after,
-				// which is a different quantity entirely - the spacewind pressure-accumulation amount,
-				// reused incorrectly for the floor-rip call in an earlier version of this function).
+				// Measure loss after clearing because slow decompression may remove less than requested.
 				let pre_clear_moles = cur_mixture.total_moles();
 				#[cfg(not(feature = "katmos_slow_decompression"))]
 				{
@@ -454,8 +458,9 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 				}
 				#[cfg(feature = "katmos_slow_decompression")]
 				{
-					const DECOMP_REMOVE_RATIO: f32 = 4_f32;
-					cur_mixture.clear_moles((_average_moles / DECOMP_REMOVE_RATIO).abs());
+					cur_mixture.clear_moles(
+						decompression_moles_per_turf(average_moles, space_turf_len).abs(),
+					);
 				}
 				let moles_lost = pre_clear_moles - cur_mixture.total_moles();
 				let mut byond_turf = ByondValue::new_ref(ValueType::Turf, cur_mixture.id);
@@ -476,7 +481,7 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 				adj_info.curr_transfer_amount += cur_info.curr_transfer_amount;
 				adj_orig.set(adj_info);
 
-				let mut byond_turf_adj = ByondValue::new_ref(ValueType::Turf, cur_mixture.id);
+				let mut byond_turf_adj = ByondValue::new_ref(ValueType::Turf, adj_mixture.id);
 
 				byond_turf.write_var_id(
 					byond_string!("pressure_difference"),
@@ -504,7 +509,12 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 					)?;
 				}
 
-				floor_rip_turfs.push((byond_turf, moles_lost.into()));
+				// Pressure redistribution applies to every drained turf. Floor damage is limited to the
+				// first gas layer next to immutable space, or a connected tunnel would lose every floor
+				// tile merely because its air was included in the same decompression flood-fill.
+				if should_notify_floor_rip(adj_mixture.is_immutable(), moles_lost) {
+					floor_rip_turfs.push((byond_turf, moles_lost.into()));
+				}
 			}
 			Ok(floor_rip_turfs)
 		})?;
@@ -513,6 +523,19 @@ fn explosively_depressurize(initial_index: TurfID, equalize_hard_turf_limit: usi
 	}
 
 	Ok(())
+}
+
+#[cfg(feature = "katmos_slow_decompression")]
+const DECOMP_BASE_REMOVE_RATIO: f32 = 4.0;
+#[cfg(feature = "katmos_slow_decompression")]
+const DECOMP_MAX_FRONTAGE_TURFS: usize = 4;
+
+#[cfg(feature = "katmos_slow_decompression")]
+fn decompression_moles_per_turf(average_moles: f32, space_turf_len: usize) -> f32 {
+	// A wider opening exposes more room air to space during the same equalizer pass. Cap the frontage
+	// multiplier so a map-scale boundary remains a slow drain rather than becoming an instant clear.
+	let frontage_turfs = space_turf_len.clamp(1, DECOMP_MAX_FRONTAGE_TURFS) as f32;
+	average_moles * frontage_turfs / DECOMP_BASE_REMOVE_RATIO
 }
 
 enum FloodFillResult {
@@ -531,7 +554,6 @@ fn flood_fill_zones(
 ) -> FloodFillResult {
 	let mut turf_graph: DiGraphMap<NodeIndex, Cell<f32>> = Default::default();
 	let mut border_turfs: std::collections::VecDeque<NodeIndex> = Default::default();
-	let sender = byond_callback_sender();
 	let mut total_moles = 0.0_f32;
 	let mut is_planet = false;
 	turf_graph.add_node(index_node);
@@ -541,6 +563,7 @@ fn flood_fill_zones(
 	while let Some(cur_index) = border_turfs.pop_front() {
 		let cur_turf = arena.get(cur_index).unwrap();
 		let cur_turf_id = cur_turf.id;
+		let cur_turf_generation = cur_turf.generation;
 		//hard cap for planet atmos because very large open space
 		if cur_turf.planetary_atmos.is_some() {
 			is_planet = true;
@@ -573,23 +596,33 @@ fn flood_fill_zones(
 				}
 
 				if adj_mixture.is_immutable() {
-					// Uh oh! looks like someone opened an airlock to space! TIME TO SUCK ALL THE AIR OUT!!!
-					// NOT ONE OF YOU IS GONNA SURVIVE THIS
-					// (I just made explosions less laggy, you're welcome)
-					drop(sender.try_send(Box::new(move || {
+					// An opening to immutable space triggers decompression.
+					auxcallback::queue_callback(Box::new(move || {
+						if !crate::turfs::turf_callback_is_current(
+							cur_turf_id,
+							cur_turf_generation,
+						) {
+							return Ok(());
+						}
 						explosively_depressurize(cur_turf_id, equalize_hard_turf_limit)
 							.wrap_err("Decompressing")
-					})));
+					}));
 					ignore_zone = true;
 				}
 
 				if adj_mixture.planetary_atmos.is_some()
 					&& weight.contains(AdjacentFlags::ATMOS_ADJACENT_FIRELOCK)
 				{
-					drop(sender.try_send(Box::new(move || {
+					auxcallback::queue_callback(Box::new(move || {
+						if !crate::turfs::turf_callback_is_current(
+							cur_turf_id,
+							cur_turf_generation,
+						) {
+							return Ok(());
+						}
 						planet_equalize(cur_turf_id, equalize_hard_turf_limit)
 							.wrap_err("Equalising planet air")
-					})));
+					}));
 				}
 			}
 		}
@@ -658,6 +691,30 @@ fn planet_equalize(initial_index: TurfID, equalize_hard_turf_limit: usize) -> Re
 	Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn only_hull_boundary_turfs_are_floor_rip_candidates() {
+		assert!(should_notify_floor_rip(true, 1.0));
+		assert!(!should_notify_floor_rip(false, 1.0));
+		assert!(!should_notify_floor_rip(true, 0.0));
+	}
+
+	#[cfg(feature = "katmos_slow_decompression")]
+	#[test]
+	fn slow_decompression_scales_with_breach_frontage() {
+		assert_eq!(decompression_moles_per_turf(100.0, 1), 25.0);
+		assert_eq!(decompression_moles_per_turf(100.0, 2), 50.0);
+		assert_eq!(decompression_moles_per_turf(100.0, 4), 100.0);
+		assert_eq!(
+			decompression_moles_per_turf(100.0, DECOMP_MAX_FRONTAGE_TURFS + 1),
+			100.0,
+		);
+	}
+}
+
 #[cfg_attr(feature = "tracy", tracing::instrument(skip_all))]
 fn process_zone(
 	graph: DiGraphMap<NodeIndex, Cell<f32>>,
@@ -722,30 +779,47 @@ fn process_zone(
 fn finalize_eq_zone(
 	arena: &TurfGases,
 	graph: DiGraphMap<NodeIndex, Cell<f32>>,
-) -> Option<Vec<(f32, u32, u32)>> {
-	let mut pressures: Vec<(f32, u32, u32)> = Vec::new();
+) -> Option<Vec<(f32, u32, u32, u32, u32)>> {
+	let mut pressures: Vec<(f32, u32, u32, u32, u32)> = Vec::new();
 	graph.nodes().for_each(|cur_index| {
 		finalize_eq(cur_index, arena, &graph, &mut pressures);
 	});
 	(!pressures.is_empty()).then_some(pressures)
 }
 
-fn send_pressure_differences(
-	pressures: Vec<(f32, u32, u32)>,
-	sender: &auxcallback::CallbackSender,
-) {
-	for (amt, cur_turf, adj_turf) in pressures {
-		drop(sender.try_send(Box::new(move || {
-			let turf = ByondValue::new_ref(ValueType::Turf, cur_turf);
-			let other_turf = ByondValue::new_ref(ValueType::Turf, adj_turf);
-			turf.call_id(
-				byond_string!("consider_pressure_difference"),
-				&[other_turf, amt.into()],
-			)
-			.map(|_| ())
-			.wrap_err("Katmos considering pressure differences")
-		})));
+fn send_pressure_differences(pressures: Vec<(f32, u32, u32, u32, u32)>) {
+	const PRESSURE_CALLBACK_BATCH_SIZE: usize = 256;
+	let mut pressures = pressures;
+	while !pressures.is_empty() {
+		let batch_len = PRESSURE_CALLBACK_BATCH_SIZE.min(pressures.len());
+		let batch = pressures.drain(..batch_len).collect::<Vec<_>>();
+		auxcallback::queue_callback(Box::new(move || {
+			let mut first_error = None;
+			for (amount, current_turf, current_generation, adjacent_turf, adjacent_generation) in batch {
+				if !crate::turfs::turf_callback_is_current(current_turf, current_generation)
+					|| !crate::turfs::turf_callback_is_current(adjacent_turf, adjacent_generation)
+				{
+					continue;
+				}
+				let turf = ByondValue::new_ref(ValueType::Turf, current_turf);
+				let other_turf = ByondValue::new_ref(ValueType::Turf, adjacent_turf);
+				let result = turf.call_id(
+					byond_string!("consider_pressure_difference"),
+					&[other_turf, amount.into()],
+				)
+				.map(|_| ())
+				.wrap_err("Katmos considering pressure differences");
+				if let Err(error) = result {
+					first_error.get_or_insert(error);
+				}
+			}
+			first_error.map_or(Ok(()), Err)
+		}));
 	}
+}
+
+fn should_notify_floor_rip(parent_is_space: bool, moles_lost: f32) -> bool {
+	parent_is_space && moles_lost > 0.0
 }
 
 /// Returns: If this cycle is interrupted by overtiming or not. Starts a katmos equalize cycle, does nothing if process_turfs isn't ran.
@@ -753,8 +827,15 @@ fn send_pressure_differences(
 fn equalize_hook(mut src: ByondValue, remaining: ByondValue) -> Result<ByondValue> {
 	let equalize_hard_turf_limit = src
 		.read_number_id(byond_string!("equalize_hard_turf_limit"))
-		.unwrap_or(2000.0) as usize;
-	let remaining_time = Duration::from_millis(remaining.get_number().unwrap_or(50.0) as u64);
+		.ok()
+		.filter(|limit| limit.is_finite() && *limit >= 0.0)
+		.map_or(2000, |limit| limit as usize);
+	let remaining_millis = remaining
+		.get_number()
+		.ok()
+		.filter(|budget| budget.is_finite())
+		.map_or(50.0, |budget| budget.max(0.0));
+	let remaining_time = Duration::from_millis(remaining_millis as u64);
 	let start_time = Instant::now();
 	let (num_eq, is_cancelled) = with_equalizes(|thing| {
 		if let Some(high_pressure_turfs) = thing {
@@ -810,7 +891,10 @@ fn equalize(
 			}
 
 			let is_unshareable = GasArena::with_all_mixtures(|all_mixtures| {
-				let our_moles = all_mixtures[cur_mixture.mix].read().total_moles();
+				let Some(our_mix) = all_mixtures.get(cur_mixture.mix) else {
+					return true;
+				};
+				let our_moles = our_mix.read().total_moles();
 				our_moles < 10.0
 					|| arena
 						.adjacent_mixes(cur_index_node, all_mixtures)
@@ -866,11 +950,9 @@ fn equalize(
 			.filter_map(|graph| finalize_eq_zone(arena, graph))
 			.collect::<Vec<_>>();
 
-		let sender = byond_callback_sender();
-
 		final_pressures
 			.into_iter()
-			.for_each(|final_pressures| send_pressure_differences(final_pressures, &sender));
+			.for_each(send_pressure_differences);
 		false
 	});
 	(turfs_processed.load(Ordering::Relaxed), is_cancelled)

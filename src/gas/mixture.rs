@@ -55,14 +55,13 @@ pub fn visibility_step(gas_amt: f32) -> u32 {
 		.clamp(1.0, FACTOR_GAS_VISIBLE_MAX) as u32
 }
 
+#[inline]
+fn quantize(amount: f32) -> f32 {
+	(amount / MOLAR_ACCURACY).round() * MOLAR_ACCURACY
+}
+
 /// The data structure representing a Space Station 13 gas mixture.
-/// Unlike Monstermos, this doesn't have the archive built-in; instead,
-/// the archive is a feature of the turf grid, only existing during
-/// turf processing.
-/// Also missing is `last_share`; due to the usage of Rust,
-/// processing no longer requires sleeping turfs. Instead, we're using
-/// a proper, fully-simulated FDM system, much like LINDA but without
-/// sleeping turfs.
+/// The archive is maintained by the turf grid during processing, rather than by each mixture.
 #[derive(Clone, Debug)]
 pub struct Mixture {
 	temperature: f32,
@@ -101,13 +100,15 @@ impl Mixture {
 	}
 	/// Returns if any data is corrupt.
 	pub fn is_corrupt(&self) -> bool {
-		!self.temperature.is_normal() || self.moles.len() > total_num_gases()
+		!self.temperature.is_normal()
+			|| self.temperature < TCMB
+			|| self.moles.len() > total_num_gases()
 	}
 	/// Fixes any corruption found.
 	pub fn fix_corruption(&mut self) {
 		self.garbage_collect();
-		if self.temperature < 2.7 || !self.temperature.is_normal() {
-			self.set_temperature(293.15);
+		if self.temperature < TCMB || !self.temperature.is_normal() {
+			self.set_temperature(T20C);
 		}
 	}
 	/// Returns the temperature of the mix. T
@@ -116,13 +117,16 @@ impl Mixture {
 	}
 	/// Sets the temperature, if the mix isn't immutable. T
 	pub fn set_temperature(&mut self, temp: f32) {
-		if !self.immutable && temp.is_normal() {
-			self.temperature = temp;
+		if !self.immutable && temp.is_finite() {
+			self.temperature = temp.max(TCMB);
 		}
 	}
 	/// Sets the minimum heat capacity of this mix.
 	pub fn set_min_heat_capacity(&mut self, amt: f32) {
-		self.min_heat_capacity = amt;
+		if !self.immutable && amt.is_finite() && amt >= 0.0 {
+			self.min_heat_capacity = amt;
+			self.cached_heat_capacity.invalidate();
+		}
 	}
 	/// Returns an iterator over the gas keys and mole amounts thereof.
 	pub fn enumerate(&self) -> impl Iterator<Item = (GasIDX, f32)> + '_ {
@@ -169,7 +173,7 @@ impl Mixture {
 	pub fn set_moles(&mut self, idx: GasIDX, amt: f32) {
 		if !self.immutable
 			&& idx < total_num_gases()
-			&& (idx <= self.moles.len() || (amt > GAS_MIN_MOLES && amt.is_normal()))
+			&& (idx < self.moles.len() || (amt > GAS_MIN_MOLES && amt.is_normal()))
 		{
 			self.maybe_expand(idx + 1);
 			unsafe {
@@ -248,6 +252,9 @@ impl Mixture {
 	}
 	/// Pressure. Kilopascals.
 	pub fn return_pressure(&self) -> f32 {
+		if self.volume <= 0.0 {
+			return 0.0;
+		}
 		self.total_moles() * R_IDEAL_GAS_EQUATION * self.temperature / self.volume
 	}
 	/// Thermal energy. Joules?
@@ -300,14 +307,17 @@ impl Mixture {
 	}
 	/// Transfers only the given gases from us to another mix.
 	pub fn transfer_gases_to(&mut self, r: f32, gases: &[GasIDX], into: &mut Self) {
+		if self.immutable || into.immutable {
+			return;
+		}
 		let ratio = r.clamp(0.0, 1.0);
 		let initial_energy = into.thermal_energy();
 		let mut heat_transfer = 0.0;
 		with_specific_heats(|heats| {
 			for i in gases.iter().copied() {
-				if let Some(orig) = self.moles.get_mut(i) {
+				if let (Some(orig), Some(specific_heat)) = (self.moles.get_mut(i), heats.get(i)) {
 					let delta = *orig * ratio;
-					heat_transfer += delta * self.temperature * heats[i];
+					heat_transfer += delta * self.temperature * specific_heat;
 					*orig -= delta;
 					into.adjust_moles(i, delta);
 				}
@@ -315,19 +325,37 @@ impl Mixture {
 		});
 		self.cached_heat_capacity.invalidate();
 		into.cached_heat_capacity.invalidate();
-		into.set_temperature((initial_energy + heat_transfer) / into.heat_capacity());
+		let new_heat_capacity = into.heat_capacity();
+		if new_heat_capacity > MINIMUM_HEAT_CAPACITY {
+			into.set_temperature((initial_energy + heat_transfer) / new_heat_capacity);
+		}
 	}
 	/// Takes a percentage of this gas mixture's moles and puts it into another mixture. if this mix is mutable, also removes those moles from the original.
 	pub fn remove_ratio_into(&mut self, mut ratio: f32, into: &mut Self) {
-		if ratio <= 0.0 {
+		if ratio.is_nan() || ratio <= 0.0 {
 			return;
 		}
-		if ratio >= 1.0 {
-			ratio = 1.0;
+		ratio = ratio.min(1.0);
+		if into.immutable {
+			return;
 		}
 		into.copy_from_mutable(self);
-		into.multiply(ratio);
-		self.multiply(1.0 - ratio);
+		if self.immutable {
+			into.moles
+				.iter_mut()
+				.for_each(|amount| *amount = quantize(*amount * ratio));
+			into.cached_heat_capacity.invalidate();
+			into.garbage_collect();
+			return;
+		}
+		for (source_amount, removed_amount) in self.moles.iter_mut().zip(into.moles.iter_mut()) {
+			*removed_amount = quantize(*source_amount * ratio);
+			*source_amount -= *removed_amount;
+		}
+		self.cached_heat_capacity.invalidate();
+		into.cached_heat_capacity.invalidate();
+		self.garbage_collect();
+		into.garbage_collect();
 	}
 	/// As `remove_ratio_into`, but a raw number of moles instead of a ratio.
 	pub fn remove_into(&mut self, amount: f32, into: &mut Self) {
@@ -375,8 +403,7 @@ impl Mixture {
 			{
 				let heat = conduction_coefficient
 					* temperature_delta
-					* (self_heat_capacity * sharer_heat_capacity
-						/ (self_heat_capacity + sharer_heat_capacity));
+					* harmonic_heat_capacity(self_heat_capacity, sharer_heat_capacity);
 				if !self.immutable {
 					self.set_temperature((self.temperature - heat / self_heat_capacity).max(TCMB));
 				}
@@ -406,8 +433,7 @@ impl Mixture {
 			{
 				let heat = conduction_coefficient
 					* temperature_delta
-					* (self_heat_capacity * sharer_heat_capacity
-						/ (self_heat_capacity + sharer_heat_capacity));
+					* harmonic_heat_capacity(self_heat_capacity, sharer_heat_capacity);
 				if !self.immutable {
 					self.set_temperature((self.temperature - heat / self_heat_capacity).max(TCMB));
 				}
@@ -459,14 +485,14 @@ impl Mixture {
 	}
 	/// Multiplies every gas molage with this value.
 	pub fn multiply(&mut self, multiplier: f32) {
-		if !self.immutable {
+		if !self.immutable && multiplier.is_finite() {
 			self.moles.iter_mut().for_each(|amt| *amt *= multiplier);
 			self.cached_heat_capacity.invalidate();
 			self.garbage_collect();
 		}
 	}
 	pub fn add(&mut self, num: f32) {
-		if !self.immutable {
+		if !self.immutable && num.is_finite() {
 			self.moles.iter_mut().for_each(|amt| *amt += num);
 			self.cached_heat_capacity.invalidate();
 			self.garbage_collect();
@@ -476,7 +502,7 @@ impl Mixture {
 		&self,
 		reactions: &BTreeMap<ReactionPriority, Reaction>,
 	) -> bool {
-		//priorities are inversed because fuck you
+		// Reaction priorities are traversed in reverse order.
 		reactions
 			.values()
 			.rev()
@@ -490,7 +516,7 @@ impl Mixture {
 		&self,
 		reactions: &BTreeMap<ReactionPriority, Reaction>,
 	) -> TinyVec<[u64; MAX_REACTION_TINYVEC_SIZE]> {
-		//priorities are inversed because fuck you
+		// Reaction priorities are traversed in reverse order.
 		reactions
 			.values()
 			.rev()
@@ -621,14 +647,16 @@ impl Mixture {
 	// Removes all redundant zeroes from the gas mixture.
 	pub fn garbage_collect(&mut self) {
 		let mut last_valid_found = 0;
+		let mut found_valid = false;
 		for (i, amt) in self.moles.iter_mut().enumerate() {
 			if *amt > GAS_MIN_MOLES {
 				last_valid_found = i;
+				found_valid = true;
 			} else {
 				*amt = 0.0;
 			}
 		}
-		self.moles.truncate(last_valid_found + 1);
+		self.moles.truncate(found_valid.then_some(last_valid_found + 1).unwrap_or(0));
 	}
 }
 
@@ -708,6 +736,25 @@ mod tests {
 	#[test]
 	fn test_gases() {
 		initialize_gases();
+		let mut minimum_capacity = Mixture::new();
+		assert_eq!(minimum_capacity.heat_capacity(), 0.0);
+		minimum_capacity.set_min_heat_capacity(10.0);
+		assert_eq!(minimum_capacity.heat_capacity(), 10.0);
+		minimum_capacity.set_min_heat_capacity(20.0);
+		assert_eq!(minimum_capacity.heat_capacity(), 20.0);
+		minimum_capacity.set_min_heat_capacity(f32::NAN);
+		assert_eq!(minimum_capacity.heat_capacity(), 20.0);
+
+		let mut hot_capacity = Mixture::new();
+		hot_capacity.set_min_heat_capacity(1e20);
+		hot_capacity.set_temperature(1000.0);
+		let mut cold_capacity = Mixture::new();
+		cold_capacity.set_min_heat_capacity(1e20);
+		cold_capacity.set_temperature(300.0);
+		hot_capacity.temperature_share(&mut cold_capacity, 1.0);
+		assert!((hot_capacity.get_temperature() - 650.0).abs() < 0.01);
+		assert!((cold_capacity.get_temperature() - 650.0).abs() < 0.01);
+
 		let mut into = Mixture::new();
 		into.set_moles(0, 82.0);
 		into.set_moles(1, 22.0);
@@ -754,6 +801,45 @@ mod tests {
 		assert_eq!(removed.get_moles(0), 11.0);
 		assert_eq!(removed.get_moles(1), 41.0);
 		assert_eq!(new_two.get_moles(0), 5.5);
+
+		let mut quantized = Mixture::new();
+		quantized.set_moles(0, 1.23456);
+		let quantized_removed = quantized.remove_ratio(0.5);
+		let expected_removed = (1.23456 * 0.5 / MOLAR_ACCURACY).round() * MOLAR_ACCURACY;
+		assert!((quantized_removed.get_moles(0) - expected_removed).abs() < 1e-6);
+		assert!((quantized.get_moles(0) - (1.23456 - expected_removed)).abs() < 1e-6);
+
+		let mut immutable_source = Mixture::new();
+		immutable_source.set_moles(0, 10.0);
+		immutable_source.mark_immutable();
+		let mut transfer_target = Mixture::new();
+		immutable_source.transfer_gases_to(1.0, &[0], &mut transfer_target);
+		assert_eq!(immutable_source.get_moles(0), 10.0);
+		assert_eq!(transfer_target.get_moles(0), 0.0);
+
+		let mut transfer_source = Mixture::new();
+		transfer_source.set_moles(0, 10.0);
+		let mut immutable_target = Mixture::new();
+		immutable_target.mark_immutable();
+		transfer_source.transfer_gases_to(1.0, &[0], &mut immutable_target);
+		assert_eq!(transfer_source.get_moles(0), 10.0);
+		assert_eq!(immutable_target.get_moles(0), 0.0);
+
+		let mut empty = Mixture::new();
+		empty.set_moles(0, 0.0);
+		empty.garbage_collect();
+		assert_eq!(empty.enumerate().count(), 0);
+		empty.volume = 0.0;
+		assert_eq!(empty.return_pressure(), 0.0);
 		destroy_gas_statics();
+	}
+
+	#[test]
+	fn set_temperature_clamps_to_cosmic_microwave_background() {
+		let mut mixture = Mixture::new();
+
+		mixture.set_temperature(-100.0);
+
+		assert_eq!(mixture.get_temperature(), TCMB);
 	}
 }

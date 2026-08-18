@@ -1,6 +1,6 @@
 use super::*;
 use crate::{react_hook, GasArena};
-use auxcallback::{byond_callback_sender, process_callbacks_for_millis};
+use auxcallback::process_callbacks_for_millis;
 use byondapi::{byond_string, prelude::*};
 use coarsetime::{Duration, Instant};
 use parking_lot::RwLock;
@@ -9,6 +9,7 @@ use tinyvec::TinyVec;
 
 const EQUALIZE_PROFILE_FDM_ONLY: i32 = 0;
 const EQUALIZE_PROFILE_FAST_ZONE: i32 = 1;
+const PRESSURE_CALLBACK_BATCH_SIZE: usize = 256;
 
 /// Returns: If a processing thread is running or not.
 #[byondapi::bind("/datum/controller/subsystem/air/proc/thread_running")]
@@ -16,18 +17,31 @@ fn thread_running_hook() -> Result<ByondValue> {
 	Ok(TASKS.try_write().is_none().into())
 }
 
+fn remaining_duration(value: &ByondValue) -> Result<Duration> {
+	let millis = value.get_number()?;
+	if !millis.is_finite() {
+		return Err(eyre::eyre!("Atmos processing budget must be finite"));
+	}
+	Ok(Duration::from_millis(millis.max(0.0) as u64))
+}
+
 /// Returns: If this cycle is interrupted by overtiming or not. Calls all outstanding callbacks created by other processes, usually ones that can't run on other threads and only the main thread.
 #[byondapi::bind("/datum/controller/subsystem/air/proc/finish_turf_processing_auxtools")]
 fn finish_process_turfs(time_remaining: ByondValue) -> Result<ByondValue> {
-	Ok(process_callbacks_for_millis(time_remaining.get_number()? as u64).into())
+	Ok(process_callbacks_for_millis(remaining_duration(&time_remaining)?.as_millis() as u64).into())
 }
 /// Returns: If this cycle is interrupted by overtiming or not. Starts a processing turfs cycle.
 #[byondapi::bind("/datum/controller/subsystem/air/proc/process_turfs_auxtools")]
 fn process_turf_hook(src: ByondValue, remaining: ByondValue) -> Result<ByondValue> {
-	let remaining_time = Duration::from_millis(remaining.get_number().unwrap_or(50.0) as u64);
-	let fdm_max_steps = src
+	let remaining_time = remaining_duration(&remaining)?;
+	let fdm_max_steps_value = src
 		.read_number_id(byond_string!("share_max_steps"))
-		.unwrap_or(1.0) as i32;
+		.unwrap_or(1.0);
+	let fdm_max_steps = if fdm_max_steps_value.is_finite() {
+		fdm_max_steps_value.clamp(0.0, i32::MAX as f32) as i32
+	} else {
+		1
+	};
 	let equalize_master_enabled = src.read_number_id(byond_string!("equalize_enabled"))? != 0.0;
 	let equalize_profile = src
 		.read_number_id(byond_string!("dogmos_equalize_performance_profile"))
@@ -38,6 +52,11 @@ fn process_turf_hook(src: ByondValue, remaining: ByondValue) -> Result<ByondValu
 	let planet_share_ratio = src
 		.read_number_id(byond_string!("planet_share_ratio"))
 		.unwrap_or(GAS_DIFFUSION_CONSTANT);
+	let planet_share_ratio = if planet_share_ratio.is_finite() {
+		planet_share_ratio.clamp(0.0, 1.0)
+	} else {
+		GAS_DIFFUSION_CONSTANT
+	};
 
 	process_turf(
 		remaining_time,
@@ -213,7 +232,7 @@ fn process_cell(
 	index: NodeIndex,
 	all_mixtures: &[RwLock<Mixture>],
 	arena: &TurfGases,
-) -> Option<(NodeIndex, Mixture, TinyVec<[(TurfID, f32); 6]>, i32)> {
+) -> Option<(NodeIndex, Mixture, TinyVec<[(TurfID, u32, f32); 6]>, i32)> {
 	let mut adj_amount = 0;
 	/*
 		Getting write locks is potential danger zone,
@@ -221,7 +240,7 @@ fn process_cell(
 		absolutely need to. Saving is fast enough.
 	*/
 	let mut end_gas = Mixture::from_vol(crate::constants::CELL_VOLUME);
-	let mut pressure_diffs: TinyVec<[(TurfID, f32); 6]> = Default::default();
+	let mut pressure_diffs: TinyVec<[(TurfID, u32, f32); 6]> = Default::default();
 	/*
 		The pressure here is negative
 		because we're going to be adding it
@@ -230,7 +249,7 @@ fn process_cell(
 		because it's not representing the total
 		gas pressure difference but the force exerted
 		due to the pressure gradient.
-		Technically that's ρν², but, like, video games.
+		The exact physical coefficient is intentionally simplified for this model.
 	*/
 	for (&loc, entry) in
 		arena.adjacent_mixes_with_adj_ids(index, all_mixtures, petgraph::Direction::Incoming)
@@ -239,7 +258,11 @@ fn process_cell(
 			Some(mix) => {
 				end_gas.merge(&mix);
 				adj_amount += 1;
-				pressure_diffs.push((loc, -mix.return_pressure() * GAS_DIFFUSION_CONSTANT));
+				pressure_diffs.push((
+					loc,
+					arena.get_from_id(loc)?.generation,
+					-mix.return_pressure() * GAS_DIFFUSION_CONSTANT,
+				));
 			}
 			None => return None, // this would lead to inconsistencies--no bueno
 		}
@@ -323,9 +346,9 @@ fn fdm(
 								gas.return_pressure() * GAS_DIFFUSION_CONSTANT
 							};
 							for pressure_diff in &mut pressure_diffs {
-								// pressure_diff.1 here was set to a negative above, so we just add.
-								pressure_diff.1 += moved_pressure;
-								max_diff = max_diff.max(pressure_diff.1.abs());
+								// pressure_diff.2 here was set to a negative above, so we just add.
+								pressure_diff.2 += moved_pressure;
+								max_diff = max_diff.max(pressure_diff.2.abs());
 							}
 							/*
 								1.0 - GAS_DIFFUSION_CONSTANT * adj_amount is going to be
@@ -351,48 +374,62 @@ fn fdm(
 								to do any more and we don't need to send the
 								value to byond, so we don't. However, if we do...
 							*/
-							(m.id, pressure_diffs, max_diff, i)
+							(m.id, m.generation, pressure_diffs, max_diff, i)
 						})
 					})
-					.partition(|&(_, _, max_diff, _)| max_diff <= 5.0);
+					.partition(|&(_, _, _, max_diff, _)| max_diff <= 5.0);
 
-				high_pressure_turfs.par_extend(high_pressure.par_iter().map(|(i, _, _, _)| i));
-				low_pressure_turfs.par_extend(low_pressure.par_iter().map(|(i, _, _, _)| i));
+				high_pressure_turfs.par_extend(high_pressure.par_iter().map(|(i, _, _, _, _)| i));
+				low_pressure_turfs.par_extend(low_pressure.par_iter().map(|(i, _, _, _, _)| i));
 				//tossing things around is already handled by katmos, so we don't need to do it here.
 				if !equalize_enabled {
-					high_pressure
+					let mut pressure_callbacks = high_pressure
 						.into_par_iter()
-						.filter_map(|(_, pressures, _, node_id)| {
-							Some((arena.get(node_id)?.id, pressures))
+						.filter_map(|(_, generation, pressures, _, node_id)| {
+							Some((arena.get(node_id)?.id, generation, pressures))
 						})
-						.for_each(|(id, diffs)| {
-							let sender = byond_callback_sender();
-							drop(sender.try_send(Box::new(move || {
+						.collect::<Vec<_>>();
+					while !pressure_callbacks.is_empty() {
+						let batch_len = PRESSURE_CALLBACK_BATCH_SIZE.min(pressure_callbacks.len());
+						let batch = pressure_callbacks.drain(..batch_len).collect::<Vec<_>>();
+						auxcallback::queue_callback(Box::new(move || {
+							let mut first_error = None;
+							for (id, generation, diffs) in batch {
 								let turf = ByondValue::new_ref(ValueType::Turf, id);
-								for (id, diff) in diffs.iter().copied() {
-									if id != 0 {
-										let enemy_tile = ByondValue::new_ref(ValueType::Turf, id);
-										if diff > 5.0 {
-											turf.call_id(
-												byond_string!("consider_pressure_difference"),
-												&[enemy_tile, diff.into()],
-											)
-											.wrap_err("Processing consider pressure differences")?;
-										} else if diff < -5.0 {
-											enemy_tile
-												.call_id(
-													byond_string!("consider_pressure_difference"),
-													&[turf, (-diff).into()],
-												)
-												.wrap_err(
-													"Processing consider pressure differences",
-												)?;
+								if !crate::turfs::turf_callback_is_current(id, generation) {
+									continue;
+								}
+								for (id, generation, diff) in diffs {
+									if id == 0
+										|| !crate::turfs::turf_callback_is_current(id, generation)
+									{
+										continue;
+									}
+									let enemy_tile = ByondValue::new_ref(ValueType::Turf, id);
+									if diff > 5.0 {
+										let result = turf.call_id(
+											byond_string!("consider_pressure_difference"),
+											&[enemy_tile, diff.into()],
+										)
+										.wrap_err("Processing consider pressure differences");
+										if let Err(error) = result {
+											first_error.get_or_insert(error);
+										}
+									} else if diff < -5.0 {
+										let result = enemy_tile.call_id(
+											byond_string!("consider_pressure_difference"),
+											&[turf, (-diff).into()],
+										)
+										.wrap_err("Processing consider pressure differences");
+										if let Err(error) = result {
+											first_error.get_or_insert(error);
 										}
 									}
 								}
-								Ok(())
-							})));
-						});
+							}
+							first_error.map_or(Ok(()), Err)
+						}));
+					}
 				}
 			});
 
@@ -446,11 +483,14 @@ fn post_process() {
 		processables
 			.into_par_iter()
 			.for_each(|(tmix, should_update_vis, should_react)| {
-				let sender = byond_callback_sender();
 				let id = tmix.id;
+				let generation = tmix.generation;
 
 				if should_react {
-					drop(sender.try_send(Box::new(move || {
+					auxcallback::queue_callback(Box::new(move || {
+						if !crate::turfs::turf_callback_is_current(id, generation) {
+							return Ok(());
+						}
 						let turf = ByondValue::new_ref(ValueType::Turf, id);
 						match turf.read_var_id(byond_string!("air")) {
 							Ok(air) if !air.is_null() => {
@@ -460,17 +500,20 @@ fn post_process() {
 							//turf is no longer valid for reactions
 							_ => Ok(()),
 						}
-					})));
+					}));
 				}
 
 				if should_update_vis {
-					drop(sender.try_send(Box::new(move || {
+					auxcallback::queue_callback(Box::new(move || {
+						if !crate::turfs::turf_callback_is_current(id, generation) {
+							return Ok(());
+						}
 						let turf = ByondValue::new_ref(ValueType::Turf, id);
 
 						//turf is checked for validity in update_visuals
 						update_visuals(turf).wrap_err("Updating Visuals")?;
 						Ok(())
-					})));
+					}));
 				}
 			});
 	});

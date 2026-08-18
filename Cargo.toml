@@ -31,15 +31,8 @@ katmos_slow_decompression = ["fastmos"]
 reaction_hooks = []
 citadel_reactions = ["reaction_hooks"]
 yogs_reactions = ["reaction_hooks"]
-# Meridian: native Rust implementations of this codebase's own fire reactions (plasmafire, h2fire,
-# tritfire, freonfire - see src/reaction/aphelion.rs), faithfully ported from
-# code/modules/atmospherics/gasmixtures/reactions.dm rather than reusing citadel_reactions/
-# yogs_reactions, whose formulas and gas byproducts genuinely differ from this codebase's tuning
-# (confirmed 2026-08-15: citadel's plasmafire drops the water_vapor byproduct entirely, and its
-# tritfire is a completely different "trit bomb" model, not this codebase's measured fuel/oxidizer
-# combustion). Without this, every fire reaction falls back to calling back into DM's own react()
-# per-reaction-per-cycle (ReactionSide::ByondSide) - correct, but the callback overhead itself was
-# part of what this phase exists to remove.
+# Native implementations of this codebase's fire reactions. The alternative reaction sets have
+# different formulas and byproducts, so they cannot replace these without changing behavior.
 aphelion_reactions = ["reaction_hooks"]
 
 # Tracing will expose this application to a local port, use with care
@@ -82,15 +75,6 @@ features = ["rustc_1_61", "alloc"]
 lto = 'fat'
 debug = true
 codegen-units = 1
-# Meridian: was 'abort' until 2026-08-13. rayon's worker threads (spawned for turf heat processing,
-# see turfs/superconduct.rs) wrap their closures in stdlib machinery that expects to be able to
-# unwind. Under panic = 'abort' any panic on one of those threads - even one that would otherwise be
-# harmless and locally recoverable - hits that wrapper's nounwind boundary and the whole process
-# aborts via core::panicking::panic_cannot_unwind, which prints only "panic in a function that cannot
-# unwind" with the real message and location discarded. This reproduced on every optimization level
-# (release, and a no-LTO/16-codegen-unit variant) but never under a debug build (panic = 'unwind' by
-# default there) - confirmed by bisecting on the panic strategy alone with LTO otherwise unchanged.
-# 'unwind' costs unwind-table size and a little codegen headroom; that's a better trade than a
-# DreamDaemon that dies silently and unrecoverably the first time gas or turf setup panics on a
-# worker thread.
+# Rayon worker threads need unwinding so a panic can be reported without terminating DreamDaemon
+# before the diagnostic hook records it.
 panic = 'unwind'

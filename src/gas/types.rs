@@ -1,6 +1,5 @@
 use super::GasIDX;
 use crate::reaction::{Reaction, ReactionPriority};
-use auxcallback::byond_callback_sender;
 use byondapi::prelude::*;
 use dashmap::DashMap;
 use eyre::{Context, Result};
@@ -97,7 +96,7 @@ impl GasRef {
 #[derive(Clone)]
 pub enum FireProductInfo {
 	Generic(Vec<(GasRef, f32)>),
-	Plasma, // yeah, just hardcoding the funny trit production
+	Plasma, // Legacy plasma reaction product representation.
 }
 
 /// An individual gas type. Contains a whole lot of info attained from Byond when the gas is first registered.
@@ -144,8 +143,7 @@ pub struct GasType {
 ///
 /// `byond_string!` resolves a literal against BYOND's string tree and panics if it is not there,
 /// which for an optional property is the normal case - a codebase that never writes
-/// "oxidation_temperature" anywhere has no such string. Since the crate is built with
-/// `panic = "abort"`, that took the whole game down instead of leaving the field unset.
+/// "oxidation_temperature" anywhere has no such string.
 fn read_optional_number(gas: &ByondValue, name: &str) -> Option<f32> {
 	let string_id = byondapi::byond_string::str_id_of(name).ok()?;
 	gas.read_number_id(string_id).ok()
@@ -158,7 +156,7 @@ fn read_optional_var(gas: &ByondValue, name: &str) -> Option<ByondValue> {
 }
 
 impl GasType {
-	// This absolute monster is what you want to override to add or remove certain gas properties, based on what a gas datum has.
+	// Keep this mapping aligned with the properties exposed by the DM gas datum.
 	fn new(gas: &ByondValue, idx: GasIDX) -> Result<Self> {
 		Ok(Self {
 			idx,
@@ -227,10 +225,17 @@ pub fn initialize_gas_info_structs() {
 }
 
 pub fn destroy_gas_info_structs() {
+	#[cfg(feature = "turf_processing")]
 	crate::turfs::wait_for_tasks();
-	GAS_INFO_BY_STRING.write().as_mut().unwrap().clear();
-	GAS_INFO_BY_IDX.write().as_mut().unwrap().clear();
-	GAS_SPECIFIC_HEATS.write().as_mut().unwrap().clear();
+	if let Some(gas_info_by_string) = GAS_INFO_BY_STRING.write().as_mut() {
+		gas_info_by_string.clear();
+	}
+	if let Some(gas_info_by_idx) = GAS_INFO_BY_IDX.write().as_mut() {
+		gas_info_by_idx.clear();
+	}
+	if let Some(gas_specific_heats) = GAS_SPECIFIC_HEATS.write().as_mut() {
+		gas_specific_heats.clear();
+	}
 	TOTAL_NUM_GASES.store(0, Ordering::Release);
 	CACHED_GAS_IDS.with_borrow_mut(|gas_ids| {
 		gas_ids.clear();
@@ -243,17 +248,40 @@ pub fn destroy_gas_info_structs() {
 #[byondapi::bind("/proc/_auxtools_register_gas")]
 fn hook_register_gas(gas: ByondValue) -> Result<ByondValue> {
 	let gas_id = gas.read_string_id(byond_string!("id"))?;
-	match GAS_INFO_BY_STRING
+	let existing_idx = GAS_INFO_BY_STRING
 		.read()
 		.as_ref()
-		.unwrap()
-		.get_mut(&gas_id as &str)
-	{
-		Some(mut old_gas) => {
-			let gas_cache = GasType::new(&gas, old_gas.idx)?;
-			*old_gas = gas_cache.clone();
-			GAS_SPECIFIC_HEATS.write().as_mut().unwrap()[old_gas.idx] = gas_cache.specific_heat;
-			GAS_INFO_BY_IDX.write().as_mut().unwrap()[old_gas.idx] = gas_cache;
+		.ok_or_else(|| eyre::eyre!("Gas metadata is not initialized"))?
+		.get(&gas_id as &str)
+		.map(|old_gas| old_gas.idx);
+	match existing_idx {
+		Some(idx) => {
+			let gas_cache = GasType::new(&gas, idx)?;
+			let gas_info_by_string_lock = GAS_INFO_BY_STRING.read();
+			let mut gas_info_by_string = gas_info_by_string_lock
+				.as_ref()
+				.ok_or_else(|| eyre::eyre!("Gas metadata is not initialized"))?
+				.get_mut(&gas_id as &str)
+				.ok_or_else(|| eyre::eyre!("Gas metadata entry disappeared during registration"))?;
+			*gas_info_by_string = gas_cache.clone();
+			drop(gas_info_by_string);
+			drop(gas_info_by_string_lock);
+			let mut specific_heats_lock = GAS_SPECIFIC_HEATS.write();
+			let specific_heats = specific_heats_lock
+				.as_mut()
+				.ok_or_else(|| eyre::eyre!("Gas specific heats are not initialized"))?;
+			*specific_heats
+				.get_mut(idx)
+			.ok_or_else(|| eyre::eyre!("Gas index {idx} is outside specific heats"))? =
+				gas_cache.specific_heat;
+			drop(specific_heats_lock);
+			let mut gas_info_by_idx_lock = GAS_INFO_BY_IDX.write();
+			let gas_info_by_idx = gas_info_by_idx_lock
+				.as_mut()
+				.ok_or_else(|| eyre::eyre!("Gas metadata index is not initialized"))?;
+			*gas_info_by_idx
+				.get_mut(idx)
+			.ok_or_else(|| eyre::eyre!("Gas index {idx} is outside metadata"))? = gas_cache;
 		}
 		None => {
 			let gas_cache = GasType::new(&gas, TOTAL_NUM_GASES.load(Ordering::Acquire))?;
@@ -262,37 +290,43 @@ fn hook_register_gas(gas: ByondValue) -> Result<ByondValue> {
 			GAS_INFO_BY_STRING
 				.read()
 				.as_ref()
-				.unwrap()
+				.ok_or_else(|| eyre::eyre!("Gas metadata is not initialized"))?
 				.insert(gas_id.into_boxed_str(), gas_cache.clone());
 			GAS_SPECIFIC_HEATS
 				.write()
 				.as_mut()
-				.unwrap()
+				.ok_or_else(|| eyre::eyre!("Gas specific heats are not initialized"))?
 				.push(gas_cache.specific_heat);
-			GAS_INFO_BY_IDX.write().as_mut().unwrap().push(gas_cache);
+			GAS_INFO_BY_IDX
+				.write()
+				.as_mut()
+				.ok_or_else(|| eyre::eyre!("Gas metadata index is not initialized"))?
+				.push(gas_cache);
 			CACHED_IDX_TO_STRINGS
 				.with_borrow_mut(|map| map.insert(cached_idx, cached_id.into_boxed_str()));
-			TOTAL_NUM_GASES.fetch_add(1, Ordering::Release); // this is the only thing that stores it other than shutdown
+			TOTAL_NUM_GASES.fetch_add(1, Ordering::Release);
 		}
 	}
 	Ok(ByondValue::null())
 }
 
-/// Registers gases, and get reaction infos for auxmos, only call when ssair is initing.
+/// Registers gases and loads the reaction table during SSair initialization.
 #[byondapi::bind("/proc/auxtools_atmos_init")]
 fn hook_init(gas_data: ByondValue) -> Result<ByondValue> {
+	crate::reset_shutdown_state(&crate::DOGMOS_SHUTDOWN);
+	auxcallback::begin_callbacks();
+	#[cfg(feature = "superconductivity")]
+	crate::turfs::prepare_turf_heat_for_world();
 	let data = gas_data.read_var_id(byond_string!("datums"))?;
 	data.iter()?
 		.map(|(_, gas)| hook_register_gas(gas))
 		.try_for_each(|res| res.map(drop))
 		.wrap_err("auxtools_atmos_init failed to register gas")?;
-	*REACTION_INFO.write() = Some(get_reaction_info());
+	*REACTION_INFO.write() = Some(get_reaction_info()?);
 	Ok(true.into())
 }
 
-/// Returns: the number of reactions Dogmos accepted at init. Meridian: exists purely so DM can
-/// assert across the FFI that the reaction table actually crossed, rather than only that DM built
-/// one - see /datum/unit_test/dogmos_registration.
+/// Returns the number of reactions accepted during initialization.
 #[byondapi::bind("/proc/dogmos_reaction_count")]
 fn dogmos_reaction_count() -> Result<ByondValue> {
 	Ok((REACTION_INFO
@@ -302,18 +336,14 @@ fn dogmos_reaction_count() -> Result<ByondValue> {
 		.into())
 }
 
-fn get_reaction_info() -> BTreeMap<ReactionPriority, Reaction> {
-	// Meridian: SSair.gas_reactions is a nested assoc list (gas id -> per-priority-group lists) in
-	// modern /tg/, which is not iterable as a flat list of reaction datums. DM builds a separate
-	// flat, unique-priority list for us instead. See code/modules/atmospherics/gasmixtures/reactions.dm.
+fn get_reaction_info() -> Result<BTreeMap<ReactionPriority, Reaction>> {
 	let gas_reactions = ByondValue::new_global_ref()
 		.read_var_id(byond_string!("SSair"))
-		.unwrap()
+		.wrap_err("SSair is unavailable while loading reactions")?
 		.read_var_id(byond_string!("dogmos_reactions"))
-		.unwrap();
+		.wrap_err("SSair.dogmos_reactions is unavailable")?;
 	let mut reaction_cache: BTreeMap<ReactionPriority, Reaction> = Default::default();
-	let sender = byond_callback_sender();
-	for (reaction, _) in gas_reactions.iter().unwrap() {
+	for (reaction, _) in gas_reactions.iter()? {
 		match Reaction::from_byond_reaction(reaction) {
 			Ok(reaction) => {
 				if let std::collections::btree_map::Entry::Vacant(e) =
@@ -321,27 +351,26 @@ fn get_reaction_info() -> BTreeMap<ReactionPriority, Reaction> {
 				{
 					e.insert(reaction);
 				} else {
-					drop(sender.try_send(Box::new(move || {
+					auxcallback::queue_callback(Box::new(move || {
 						Err(eyre::eyre!(format!(
 							"Duplicate reaction priority {}, this reaction will be ignored!",
 							reaction.get_priority().0
 						)))
-					})));
+					}));
 				}
 			}
-			//maybe awful error handling
 			Err(runtime) => {
-				drop(sender.try_send(Box::new(move || Err(runtime))));
+				auxcallback::queue_callback(Box::new(move || Err(runtime)));
 			}
 		}
 	}
-	reaction_cache
+	Ok(reaction_cache)
 }
 
-/// For updating reaction informations for auxmos, only call this when it is changed.
+/// Refreshes the reaction cache after DM changes the reaction table.
 #[byondapi::bind("/datum/controller/subsystem/air/proc/auxtools_update_reactions")]
 fn update_reactions() -> Result<ByondValue> {
-	*REACTION_INFO.write() = Some(get_reaction_info());
+	*REACTION_INFO.write() = Some(get_reaction_info()?);
 	Ok(true.into())
 }
 
@@ -355,7 +384,7 @@ where
 	f(REACTION_INFO
 		.read()
 		.as_ref()
-		.unwrap_or_else(|| panic!("Reactions not loaded yet! Uh oh!")))
+		.unwrap_or_else(|| panic!("Reactions are not loaded")))
 }
 
 /// Runs the given closure with the global specific heats vector locked.
@@ -374,7 +403,7 @@ pub fn gas_fusion_power(idx: &GasIDX) -> f32 {
 	GAS_INFO_BY_IDX
 		.read()
 		.as_ref()
-		.unwrap_or_else(|| panic!("Gases not loaded yet! Uh oh!"))
+		.unwrap_or_else(|| panic!("Gases are not loaded"))
 		.get(*idx)
 		.unwrap()
 		.fusion_power
@@ -393,7 +422,7 @@ pub fn gas_visibility(idx: usize) -> Option<f32> {
 	GAS_INFO_BY_IDX
 		.read()
 		.as_ref()
-		.unwrap_or_else(|| panic!("Gases not loaded yet! Uh oh!"))
+		.unwrap_or_else(|| panic!("Gases are not loaded"))
 		.get(idx)
 		.unwrap()
 		.moles_visible
@@ -407,7 +436,7 @@ pub fn visibility_copies() -> Box<[Option<f32>]> {
 	GAS_INFO_BY_IDX
 		.read()
 		.as_ref()
-		.unwrap_or_else(|| panic!("Gases not loaded yet! Uh oh!"))
+		.unwrap_or_else(|| panic!("Gases are not loaded"))
 		.iter()
 		.map(|g| g.moles_visible)
 		.collect::<Vec<_>>()
@@ -421,30 +450,32 @@ pub fn with_gas_info<T>(f: impl FnOnce(&[GasType]) -> T) -> T {
 	f(GAS_INFO_BY_IDX
 		.read()
 		.as_ref()
-		.unwrap_or_else(|| panic!("Gases not loaded yet! Uh oh!")))
+		.unwrap_or_else(|| panic!("Gases are not loaded")))
 }
 
 /// Updates all the `GasRef`s in the global gas info vec with proper indices instead of strings.
 /// # Panics
 /// If gas info is not loaded yet.
-pub fn update_gas_refs() {
+pub fn update_gas_refs() -> Result<()> {
 	GAS_INFO_BY_IDX
 		.write()
 		.as_mut()
-		.unwrap_or_else(|| panic!("Gases not loaded yet! Uh oh!"))
+		.ok_or_else(|| eyre::eyre!("Gas metadata is not initialized"))?
 		.iter_mut()
-		.for_each(|gas| {
+		.try_for_each(|gas| -> Result<()> {
 			if let Some(FireProductInfo::Generic(products)) = gas.fire_products.as_mut() {
 				for product in products.iter_mut() {
-					product.0.update().unwrap();
+					product.0.update()?;
 				}
 			}
-		});
+			Ok(())
+		})?;
+	Ok(())
 }
 /// For updating reagent gas fire products, do not use for now.
 #[byondapi::bind("/proc/finalize_gas_refs")]
 fn finalize_gas_refs() -> Result<ByondValue> {
-	update_gas_refs();
+	update_gas_refs()?;
 	Ok(ByondValue::null())
 }
 
@@ -460,7 +491,7 @@ pub fn gas_idx_from_string(id: &str) -> Result<GasIDX> {
 	Ok(GAS_INFO_BY_STRING
 		.read()
 		.as_ref()
-		.ok_or_else(|| eyre::eyre!("Gases not loaded yet! Uh oh!"))?
+		.ok_or_else(|| eyre::eyre!("Gases are not loaded"))?
 		.get(id)
 		.ok_or_else(|| eyre::eyre!("Invalid gas ID: {id}"))?
 		.idx)
@@ -468,13 +499,8 @@ pub fn gas_idx_from_string(id: &str) -> Result<GasIDX> {
 
 /// Returns the appropriate index to be used by the game for a given Byond string.
 ///
-/// Meridian: BYOND typepath *constants* (unlike live object instances) cannot have their vars read
-/// through `Byond_ReadVarByStrId` - `initial(path::var)` is a DM-compiler-time fold, not something the
-/// runtime C API resolves for a bare, unresolved type value. An earlier version of this function tried
-/// a read-var fallback for non-string input on that assumption and it corrupted the panic runtime
-/// instead of erroring cleanly. Gas identity must cross the FFI boundary as a string; DM-side callers
-/// that hold a typepath translate it (see `/datum/gas_mixture/proc/get_moles` and siblings in
-/// gas_mixture.dm) before it ever reaches here.
+/// Gas identity crosses the FFI as a string id. DM wrappers translate typepaths before calling this
+/// raw bind because typepath constants do not expose regular runtime vars.
 /// # Errors
 /// If the given string is not a string or is not a valid gas ID.
 pub fn gas_idx_from_value(string_val: &ByondValue) -> Result<GasIDX> {

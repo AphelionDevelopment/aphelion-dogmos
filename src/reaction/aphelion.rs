@@ -1,19 +1,10 @@
-//! Meridian: native Rust ports of this codebase's own fire reactions
-//! (code/modules/atmospherics/gasmixtures/reactions.dm), gated behind `aphelion_reactions`.
+//! Native implementations of the fire reactions selected by the `aphelion_reactions` feature.
 //!
-//! Deliberately NOT reusing citadel_reactions - confirmed, side by side against the actual DM source,
-//! that citadel's formulas diverge from this codebase's tuning in real ways: its plasmafire drops the
-//! water_vapor byproduct plasmafire here produces, and its tritfire implements a completely different
-//! "trit bomb" model (an exponential burned_fuel blowup) rather than this codebase's measured
-//! fuel/oxidizer combustion with a probabilistic radiation_pulse. Reusing citadel's numbers would have
-//! been a silent balance change, not a port.
+//! This module is separate from the Citadel and Yogs reaction sets because their formulas and
+//! byproducts differ.
 //!
-//! Every function here is a line-for-line translation of its DM counterpart's math. Anything that
-//! needs DM-side type introspection or side effects DM already knows how to do correctly (locating a
-//! turf from a holder that might be an atom or a pipenet, creating hot_ice, radiation_pulse, and
-//! writing into `air.reaction_results` keyed by the reaction's own type path) is left to a small glue
-//! proc per reaction (`dogmos_aphelion_*_finish`, reactions.dm) that Rust calls once at the end with
-//! already-computed numbers, rather than reimplementing that plumbing here.
+//! DM remains responsible for holder lookup and side effects. Each reaction calls a small DM glue
+//! proc after Rust computes its numeric results.
 
 use crate::gas::{constants::*, gas_idx_from_string, with_mix, with_mix_mut};
 use byondapi::prelude::*;
@@ -35,7 +26,6 @@ pub fn func_from_id(id: &str) -> Option<super::ReactFunc> {
 
 /// DM's QUANTIZE(variable) macro: round(variable, MOLAR_ACCURACY).
 fn quantize(amount: f32) -> f32 {
-	const MOLAR_ACCURACY: f32 = 1e-4;
 	(amount / MOLAR_ACCURACY).round() * MOLAR_ACCURACY
 }
 
