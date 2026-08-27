@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "idle_station",
+  "seed": 54102,
+  "duration_seconds": 300,
+  "map": "MetaStation.dmm",
+  "driver": { "kind": "meridian_mcp_live", "profile": "idle" },
+  "expected_markers": ["Initializations complete", "DOGMOS_PERF_IDLE_COMPLETE"],
+  "correctness_assertions": ["zero runtime errors", "DreamDaemon private bytes stop growing after warm-up"]
+}

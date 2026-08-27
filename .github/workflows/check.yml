@@ -1,21 +1,41 @@
-name: Check compile
-on: pull_request
-jobs:
-    linux-build:
-        runs-on: ubuntu-20.04
-        steps:
-            - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: stable
-                  target: i686-unknown-linux-gnu
-                  override: true
+name: Check Dogmos
 
-            - name: Install g++-multilib
-              run: |
-                  sudo apt update
-                  sudo apt install g++-multilib -y
-            - name: Check formatting
-              run: cargo fmt --all -- --check
-            - name: Check auxmos build
-              run: cargo check --target=i686-unknown-linux-gnu --release --features citadel_reactions
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy, rustfmt
+          targets: i686-unknown-linux-gnu
+
+      - name: Install 32-bit linker support
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes g++-multilib
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run repository tooling tests
+        run: python -m unittest discover -s tools/tests -v
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --locked --target i686-unknown-linux-gnu --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked --target i686-unknown-linux-gnu
+
+      - name: Check supported feature matrix
+        shell: pwsh
+        run: tools/check_feature_matrix.ps1 -Target i686-unknown-linux-gnu

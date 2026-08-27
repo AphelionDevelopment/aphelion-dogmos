@@ -1,11 +1,15 @@
 pub mod groups;
-pub mod processing;
 #[cfg(feature = "katmos")]
 pub mod katmos;
+pub mod processing;
 #[cfg(feature = "superconductivity")]
 mod superconduct;
 
-use crate::{constants::*, gas::{gas_slot_for_mix, Mixture}, GasArena};
+use crate::{
+	constants::*,
+	gas::{gas_slot_for_mix, Mixture},
+	GasArena,
+};
 use bitflags::bitflags;
 use byondapi::prelude::*;
 use eyre::{Context, Result};
@@ -214,6 +218,16 @@ struct TurfGases {
 	map: TurfGraphMap,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TurfRuntimeMetrics {
+	pub nodes: usize,
+	pub edges: usize,
+	pub node_capacity: usize,
+	pub edge_capacity: usize,
+	pub map_capacity: usize,
+	pub turf_mixture_bytes: usize,
+}
+
 impl TurfGases {
 	pub fn insert_turf(&mut self, tmix: TurfMixture) {
 		if let Some(&node_id) = self.map.get(&tmix.id) {
@@ -289,7 +303,7 @@ impl TurfGases {
 		self.graph.neighbors(index).filter(|&adj_index| {
 			self.graph
 				.node_weight(adj_index)
-				.map_or(false, |mix| mix.enabled())
+				.is_some_and(|mix| mix.enabled())
 		})
 	}
 
@@ -366,7 +380,7 @@ pub fn wait_for_tasks() {
 		),
 	}
 }
-#[byondapi::init]
+#[auxmacros::init]
 pub fn initialize_turfs() {
 	// 10x 255x255 zlevels
 	// Reserve room for the graph's expected node and edge counts.
@@ -385,6 +399,30 @@ pub fn shutdown_turfs() {
 	if let Some(planetary_atmos) = PLANETARY_ATMOS.write().as_mut() {
 		planetary_atmos.clear();
 	}
+}
+
+pub(crate) fn turf_runtime_metrics() -> TurfRuntimeMetrics {
+	let arena = TURF_GASES.read();
+	let Some(arena) = arena.as_ref() else {
+		return TurfRuntimeMetrics {
+			turf_mixture_bytes: std::mem::size_of::<TurfMixture>(),
+			..Default::default()
+		};
+	};
+	let (node_capacity, edge_capacity) = arena.graph.capacity();
+	TurfRuntimeMetrics {
+		nodes: arena.graph.node_count(),
+		edges: arena.graph.edge_count(),
+		node_capacity,
+		edge_capacity,
+		map_capacity: arena.map.capacity(),
+		turf_mixture_bytes: std::mem::size_of::<TurfMixture>(),
+	}
+}
+
+#[cfg(feature = "superconductivity")]
+pub(crate) fn heat_runtime_metrics() -> superconduct::HeatRuntimeMetrics {
+	superconduct::heat_runtime_metrics()
 }
 
 #[cfg(feature = "superconductivity")]
@@ -409,14 +447,19 @@ pub(crate) fn gas_mix_is_referenced(mix: usize) -> bool {
 	TURF_GASES
 		.read()
 		.as_ref()
-		.map_or(false, |arena| arena.graph.node_weights().any(|turf| turf.mix == mix))
+		.is_some_and(|arena| arena.graph.node_weights().any(|turf| turf.mix == mix))
 }
 
 /// Returns the number of on-demand space-boundary nodes in the gas graph.
-#[byondapi::bind("/proc/dogmos_space_boundary_count")]
+#[auxmacros::bind("/proc/dogmos_space_boundary_count")]
 fn dogmos_space_boundary_count() -> Result<ByondValue> {
-	Ok((with_turf_gases_read(|arena| arena.graph.node_weights().filter(|mix| !mix.enabled()).count())
-		as f32)
+	Ok((with_turf_gases_read(|arena| {
+		arena
+			.graph
+			.node_weights()
+			.filter(|mix| !mix.enabled())
+			.count()
+	}) as f32)
 		.into())
 }
 
@@ -431,7 +474,7 @@ where
 pub(crate) fn turf_callback_is_current(id: TurfID, generation: u32) -> bool {
 	ByondValue::new_ref(ValueType::Turf, id)
 		.read_number_id(byond_string!("dogmos_registration_generation"))
-		.map_or(false, |current| current >= 0.0 && current as u32 == generation)
+		.is_ok_and(|current| current >= 0.0 && current as u32 == generation)
 }
 
 fn with_planetary_atmos<T, F>(f: F) -> T
@@ -443,7 +486,9 @@ where
 
 fn with_planetary_atmos_upgradeable_read<T, F>(f: F) -> Result<T>
 where
-	F: FnOnce(RwLockUpgradableReadGuard<'_, Option<IndexMap<u32, Mixture, FxBuildHasher>>>) -> Result<T>,
+	F: FnOnce(
+		RwLockUpgradableReadGuard<'_, Option<IndexMap<u32, Mixture, FxBuildHasher>>>,
+	) -> Result<T>,
 {
 	f(PLANETARY_ATMOS.upgradable_read())
 }
@@ -456,7 +501,7 @@ const SPACE_BOUNDARY_FLAG: i32 = -2;
 const REMOVE_TURF_FLAG: i32 = -3;
 
 /// Returns: null. Updates turf air infos, whether the turf is closed, is space or a regular turf, or even a planet turf is decided here.
-#[byondapi::bind("/turf/proc/update_air_ref")]
+#[auxmacros::bind("/turf/proc/update_air_ref")]
 fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	let raw_flag = flag.get_number()? as i32;
@@ -551,8 +596,8 @@ fn hook_register_turf(src: ByondValue, flag: ByondValue) -> Result<ByondValue> {
 /// Updates adjacency infos for turfs, only use this in immediateupdateturfs.
 ///
 /// The map bounds are passed from DM because World intrinsic properties are not regular FFI vars.
-#[byondapi::bind("/turf/proc/__update_auxtools_turf_adjacency_info")]
-fn hook_infos(src: ByondValue, max_x: ByondValue, max_y: ByondValue) -> Result<ByondValue> {
+#[auxmacros::bind("/turf/proc/__update_auxtools_turf_adjacency_info")]
+fn hook_infos(src: ByondValue, _max_x: ByondValue, _max_y: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	let adjacent_list = src
 		.read_var_id(byond_string!("atmos_adjacent_turfs"))
@@ -568,7 +613,11 @@ fn hook_infos(src: ByondValue, max_x: ByondValue, max_y: ByondValue) -> Result<B
 	})?;
 
 	#[cfg(feature = "superconductivity")]
-	superconduct::supercond_update_adjacencies(id, max_x.get_number()? as i32, max_y.get_number()? as i32)?;
+	superconduct::supercond_update_adjacencies(
+		id,
+		_max_x.get_number()? as i32,
+		_max_y.get_number()? as i32,
+	)?;
 	Ok(ByondValue::null())
 }
 
@@ -629,7 +678,10 @@ fn update_visuals(src: ByondValue) -> Result<ByondValue> {
 					})
 					// getting the list(VIS_FACTORS = OVERLAYS) with PLANE_OFFSET+1
 					.filter_map(|(per_offset_list, moles)| {
-						Some((per_offset_list.read_list_index(plane_offset_index).ok()?, moles))
+						Some((
+							per_offset_list.read_list_index(plane_offset_index).ok()?,
+							moles,
+						))
 					})
 					// getting the OVERLAYS with VIS_FACTOR
 					.filter_map(|(this_overlay_list, moles)| {
@@ -716,5 +768,20 @@ fn adjacent_tile_ids(adj: Directions, i: TurfID, max_x: i32, max_y: i32) -> Adja
 		max_x,
 		max_y,
 		count: 0,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{initialize_turfs, turf_runtime_metrics};
+
+	#[test]
+	fn turf_runtime_metrics_report_source_layout_and_reserved_capacity() {
+		initialize_turfs();
+		let metrics = turf_runtime_metrics();
+		assert_eq!(metrics.turf_mixture_bytes, 32);
+		assert_eq!(metrics.node_capacity, 650_250);
+		assert_eq!(metrics.edge_capacity, 1_300_500);
+		assert_eq!(metrics.map_capacity, 650_250);
 	}
 }

@@ -1,0 +1,4 @@
+[package]
+name = "dogmos-protocol"
+version = "2.3.0"
+edition = "2021"

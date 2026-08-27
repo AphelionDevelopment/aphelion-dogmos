@@ -14,7 +14,21 @@ pub type CallbackReceiver = flume::Receiver<DeferredFunc>;
 
 static CALLBACK_CHANNEL: std::sync::OnceLock<CallbackChannel> = std::sync::OnceLock::new();
 static CALLBACK_ENQUEUE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static CALLBACK_ITEMS_ENQUEUED: AtomicUsize = AtomicUsize::new(0);
+static CALLBACK_ITEMS_DRAINED: AtomicUsize = AtomicUsize::new(0);
+static CALLBACK_QUEUE_DEPTH_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 static CALLBACK_STATE: RwLock<bool> = RwLock::new(false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallbackMetrics {
+	pub items_enqueued: usize,
+	pub items_drained: usize,
+	pub queue_depth: usize,
+	pub queue_depth_high_water: usize,
+	pub owned_bytes_current: usize,
+	pub owned_bytes_enqueued: usize,
+	pub enqueue_failures: usize,
+}
 
 /// Reopens the main-thread callback queue for a new BYOND world.
 pub fn begin_callbacks() {
@@ -52,9 +66,7 @@ pub fn byond_callback_sender() -> flume::Sender<DeferredFunc> {
 /// The callback channel is unbounded, so a live server cannot lose work to queue capacity. Once
 /// teardown begins, new callbacks are rejected and counted instead of being silently discarded.
 pub fn queue_callback(callback: DeferredFunc) {
-	let state = CALLBACK_STATE
-		.read()
-		.expect("callback state lock poisoned");
+	let state = CALLBACK_STATE.read().expect("callback state lock poisoned");
 	if !*state {
 		CALLBACK_ENQUEUE_FAILURES.fetch_add(1, Ordering::Relaxed);
 		return;
@@ -66,12 +78,32 @@ pub fn queue_callback(callback: DeferredFunc) {
 		.is_err()
 	{
 		CALLBACK_ENQUEUE_FAILURES.fetch_add(1, Ordering::Relaxed);
+	} else {
+		CALLBACK_ITEMS_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+		let depth = CALLBACK_CHANNEL.get().map_or(0, |channel| channel.0.len());
+		CALLBACK_QUEUE_DEPTH_HIGH_WATER.fetch_max(depth, Ordering::Relaxed);
 	}
 }
 
 /// Returns the number of callbacks rejected because the main-thread queue was already closed.
 pub fn callback_enqueue_failures() -> usize {
 	CALLBACK_ENQUEUE_FAILURES.load(Ordering::Relaxed)
+}
+
+#[must_use]
+pub fn callback_metrics() -> CallbackMetrics {
+	let queue_depth = CALLBACK_CHANNEL.get().map_or(0, |channel| channel.1.len());
+	CallbackMetrics {
+		items_enqueued: CALLBACK_ITEMS_ENQUEUED.load(Ordering::Relaxed),
+		items_drained: CALLBACK_ITEMS_DRAINED.load(Ordering::Relaxed),
+		queue_depth,
+		queue_depth_high_water: CALLBACK_QUEUE_DEPTH_HIGH_WATER.load(Ordering::Relaxed),
+		owned_bytes_current: queue_depth.saturating_mul(std::mem::size_of::<DeferredFunc>()),
+		owned_bytes_enqueued: CALLBACK_ITEMS_ENQUEUED
+			.load(Ordering::Relaxed)
+			.saturating_mul(std::mem::size_of::<DeferredFunc>()),
+		enqueue_failures: CALLBACK_ENQUEUE_FAILURES.load(Ordering::Relaxed),
+	}
 }
 
 fn report_callback_error(error: impl std::fmt::Debug) {
@@ -89,7 +121,10 @@ fn process_callbacks() {
 	with_callback_receiver(|receiver| {
 		receiver
 			.try_iter()
-			.filter_map(|cb| cb().err())
+			.filter_map(|cb| {
+				CALLBACK_ITEMS_DRAINED.fetch_add(1, Ordering::Relaxed);
+				cb().err()
+			})
 			.for_each(report_callback_error)
 	})
 }
@@ -99,6 +134,7 @@ fn process_callbacks_for(duration: Duration) -> bool {
 	let timer = Instant::now();
 	with_callback_receiver(|receiver| {
 		for callback in receiver.try_iter() {
+			CALLBACK_ITEMS_DRAINED.fetch_add(1, Ordering::Relaxed);
 			if let Err(e) = callback() {
 				report_callback_error(e);
 			}
@@ -126,7 +162,6 @@ pub fn process_callbacks_for_millis(millis: u64) -> bool {
 ///     auxcallback::callback_processing_hook(remaining)
 /// }
 /// ```
-
 pub fn callback_processing_hook(time_remaining: ByondValue) -> Result<ByondValue> {
 	if time_remaining.is_num() {
 		let limit = time_remaining.get_number()?.max(0.0) as u64;
@@ -173,5 +208,22 @@ mod tests {
 		queue_callback(Box::new(|| Ok(())));
 		assert_eq!(callback_enqueue_failures(), failures_before_cleanup + 1);
 		begin_callbacks();
+	}
+
+	#[test]
+	fn callback_metrics_track_queue_depth_and_owned_handle_bytes() {
+		let _guard = CALLBACK_TEST_LOCK.lock().unwrap();
+		begin_callbacks();
+		let before = callback_metrics();
+		queue_callback(Box::new(|| Ok(())));
+		let queued = callback_metrics();
+		assert_eq!(queued.queue_depth, before.queue_depth + 1);
+		assert!(queued.owned_bytes_current > before.owned_bytes_current);
+		assert!(queued.queue_depth_high_water >= queued.queue_depth);
+		assert!(!process_callbacks_for_millis(100));
+		let drained = callback_metrics();
+		assert_eq!(drained.queue_depth, before.queue_depth);
+		assert_eq!(drained.owned_bytes_current, before.owned_bytes_current);
+		assert!(drained.items_drained > before.items_drained);
 	}
 }

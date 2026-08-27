@@ -61,12 +61,12 @@ fn plasma_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> 
 	let fire_amount = plasma_burn_rate * (1.0 + oxygen_burn_rate);
 	if fire_amount > 0.0 {
 		let temperature = with_mix_mut(&byond_air, |air| {
-			air.set_moles(plasma, initial_plasma - plasma_burn_rate);
-			air.set_moles(o2, initial_oxy - (plasma_burn_rate * oxygen_burn_rate));
+			air.set_moles(plasma, initial_plasma - plasma_burn_rate)?;
+			air.set_moles(o2, initial_oxy - (plasma_burn_rate * oxygen_burn_rate))?;
 			if initial_oxy / initial_plasma > SUPER_SATURATION_THRESHOLD {
-				air.adjust_moles(tritium, plasma_burn_rate);
+				air.adjust_moles(tritium, plasma_burn_rate)?;
 			} else {
-				air.adjust_moles(co2, plasma_burn_rate);
+				air.adjust_moles(co2, plasma_burn_rate)?;
 			}
 			let new_temp = (initial_energy + plasma_burn_rate * FIRE_PLASMA_ENERGY_RELEASED)
 				/ air.heat_capacity();

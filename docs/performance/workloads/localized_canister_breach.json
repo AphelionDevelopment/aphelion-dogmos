@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "localized_canister_breach",
+  "seed": 54103,
+  "duration_seconds": 120,
+  "map": "MetaStation.dmm",
+  "driver": { "kind": "meridian_mcp_live", "profile": "localized_canister_breach" },
+  "expected_markers": ["DOGMOS_PERF_BREACH_STARTED", "DOGMOS_PERF_BREACH_COMPLETE"],
+  "correctness_assertions": ["total tracked gas remains conserved", "pressure movement callbacks drain within the workload"]
+}

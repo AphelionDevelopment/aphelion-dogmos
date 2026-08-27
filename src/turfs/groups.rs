@@ -17,7 +17,7 @@ pub fn send_to_groups(sent: BTreeSet<TurfID>) {
 	GROUPS_CHANNEL.try_lock().map(|mut opt| opt.replace(sent));
 }
 /// Returns: If this cycle is interrupted by overtiming or not. Starts a processing excited groups cycle, does nothing if process_turfs isn't ran.
-#[byondapi::bind("/datum/controller/subsystem/air/proc/process_excited_groups_auxtools")]
+#[auxmacros::bind("/datum/controller/subsystem/air/proc/process_excited_groups_auxtools")]
 fn groups_hook(mut src: ByondValue, remaining: ByondValue) -> Result<ByondValue> {
 	let group_pressure_goal = src
 		.read_number_id(byond_string!("excited_group_pressure_goal"))

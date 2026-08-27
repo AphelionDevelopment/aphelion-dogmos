@@ -11,6 +11,16 @@ coarsetime = "0.1.35"
 flume = "0.11.1"
 eyre = "0.6.12"
 tracing = "0.1.41"
+interprocess = { version = "2.4.3", default-features = false }
+windows-sys = { version = "0.61.2", features = [
+	"Win32_Foundation",
+	"Win32_Security",
+	"Win32_Security_Cryptography",
+	"Win32_System_IO",
+	"Win32_System_JobObjects",
+	"Win32_System_Memory",
+	"Win32_System_Threading",
+] }
 
 [package]
 name = "dogmos"
@@ -48,6 +58,8 @@ coarsetime = { workspace = true }
 eyre = { workspace = true }
 auxcallback = { path = "./crates/auxcallback" }
 auxmacros = { path = "./crates/auxmacros" }
+dogmos-core = { path = "./crates/dogmos-core" }
+dogmos-perf = { path = "./crates/dogmos-perf" }
 itertools = "0.14.0"
 rayon = "1.10.0"
 float-ord = "0.3.2"

@@ -3,6 +3,7 @@ use byondapi::{byond_string, prelude::*};
 //use indexmap::IndexSet;
 use crate::GasArena;
 use coarsetime::Instant;
+use dogmos_core::numerics::conduction::{conduction_step, BASE_HEAT_STEP_SECONDS};
 use eyre::Result;
 use std::{
 	collections::HashSet,
@@ -42,7 +43,7 @@ fn record_registration_change(pending: &AtomicUsize, total: &AtomicUsize) {
 	total.fetch_add(1, Ordering::Relaxed);
 }
 
-#[byondapi::init]
+#[auxmacros::init]
 fn initialize_heat_statics() {
 	HEAT_SHUTDOWN.store(false, Ordering::Release);
 	*TURF_HEAT.write() = Some(new_turf_heat());
@@ -129,7 +130,29 @@ struct TurfHeat {
 	map: HeatGraphMap,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeatRuntimeMetrics {
+	pub nodes: usize,
+	pub edges: usize,
+	pub node_capacity: usize,
+	pub edge_capacity: usize,
+	pub map_capacity: usize,
+	pub thermal_info_bytes: usize,
+}
+
 impl TurfHeat {
+	fn runtime_metrics(&self) -> HeatRuntimeMetrics {
+		let (node_capacity, edge_capacity) = self.graph.capacity();
+		HeatRuntimeMetrics {
+			nodes: self.graph.node_count(),
+			edges: self.graph.edge_count(),
+			node_capacity,
+			edge_capacity,
+			map_capacity: self.map.capacity(),
+			thermal_info_bytes: std::mem::size_of::<ThermalInfo>(),
+		}
+	}
+
 	pub fn insert_turf(&mut self, info: ThermalInfo) -> bool {
 		if let Some(&node_id) = self.map.get(&info.id) {
 			let thin = self.graph.node_weight_mut(node_id).unwrap();
@@ -215,6 +238,16 @@ impl TurfHeat {
 	}
 }
 
+pub(crate) fn heat_runtime_metrics() -> HeatRuntimeMetrics {
+	TURF_HEAT.read().as_ref().map_or_else(
+		|| HeatRuntimeMetrics {
+			thermal_info_bytes: std::mem::size_of::<ThermalInfo>(),
+			..Default::default()
+		},
+		TurfHeat::runtime_metrics,
+	)
+}
+
 pub fn supercond_update_ref(src: ByondValue) -> Result<()> {
 	let id = src.get_ref()?;
 	let therm_cond = src
@@ -278,7 +311,7 @@ pub fn supercond_update_adjacencies(id: u32, max_x: i32, max_y: i32) -> Result<(
 }
 
 // This overrides the existing atom temperature proc for registered heat nodes.
-#[byondapi::bind("/turf/return_temperature")]
+#[auxmacros::bind("/turf/return_temperature")]
 fn hook_turf_temperature(src: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	with_turf_heat_read(|arena| -> Result<ByondValue> {
@@ -297,7 +330,7 @@ fn hook_turf_temperature(src: ByondValue) -> Result<ByondValue> {
 }
 
 // Return null for unregistered nodes so DM can use its compatibility temperature.
-#[byondapi::bind("/turf/proc/__dogmos_heat_temperature")]
+#[auxmacros::bind("/turf/proc/__dogmos_heat_temperature")]
 fn hook_dogmos_heat_temperature(src: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	with_turf_heat_read(|arena| -> Result<ByondValue> {
@@ -316,7 +349,7 @@ fn hook_dogmos_heat_temperature(src: ByondValue) -> Result<ByondValue> {
 
 // Raw bind for the DM temperature wrapper. Writes before registration are safe no-ops because the
 // wrapper also maintains the compatibility value.
-#[byondapi::bind("/turf/proc/__set_temperature")]
+#[auxmacros::bind("/turf/proc/__set_temperature")]
 fn hook_turf_temperature_set(src: ByondValue, arg_temp: ByondValue) -> Result<ByondValue> {
 	let id = src.get_ref()?;
 	let v = arg_temp.get_number()?;
@@ -338,7 +371,7 @@ fn hook_turf_temperature_set(src: ByondValue, arg_temp: ByondValue) -> Result<By
 
 // Expected function call: process_turf_heat()
 // Returns: TRUE if thread not done, FALSE otherwise
-#[byondapi::bind("/datum/controller/subsystem/air/proc/process_turf_heat")]
+#[auxmacros::bind("/datum/controller/subsystem/air/proc/process_turf_heat")]
 fn process_heat_notify(src: ByondValue) -> Result<ByondValue> {
 	if HEAT_SHUTDOWN.load(Ordering::Acquire) {
 		return Ok(ByondValue::null());
@@ -369,7 +402,9 @@ fn process_heat_notify(src: ByondValue) -> Result<ByondValue> {
 		)
 	})?;
 	if !wait.is_finite() || wait < 0.0 {
-		return Err(eyre::eyre!("Atmos heat budget must be finite and non-negative"));
+		return Err(eyre::eyre!(
+			"Atmos heat budget must be finite and non-negative"
+		));
 	}
 	let time_delta = f64::from(wait) / 10.0;
 	// Preserve the physical model if the mode toggle cannot be read.
@@ -408,7 +443,7 @@ fn blackbody_temperature_after_cooling(
 	emissivity_constant: f64,
 	radiation_from_space_tick: f64,
 ) -> f32 {
-	if !(heat_capacity > 0.0) {
+	if heat_capacity.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
 		return TCMB;
 	}
 	let blackbody_radiation =
@@ -460,7 +495,22 @@ struct HeatProcessingScratch {
 	temperatures: Vec<f32>,
 	conductivities: Vec<f32>,
 	heat_capacities: Vec<f32>,
-	deltas: Vec<f32>,
+	dense_edges: Vec<(u32, u32)>,
+}
+
+fn record_heat_metrics(
+	telemetry: &dogmos_perf::Telemetry,
+	nodes_scanned: usize,
+	nodes_changed: usize,
+	edges_attempted: usize,
+	edges_applied: u64,
+) {
+	use dogmos_perf::RuntimeMetric;
+
+	telemetry.increment_metric(RuntimeMetric::HeatNodesScanned, nodes_scanned as u64);
+	telemetry.increment_metric(RuntimeMetric::HeatNodesChanged, nodes_changed as u64);
+	telemetry.increment_metric(RuntimeMetric::HeatEdgesAttempted, edges_attempted as u64);
+	telemetry.increment_metric(RuntimeMetric::HeatEdgesApplied, edges_applied);
 }
 
 #[cfg(test)]
@@ -481,6 +531,7 @@ fn accumulate_heat_edge_deltas(
 	deltas
 }
 
+#[cfg(test)]
 fn accumulate_heat_edge_deltas_into(
 	edges: &[(HeatNodeIndex, HeatNodeIndex)],
 	temperatures: &[f32],
@@ -507,6 +558,7 @@ fn accumulate_heat_edge_deltas_into(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use dogmos_perf::RuntimeMetric;
 
 	#[test]
 	fn heat_edge_accumulation_visits_each_undirected_edge_once() {
@@ -525,6 +577,17 @@ mod tests {
 				(HeatNodeIndex::new(1), HeatNodeIndex::new(2)),
 			]
 		);
+	}
+
+	#[test]
+	fn heat_metrics_count_work_without_combining_dimensions() {
+		let telemetry = dogmos_perf::Telemetry::new();
+		record_heat_metrics(&telemetry, 256, 32, 48, 44);
+		let snapshot = telemetry.snapshot(0);
+		assert_eq!(snapshot.metric(RuntimeMetric::HeatNodesScanned), 256);
+		assert_eq!(snapshot.metric(RuntimeMetric::HeatNodesChanged), 32);
+		assert_eq!(snapshot.metric(RuntimeMetric::HeatEdgesAttempted), 48);
+		assert_eq!(snapshot.metric(RuntimeMetric::HeatEdgesApplied), 44);
 	}
 
 	#[test]
@@ -655,10 +718,20 @@ mod tests {
 		assert_eq!(stored_info.heat_capacity, 2.0);
 		assert!(stored_info.adjacent_to_space);
 	}
+
+	#[test]
+	fn heat_runtime_metrics_report_source_layout_and_reserved_capacity() {
+		let arena = new_turf_heat();
+		let metrics = arena.runtime_metrics();
+		assert_eq!(metrics.thermal_info_bytes, 28);
+		assert_eq!(metrics.node_capacity, 650_250);
+		assert_eq!(metrics.edge_capacity, 1_300_500);
+		assert_eq!(metrics.map_capacity, 650_250);
+	}
 }
 
 /// Returns the number of registered turfs in the heat graph.
-#[byondapi::bind("/proc/dogmos_heat_graph_count")]
+#[auxmacros::bind("/proc/dogmos_heat_graph_count")]
 fn dogmos_heat_graph_count() -> Result<ByondValue> {
 	Ok((with_turf_heat_read(|arena| arena.map.len()) as f32).into())
 }
@@ -667,7 +740,7 @@ fn dogmos_heat_graph_count() -> Result<ByondValue> {
 /// This is intentionally monotonic: the per-cycle registration counter is delivered through the
 /// asynchronous callback queue and can be zero when a perf sample races that callback, while this
 /// direct atomic read cannot lose a completed registration event to queue timing.
-#[byondapi::bind("/proc/dogmos_heat_registration_total")]
+#[auxmacros::bind("/proc/dogmos_heat_registration_total")]
 fn dogmos_heat_registration_total() -> Result<ByondValue> {
 	Ok((HEAT_REGISTRATION_TOTAL.load(Ordering::Relaxed) as f32).into())
 }
@@ -701,13 +774,16 @@ fn start_heat_worker() {
 			let start_time = Instant::now();
 			let emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * info.time_delta;
 			let radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * info.time_delta;
+			let elapsed_heat_scale = info.time_delta as f32 / BASE_HEAT_STEP_SECONDS;
 			// Extracted before the closures below, which shadow the name `info` with each turf's own
 			// ThermalInfo - this is SSheatInfo's toggle, not a per-turf value.
 			let blackbody_enabled = info.blackbody_enabled;
 			let mut heat_graph_nodes = 0;
+			let mut heat_nodes_changed = 0;
 			let mut heat_edge_attempts = 0;
-			let mut heat_edges_applied = 0;
+			let mut heat_edges_applied = 0_u64;
 			let mut heat_lock_contention = 0;
+			let mut heat_processing_error = None;
 			with_turf_heat_read(|arena| {
 				heat_graph_nodes = arena.map.len();
 				with_turf_gases_read(|air_arena| {
@@ -751,9 +827,7 @@ fn start_heat_worker() {
 										return None;
 									}
 									let air_temp = all_mixtures.get(cur_mix.mix)?.try_read();
-									if air_temp.is_none() {
-										return None;
-									}
+									air_temp.as_ref()?;
 									let air_temp = air_temp.unwrap().get_temperature();
 
 									if air_temp < MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION {
@@ -787,7 +861,7 @@ fn start_heat_worker() {
 									} else if *temp_write > T20C {
 										let delta = *temp_write - TCMB;
 										let energy = get_share_energy(
-											info.thermal_conductivity * delta,
+											info.thermal_conductivity * elapsed_heat_scale * delta,
 											HEAT_CAPACITY_VACUUM,
 											info.heat_capacity,
 										);
@@ -843,10 +917,8 @@ fn start_heat_worker() {
 							})
 							.collect::<Vec<_>>();
 
-						// Read every undirected edge from a stable snapshot, accumulate each endpoint's
-						// temperature delta, then write each node once. The old parallel loop held one
-						// endpoint's write lock and used try_write() for the other endpoint, so two opposing
-						// tasks could silently skip the same valid edge under contention.
+						// Read every undirected edge from a stable snapshot. The core applies deterministic,
+						// conservative substeps using SSair's elapsed time before each node is written once.
 						unique_heat_edges_into(
 							adjacencies_to_consider.iter().flat_map(|&cur_index| {
 								arena
@@ -857,7 +929,6 @@ fn start_heat_worker() {
 							&mut scratch.unique_edges,
 						);
 						heat_edge_attempts = scratch.unique_edges.len();
-						heat_edges_applied = scratch.unique_edges.len();
 						scratch.touched_nodes.clear();
 						scratch.touched_nodes.extend(
 							scratch
@@ -870,48 +941,86 @@ fn start_heat_worker() {
 							.sort_by_key(|node_index| node_index.index());
 						scratch.touched_nodes.dedup();
 
-						let node_bound = scratch
-							.touched_nodes
-							.last()
-							.map_or(0, |node_index| node_index.index() + 1);
+						let touched_node_count = scratch.touched_nodes.len();
+						heat_nodes_changed = touched_node_count;
 						scratch.temperatures.clear();
-						scratch.temperatures.resize(node_bound, 0.0);
+						scratch.temperatures.resize(touched_node_count, 0.0);
 						scratch.conductivities.clear();
-						scratch.conductivities.resize(node_bound, 0.0);
+						scratch.conductivities.resize(touched_node_count, 0.0);
 						scratch.heat_capacities.clear();
-						scratch.heat_capacities.resize(node_bound, 0.0);
-						for &node_index in &scratch.touched_nodes {
+						scratch.heat_capacities.resize(touched_node_count, 0.0);
+						for (dense_index, &node_index) in scratch.touched_nodes.iter().enumerate() {
 							let info = arena.get(node_index).unwrap();
-							let index = node_index.index();
-							scratch.temperatures[index] = *info.temperature.read();
-							scratch.conductivities[index] = info.thermal_conductivity;
-							scratch.heat_capacities[index] = info.heat_capacity;
+							scratch.temperatures[dense_index] = *info.temperature.read();
+							scratch.conductivities[dense_index] = info.thermal_conductivity;
+							scratch.heat_capacities[dense_index] = info.heat_capacity;
 						}
 
-						accumulate_heat_edge_deltas_into(
-							&scratch.unique_edges,
-							&scratch.temperatures,
-							&scratch.conductivities,
-							&scratch.heat_capacities,
-							&mut scratch.deltas,
-						);
-						for &node_index in &scratch.touched_nodes {
-							let info = arena.get(node_index).unwrap();
-							let mut temp_write = match info.temperature.try_write() {
-								Some(temperature) => temperature,
-								None => {
-									heat_lock_contention += 1;
-									info.temperature.write()
-								}
+						scratch.dense_edges.clear();
+						for &(first, second) in &scratch.unique_edges {
+							let first_dense = scratch
+								.touched_nodes
+								.binary_search_by_key(&first.index(), |node_index| {
+									node_index.index()
+								});
+							let second_dense = scratch
+								.touched_nodes
+								.binary_search_by_key(&second.index(), |node_index| {
+									node_index.index()
+								});
+							let (Ok(first_dense), Ok(second_dense)) = (first_dense, second_dense)
+							else {
+								heat_processing_error = Some(
+									"heat edge endpoint was absent from the dense node snapshot"
+										.to_owned(),
+								);
+								break;
 							};
-							*temp_write += scratch.deltas[node_index.index()];
-							if !temp_write.is_normal() {
-								*temp_write = TCMB;
+							scratch
+								.dense_edges
+								.push((first_dense as u32, second_dense as u32));
+						}
+
+						if heat_processing_error.is_none() {
+							match conduction_step(
+								&mut scratch.temperatures,
+								&scratch.conductivities,
+								&scratch.heat_capacities,
+								&scratch.dense_edges,
+								info.time_delta as f32,
+							) {
+								Ok(stats) => heat_edges_applied = stats.edges_applied,
+								Err(error) => heat_processing_error = Some(error.to_string()),
+							}
+						}
+						if heat_processing_error.is_none() {
+							for (dense_index, &node_index) in
+								scratch.touched_nodes.iter().enumerate()
+							{
+								let info = arena.get(node_index).unwrap();
+								let mut temp_write = match info.temperature.try_write() {
+									Some(temperature) => temperature,
+									None => {
+										heat_lock_contention += 1;
+										info.temperature.write()
+									}
+								};
+								*temp_write = scratch.temperatures[dense_index];
+								if !temp_write.is_normal() {
+									*temp_write = TCMB;
+								}
 							}
 						}
 					});
 				});
 			});
+			record_heat_metrics(
+				&crate::DOGMOS_TELEMETRY,
+				heat_graph_nodes,
+				heat_nodes_changed,
+				heat_edge_attempts,
+				heat_edges_applied,
+			);
 			let bench = start_time.elapsed().as_millis();
 			let registration_changes = HEAT_REGISTRATION_CHANGES.swap(0, Ordering::Relaxed);
 			auxcallback::queue_callback(Box::new(move || {
@@ -950,6 +1059,11 @@ fn start_heat_worker() {
 					byond_string!("dogmos_heat_registration_changes"),
 					&(registration_changes as f32).into(),
 				)?;
+				if let Some(error) = heat_processing_error {
+					return Err(eyre::eyre!(
+						"Dogmos TurfHeat numerical step rejected: {error}"
+					));
+				}
 				Ok(())
 			}));
 			drop(task_lock);
@@ -957,7 +1071,7 @@ fn start_heat_worker() {
 	});
 }
 
-#[byondapi::init]
+#[auxmacros::init]
 fn process_heat_start() {
 	start_heat_worker();
 }

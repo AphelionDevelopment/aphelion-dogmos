@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "callback_consumer_throttled",
+  "seed": 54109,
+  "duration_seconds": 180,
+  "map": "MetaStation.dmm",
+  "driver": { "kind": "meridian_mcp_live", "profile": "callback_consumer_throttled" },
+  "expected_markers": ["DOGMOS_PERF_CALLBACK_STARTED", "DOGMOS_PERF_CALLBACK_COMPLETE"],
+  "correctness_assertions": ["callback queue remains bounded", "critical callback order is deterministic", "queue age recovers after throttling"]
+}

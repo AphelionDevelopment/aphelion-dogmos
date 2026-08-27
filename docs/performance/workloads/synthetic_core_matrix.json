@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "synthetic_core_matrix",
+  "seed": 54110,
+  "duration_seconds": 1,
+  "map": "synthetic",
+  "driver": { "kind": "dogmos_core", "profile": "matrix" },
+  "turf_counts": [1000, 10000, 100000, 650250],
+  "gas_counts": [4, 8, 9, 20],
+  "active_percentages": [0, 1, 10, 100],
+  "topologies": ["corridor", "grid", "multiz"],
+  "expected_markers": ["DOGMOS_CORE_MATRIX_COMPLETE"],
+  "correctness_assertions": ["deterministic output for a fixed seed", "diffusion conserves moles", "conduction conserves finite thermal energy"]
+}

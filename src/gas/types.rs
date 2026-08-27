@@ -181,28 +181,27 @@ impl GasType {
 					FireInfo::None
 				}
 			},
-			fire_products: read_optional_var(gas, "fire_products")
-				.and_then(|product_info| {
-					if product_info.is_list() {
-						Some(FireProductInfo::Generic(
-							product_info
-								.iter()
-								.unwrap()
-								.filter_map(|(k, v)| {
-									k.get_string().ok().and_then(|s_str| {
-										v.get_number()
-											.ok()
-											.map(|amt| (GasRef::Deferred(s_str), amt))
-									})
+			fire_products: read_optional_var(gas, "fire_products").and_then(|product_info| {
+				if product_info.is_list() {
+					Some(FireProductInfo::Generic(
+						product_info
+							.iter()
+							.unwrap()
+							.filter_map(|(k, v)| {
+								k.get_string().ok().and_then(|s_str| {
+									v.get_number()
+										.ok()
+										.map(|amt| (GasRef::Deferred(s_str), amt))
 								})
-								.collect(),
-						))
-					} else if product_info.is_num() {
-						Some(FireProductInfo::Plasma) // if we add another snowflake later, add it, but for now we hack this in
-					} else {
-						None
-					}
-				}),
+							})
+							.collect(),
+					))
+				} else if product_info.is_num() {
+					Some(FireProductInfo::Plasma) // if we add another snowflake later, add it, but for now we hack this in
+				} else {
+					None
+				}
+			}),
 			enthalpy: read_optional_number(gas, "enthalpy").unwrap_or_default(),
 			fire_radiation_released: read_optional_number(gas, "fire_radiation_released")
 				.unwrap_or_default(),
@@ -217,7 +216,7 @@ static GAS_INFO_BY_IDX: RwLock<Option<Vec<GasType>>> = const_rwlock(None);
 
 static GAS_SPECIFIC_HEATS: RwLock<Option<Vec<f32>>> = const_rwlock(None);
 
-#[byondapi::init]
+#[auxmacros::init]
 pub fn initialize_gas_info_structs() {
 	*GAS_INFO_BY_STRING.write() = Some(DashMap::with_hasher(FxBuildHasher));
 	*GAS_INFO_BY_IDX.write() = Some(Vec::new());
@@ -245,7 +244,7 @@ pub fn destroy_gas_info_structs() {
 	});
 }
 /// For registering gases, do not touch this.
-#[byondapi::bind("/proc/_auxtools_register_gas")]
+#[auxmacros::bind("/proc/_auxtools_register_gas")]
 fn hook_register_gas(gas: ByondValue) -> Result<ByondValue> {
 	let gas_id = gas.read_string_id(byond_string!("id"))?;
 	let existing_idx = GAS_INFO_BY_STRING
@@ -272,7 +271,7 @@ fn hook_register_gas(gas: ByondValue) -> Result<ByondValue> {
 				.ok_or_else(|| eyre::eyre!("Gas specific heats are not initialized"))?;
 			*specific_heats
 				.get_mut(idx)
-			.ok_or_else(|| eyre::eyre!("Gas index {idx} is outside specific heats"))? =
+				.ok_or_else(|| eyre::eyre!("Gas index {idx} is outside specific heats"))? =
 				gas_cache.specific_heat;
 			drop(specific_heats_lock);
 			let mut gas_info_by_idx_lock = GAS_INFO_BY_IDX.write();
@@ -281,7 +280,7 @@ fn hook_register_gas(gas: ByondValue) -> Result<ByondValue> {
 				.ok_or_else(|| eyre::eyre!("Gas metadata index is not initialized"))?;
 			*gas_info_by_idx
 				.get_mut(idx)
-			.ok_or_else(|| eyre::eyre!("Gas index {idx} is outside metadata"))? = gas_cache;
+				.ok_or_else(|| eyre::eyre!("Gas index {idx} is outside metadata"))? = gas_cache;
 		}
 		None => {
 			let gas_cache = GasType::new(&gas, TOTAL_NUM_GASES.load(Ordering::Acquire))?;
@@ -311,7 +310,7 @@ fn hook_register_gas(gas: ByondValue) -> Result<ByondValue> {
 }
 
 /// Registers gases and loads the reaction table during SSair initialization.
-#[byondapi::bind("/proc/auxtools_atmos_init")]
+#[auxmacros::bind("/proc/auxtools_atmos_init")]
 fn hook_init(gas_data: ByondValue) -> Result<ByondValue> {
 	crate::reset_shutdown_state(&crate::DOGMOS_SHUTDOWN);
 	auxcallback::begin_callbacks();
@@ -327,13 +326,9 @@ fn hook_init(gas_data: ByondValue) -> Result<ByondValue> {
 }
 
 /// Returns the number of reactions accepted during initialization.
-#[byondapi::bind("/proc/dogmos_reaction_count")]
+#[auxmacros::bind("/proc/dogmos_reaction_count")]
 fn dogmos_reaction_count() -> Result<ByondValue> {
-	Ok((REACTION_INFO
-		.read()
-		.as_ref()
-		.map_or(0, |info| info.len()) as f32)
-		.into())
+	Ok((REACTION_INFO.read().as_ref().map_or(0, |info| info.len()) as f32).into())
 }
 
 fn get_reaction_info() -> Result<BTreeMap<ReactionPriority, Reaction>> {
@@ -368,7 +363,7 @@ fn get_reaction_info() -> Result<BTreeMap<ReactionPriority, Reaction>> {
 }
 
 /// Refreshes the reaction cache after DM changes the reaction table.
-#[byondapi::bind("/datum/controller/subsystem/air/proc/auxtools_update_reactions")]
+#[auxmacros::bind("/datum/controller/subsystem/air/proc/auxtools_update_reactions")]
 fn update_reactions() -> Result<ByondValue> {
 	*REACTION_INFO.write() = Some(get_reaction_info()?);
 	Ok(true.into())
@@ -473,7 +468,7 @@ pub fn update_gas_refs() -> Result<()> {
 	Ok(())
 }
 /// For updating reagent gas fire products, do not use for now.
-#[byondapi::bind("/proc/finalize_gas_refs")]
+#[auxmacros::bind("/proc/finalize_gas_refs")]
 fn finalize_gas_refs() -> Result<ByondValue> {
 	update_gas_refs()?;
 	Ok(ByondValue::null())

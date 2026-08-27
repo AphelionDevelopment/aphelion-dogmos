@@ -2,3 +2,4 @@
 /.vscode
 /.cargo/config.toml
 /bindings.dm
+/tmp/dogmos-perf/

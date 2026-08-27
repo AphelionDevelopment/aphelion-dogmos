@@ -1,0 +1,20 @@
+[package]
+name = "dogmos-server"
+version = "2.3.0"
+edition = "2021"
+
+[[bin]]
+name = "dogmosd"
+path = "src/main.rs"
+
+[dependencies]
+dogmos-core = { path = "../dogmos-core" }
+dogmos-identity = { path = "../dogmos-identity" }
+dogmos-protocol = { path = "../dogmos-protocol" }
+interprocess = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(all(windows, target_arch = "x86"))'.dev-dependencies]
+dogmos-byond = { path = "../dogmos-byond" }

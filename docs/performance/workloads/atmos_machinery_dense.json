@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "atmos_machinery_dense",
+  "seed": 54108,
+  "duration_seconds": 180,
+  "map": "MetaStation.dmm",
+  "driver": { "kind": "meridian_mcp_live", "profile": "atmos_machinery_dense" },
+  "expected_markers": ["DOGMOS_PERF_MACHINERY_STARTED", "DOGMOS_PERF_MACHINERY_COMPLETE"],
+  "correctness_assertions": ["atmos machinery processing completes without budget starvation", "mixture slot count stops growing after setup"]
+}

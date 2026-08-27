@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "turf_heat_sparse",
+  "seed": 54106,
+  "duration_seconds": 120,
+  "map": "MetaStation.dmm",
+  "driver": { "kind": "meridian_mcp_live", "profile": "turf_heat_sparse" },
+  "expected_markers": ["DOGMOS_PERF_HEAT_SPARSE_STARTED", "DOGMOS_PERF_HEAT_SPARSE_COMPLETE"],
+  "correctness_assertions": ["finite-capacity heat energy remains within tolerance", "temperatures stay within modeled extrema"]
+}

@@ -7,6 +7,7 @@ use byondapi::prelude::*;
 use eyre::Result;
 pub use mixture::Mixture;
 use parking_lot::{const_rwlock, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 pub use types::*;
 
 pub type GasIDX = usize;
@@ -18,10 +19,29 @@ pub struct GasArena {}
 static GAS_MIXTURES: RwLock<Option<Vec<RwLock<Mixture>>>> = const_rwlock(None);
 
 static NEXT_GAS_IDS: RwLock<Option<Vec<usize>>> = const_rwlock(None);
+static ACTIVE_MIXTURE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static MIXTURE_SLOT_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GasRuntimeMetrics {
+	pub arena_len: usize,
+	pub arena_capacity: usize,
+	pub active_slots: usize,
+	pub slot_high_water: usize,
+	pub mixture_bytes: usize,
+	pub mixture_lock_bytes: usize,
+	pub mole_length_zero: usize,
+	pub mole_length_one_to_four: usize,
+	pub mole_length_five_to_eight: usize,
+	pub mole_length_nine: usize,
+	pub mole_spills: usize,
+}
 
 fn gas_slot_from_number(raw_slot: f32, arena_len: usize) -> Result<usize> {
 	if !raw_slot.is_finite() || raw_slot < 0.0 || raw_slot.fract() != 0.0 {
-		return Err(eyre::eyre!("Gas mixture has an invalid arena slot: {raw_slot}"));
+		return Err(eyre::eyre!(
+			"Gas mixture has an invalid arena slot: {raw_slot}"
+		));
 	}
 	let slot = raw_slot as usize;
 	if slot >= arena_len {
@@ -51,10 +71,12 @@ pub(crate) fn gas_slot_for_mix(mix: &ByondValue) -> Result<usize> {
 	gas_slot_from_number(raw_slot, arena_len)
 }
 
-#[byondapi::init]
+#[auxmacros::init]
 pub fn initialize_gases() {
 	*GAS_MIXTURES.write() = Some(Vec::with_capacity(240_000));
 	*NEXT_GAS_IDS.write() = Some(Vec::with_capacity(2000));
+	ACTIVE_MIXTURE_SLOTS.store(0, Ordering::Relaxed);
+	MIXTURE_SLOT_HIGH_WATER.store(0, Ordering::Relaxed);
 }
 
 pub fn shut_down_gases() {
@@ -201,8 +223,8 @@ impl GasArena {
 		let reusable_idx = {
 			let mut next_gas_ids = NEXT_GAS_IDS.write();
 			let next_gas_ids = next_gas_ids
-			.as_mut()
-			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
+				.as_mut()
+				.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
 			let reusable_position = (0..next_gas_ids.len()).rev().find(|position| {
 				if next_gas_ids[*position] >= arena_len {
 					return false;
@@ -225,7 +247,9 @@ impl GasArena {
 				.as_ref()
 				.unwrap()
 				.get(idx)
-				.ok_or_else(|| eyre::eyre!("Reusable gas mixture ID {idx} is outside the gas arena"))?
+				.ok_or_else(|| {
+					eyre::eyre!("Reusable gas mixture ID {idx} is outside the gas arena")
+				})?
 				.write()
 				.clear_with_vol(init_volume);
 			mix.write_var_id(
@@ -257,6 +281,8 @@ impl GasArena {
 			next_gas_ids.extend(cur_last..(cur_last + cap));
 			gas_mixtures.resize_with(cur_last + cap, Default::default);
 		}
+		let active_slots = ACTIVE_MIXTURE_SLOTS.fetch_add(1, Ordering::Relaxed) + 1;
+		MIXTURE_SLOT_HIGH_WATER.fetch_max(active_slots, Ordering::Relaxed);
 		Ok(ByondValue::null())
 	}
 	/// Marks the ByondValue's gas mixture as unused, allowing it to be reallocated to another.
@@ -272,6 +298,7 @@ impl GasArena {
 			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
 		if !next_gas_ids.contains(&idx) {
 			next_gas_ids.push(idx);
+			ACTIVE_MIXTURE_SLOTS.fetch_sub(1, Ordering::Relaxed);
 		}
 		Ok(())
 	}
@@ -304,11 +331,7 @@ pub fn with_mixes<T, F>(src_mix: &ByondValue, arg_mix: &ByondValue, f: F) -> Res
 where
 	F: FnOnce(&Mixture, &Mixture) -> Result<T>,
 {
-	GasArena::with_gas_mixtures(
-		gas_slot_for_mix(src_mix)?,
-		gas_slot_for_mix(arg_mix)?,
-		f,
-	)
+	GasArena::with_gas_mixtures(gas_slot_for_mix(src_mix)?, gas_slot_for_mix(arg_mix)?, f)
 }
 
 /// As `with_mix_mut`, but with two mixes.
@@ -318,11 +341,7 @@ pub fn with_mixes_mut<T, F>(src_mix: &ByondValue, arg_mix: &ByondValue, f: F) ->
 where
 	F: FnOnce(&mut Mixture, &mut Mixture) -> Result<T>,
 {
-	GasArena::with_gas_mixtures_mut(
-		gas_slot_for_mix(src_mix)?,
-		gas_slot_for_mix(arg_mix)?,
-		f,
-	)
+	GasArena::with_gas_mixtures_mut(gas_slot_for_mix(src_mix)?, gas_slot_for_mix(arg_mix)?, f)
 }
 
 /// Allows different lock levels for each gas. Instead of relevant refs to the gases, returns the `RWLock` object.
@@ -332,11 +351,7 @@ pub fn with_mixes_custom<T, F>(src_mix: &ByondValue, arg_mix: &ByondValue, f: F)
 where
 	F: FnMut(&RwLock<Mixture>, &RwLock<Mixture>) -> Result<T>,
 {
-	GasArena::with_gas_mixtures_custom(
-		gas_slot_for_mix(src_mix)?,
-		gas_slot_for_mix(arg_mix)?,
-		f,
-	)
+	GasArena::with_gas_mixtures_custom(gas_slot_for_mix(src_mix)?, gas_slot_for_mix(arg_mix)?, f)
 }
 
 /// Gets the amount of gases that are active in byond.
@@ -353,9 +368,43 @@ pub fn tot_gases() -> usize {
 	GAS_MIXTURES.read().as_ref().unwrap().len()
 }
 
+pub(crate) fn gas_runtime_metrics() -> GasRuntimeMetrics {
+	let gas_mixtures = GAS_MIXTURES.read();
+	let Some(gas_mixtures) = gas_mixtures.as_ref() else {
+		return GasRuntimeMetrics {
+			mixture_bytes: std::mem::size_of::<Mixture>(),
+			mixture_lock_bytes: std::mem::size_of::<RwLock<Mixture>>(),
+			..Default::default()
+		};
+	};
+	let mut metrics = GasRuntimeMetrics {
+		arena_len: gas_mixtures.len(),
+		arena_capacity: gas_mixtures.capacity(),
+		active_slots: ACTIVE_MIXTURE_SLOTS.load(Ordering::Relaxed),
+		slot_high_water: MIXTURE_SLOT_HIGH_WATER.load(Ordering::Relaxed),
+		mixture_bytes: std::mem::size_of::<Mixture>(),
+		mixture_lock_bytes: std::mem::size_of::<RwLock<Mixture>>(),
+		..Default::default()
+	};
+	for mixture in gas_mixtures {
+		let mixture = mixture.read();
+		match mixture.mole_len() {
+			0 => metrics.mole_length_zero += 1,
+			1..=4 => metrics.mole_length_one_to_four += 1,
+			5..=8 => metrics.mole_length_five_to_eight += 1,
+			9 => metrics.mole_length_nine += 1,
+			_ => (),
+		}
+		metrics.mole_spills += usize::from(mixture.moles_spilled());
+	}
+	metrics
+}
+
 #[cfg(test)]
 mod tests {
-	use super::{ensure_distinct_mixture_slots, gas_slot_from_number};
+	use super::{
+		ensure_distinct_mixture_slots, gas_runtime_metrics, gas_slot_from_number, initialize_gases,
+	};
 
 	#[test]
 	fn rejects_invalid_or_stale_gas_arena_slots() {
@@ -370,5 +419,15 @@ mod tests {
 	fn rejects_aliased_mutation_slots() {
 		assert!(ensure_distinct_mixture_slots(4, 4).is_err());
 		assert!(ensure_distinct_mixture_slots(4, 5).is_ok());
+	}
+
+	#[test]
+	fn gas_runtime_metrics_report_source_layout_and_reserved_capacity() {
+		initialize_gases();
+		let metrics = gas_runtime_metrics();
+		assert_eq!(metrics.mixture_bytes, 60);
+		assert_eq!(metrics.mixture_lock_bytes, 64);
+		assert_eq!(metrics.arena_capacity, 240_000);
+		assert_eq!(metrics.active_slots, 0);
 	}
 }

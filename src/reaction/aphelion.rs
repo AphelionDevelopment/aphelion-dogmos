@@ -72,12 +72,19 @@ fn plasma_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> 
 		let plasma_moles = air.get_moles(plasma);
 		let ratio = oxygen_moles / plasma_moles;
 		let (plasma_burn_rate, super_saturation) = if ratio >= SUPER_SATURATION_THRESHOLD {
-			(plasma_moles / PLASMA_BURN_RATE_DELTA * temperature_scale, true)
+			(
+				plasma_moles / PLASMA_BURN_RATE_DELTA * temperature_scale,
+				true,
+			)
 		} else if ratio >= PLASMA_OXYGEN_FULLBURN {
-			(plasma_moles / PLASMA_BURN_RATE_DELTA * temperature_scale, false)
+			(
+				plasma_moles / PLASMA_BURN_RATE_DELTA * temperature_scale,
+				false,
+			)
 		} else {
 			(
-				(oxygen_moles / PLASMA_OXYGEN_FULLBURN) / PLASMA_BURN_RATE_DELTA * temperature_scale,
+				(oxygen_moles / PLASMA_OXYGEN_FULLBURN) / PLASMA_BURN_RATE_DELTA
+					* temperature_scale,
 				false,
 			)
 		};
@@ -103,16 +110,16 @@ fn plasma_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> 
 	};
 
 	let (fire_amount, new_temperature) = with_mix_mut(&byond_air, |air| {
-		air.set_moles(plasma, quantize(pre.plasma_moles - pre.plasma_burn_rate));
+		air.set_moles(plasma, quantize(pre.plasma_moles - pre.plasma_burn_rate))?;
 		air.set_moles(
 			o2,
 			quantize(pre.oxygen_moles - pre.plasma_burn_rate * pre.oxygen_burn_ratio),
-		);
+		)?;
 		if pre.super_saturation {
-			air.adjust_moles(tritium, pre.plasma_burn_rate);
+			air.adjust_moles(tritium, pre.plasma_burn_rate)?;
 		} else {
-			air.adjust_moles(co2, pre.plasma_burn_rate * 0.75);
-			air.adjust_moles(water_vapor, pre.plasma_burn_rate * 0.25);
+			air.adjust_moles(co2, pre.plasma_burn_rate * 0.75)?;
+			air.adjust_moles(water_vapor, pre.plasma_burn_rate * 0.25)?;
 		}
 		let fire_amount = pre.plasma_burn_rate * (1.0 + pre.oxygen_burn_ratio);
 		let energy_released = FIRE_PLASMA_ENERGY_RELEASED * pre.plasma_burn_rate;
@@ -130,7 +137,12 @@ fn plasma_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> 
 
 	byondapi::global_call::call_global_id(
 		byond_string!("dogmos_aphelion_plasmafire_finish"),
-		&[byond_air, holder, fire_amount.into(), new_temperature.into()],
+		&[
+			byond_air,
+			holder,
+			fire_amount.into(),
+			new_temperature.into(),
+		],
 	)?;
 	Ok(true.into())
 }
@@ -162,9 +174,9 @@ fn hydrogen_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue
 			return Ok((0.0, temperature));
 		}
 
-		air.adjust_moles(hydrogen, -burned_fuel);
-		air.adjust_moles(o2, -(burned_fuel * 0.5));
-		air.adjust_moles(water_vapor, burned_fuel);
+		air.adjust_moles(hydrogen, -burned_fuel)?;
+		air.adjust_moles(o2, -(burned_fuel * 0.5))?;
+		air.adjust_moles(water_vapor, burned_fuel)?;
 
 		let energy_released = FIRE_HYDROGEN_ENERGY_RELEASED * burned_fuel;
 		let mut new_temperature = temperature;
@@ -219,9 +231,9 @@ fn tritium_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue>
 			return Ok((0.0, 0.0, volume, temperature));
 		}
 
-		air.adjust_moles(tritium, -burned_fuel);
-		air.adjust_moles(o2, -(burned_fuel * 0.5));
-		air.adjust_moles(water_vapor, burned_fuel);
+		air.adjust_moles(tritium, -burned_fuel)?;
+		air.adjust_moles(o2, -(burned_fuel * 0.5))?;
+		air.adjust_moles(water_vapor, burned_fuel)?;
 
 		let energy_released = FIRE_TRITIUM_ENERGY_RELEASED * burned_fuel;
 		let mut new_temperature = temperature;
@@ -322,18 +334,19 @@ fn freon_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> {
 	};
 
 	let (fire_amount, new_temperature) = with_mix_mut(&byond_air, |air| {
-		air.set_moles(freon, quantize(pre.freon_moles - pre.freon_burn_rate));
+		air.set_moles(freon, quantize(pre.freon_moles - pre.freon_burn_rate))?;
 		air.set_moles(
 			o2,
 			quantize(pre.oxygen_moles - pre.freon_burn_rate * pre.oxygen_burn_ratio),
-		);
-		air.adjust_moles(co2, pre.freon_burn_rate);
+		)?;
+		air.adjust_moles(co2, pre.freon_burn_rate)?;
 
 		let fire_amount = pre.freon_burn_rate * (1.0 + pre.oxygen_burn_ratio);
 		let energy_consumed = FIRE_FREON_ENERGY_CONSUMED * pre.freon_burn_rate;
 		let new_heat_capacity = air.heat_capacity();
 		let new_temperature = if new_heat_capacity > MINIMUM_HEAT_CAPACITY {
-			let t = ((pre.temperature * pre.old_heat_capacity - energy_consumed) / new_heat_capacity)
+			let t = ((pre.temperature * pre.old_heat_capacity - energy_consumed)
+				/ new_heat_capacity)
 				.max(TCMB);
 			air.set_temperature(t);
 			t

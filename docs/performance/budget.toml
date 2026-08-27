@@ -1,0 +1,16 @@
+schema_version = 1
+minimum_repetitions = 3
+dreamdaemon_reduction_target_percent = 70
+shim_address_space_limit_bytes = 33554432
+p95_minimum_allowance_percent = 5
+p99_minimum_allowance_percent = 10
+noise_multiplier = 2
+
+[control_noise]
+status = "pending_measurement"
+p95_percent = 0
+p99_percent = 0
+
+[numerics]
+relative_energy_error = 0.0001
+relative_mole_error = 0.00001

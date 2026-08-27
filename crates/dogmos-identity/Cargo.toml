@@ -1,0 +1,7 @@
+[package]
+name = "dogmos-identity"
+version = "2.3.0"
+edition = "2021"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

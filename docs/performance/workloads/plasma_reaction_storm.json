@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "plasma_reaction_storm",
+  "seed": 54105,
+  "duration_seconds": 180,
+  "map": "MetaStation.dmm",
+  "driver": { "kind": "meridian_mcp_live", "profile": "plasma_reaction_storm" },
+  "expected_markers": ["DOGMOS_PERF_REACTION_STARTED", "DOGMOS_PERF_REACTION_COMPLETE"],
+  "correctness_assertions": ["all gas values remain finite and non-negative", "critical reaction callbacks are not dropped"]
+}

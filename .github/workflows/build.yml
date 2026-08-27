@@ -1,21 +1,32 @@
-name: Linux build
-on:
-    push:
-        branches: [master]
-jobs:
-    linux-build:
-        runs-on: ubuntu-20.04
-        steps:
-            - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: stable
-                  target: i686-unknown-linux-gnu
-                  override: true
+name: Build Dogmos for Linux
 
-            - name: Install g++-multilib
-              run: |
-                  sudo apt update
-                  sudo apt install g++-multilib -y
-            - name: Build auxmos
-              run: cargo build --target=i686-unknown-linux-gnu --release --features citadel_reactions
+on:
+  push:
+    branches: [dogmos, master]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: i686-unknown-linux-gnu
+
+      - name: Install 32-bit linker support
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes g++-multilib
+
+      - name: Check supported feature matrix
+        shell: pwsh
+        run: tools/check_feature_matrix.ps1 -Target i686-unknown-linux-gnu
+
+      - name: Build Dogmos
+        run: cargo build --workspace --locked --target i686-unknown-linux-gnu --release

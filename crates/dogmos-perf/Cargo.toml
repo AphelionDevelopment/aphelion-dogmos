@@ -1,0 +1,16 @@
+[package]
+name = "dogmos-perf"
+version = "2.3.0"
+edition = "2021"
+
+[dependencies]
+dogmos-core = { path = "../dogmos-core" }
+dogmos-protocol = { path = "../dogmos-protocol" }
+
+[target.'cfg(all(windows, target_arch = "x86"))'.dev-dependencies]
+dogmos-byond = { path = "../dogmos-byond" }
+dogmos-identity = { path = "../dogmos-identity" }
+
+[[bench]]
+name = "ipc_round_trip"
+harness = false

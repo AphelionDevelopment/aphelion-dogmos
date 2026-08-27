@@ -26,7 +26,7 @@ pub fn harmonic_heat_capacity(cap_a: f32, cap_b: f32) -> f32 {
 		return 0.0;
 	}
 	if cap_a.is_infinite() {
-		return cap_b.is_finite().then_some(cap_b).unwrap_or(0.0);
+		return if cap_b.is_finite() { cap_b } else { 0.0 };
 	}
 	if cap_b.is_infinite() {
 		return cap_a;
@@ -36,7 +36,7 @@ pub fn harmonic_heat_capacity(cap_a: f32, cap_b: f32) -> f32 {
 	} else {
 		(cap_b, cap_a)
 	};
-	smaller / (1.0 + larger / smaller)
+	smaller / (1.0 + smaller / larger)
 }
 
 /// liters in a cell
@@ -58,8 +58,7 @@ pub const BREATH_VOLUME: f32 = 0.5;
 /// Amount of air to take a from a tile
 pub const BREATH_PERCENTAGE: f32 = BREATH_VOLUME / CELL_VOLUME;
 
-/// EXCITED GROUPS
-
+// EXCITED GROUPS
 /// number of FULL air controller ticks before an excited group breaks down (averages gas contents across turfs)
 pub const EXCITED_GROUP_BREAKDOWN_CYCLES: i32 = 4;
 /// number of FULL air controller ticks before an excited group dismantles and removes its turfs from active
@@ -89,12 +88,9 @@ pub const GAS_DIFFUSION_CONSTANT: f32 = 0.125;
 /// This number minus the number of adjacent turfs is how much the original gas needs to be multiplied by to represent loss by diffusion
 pub const GAS_LOSS_CONSTANT: f32 = 1.0 / GAS_DIFFUSION_CONSTANT;
 
-/// HEAT TRANSFER COEFFICIENTS
-
+// HEAT TRANSFER COEFFICIENTS
 /// Must be between 0 and 1. Values closer to 1 equalize temperature faster
-
 /// Should not exceed 0.4 else the algorithm will diverge
-
 pub const WALL_HEAT_TRANSFER_COEFFICIENT: f32 = 0.0;
 pub const OPEN_HEAT_TRANSFER_COEFFICIENT: f32 = 0.4;
 /// a hack for now
@@ -111,8 +107,7 @@ const SPACE_TEMP: f64 = TCMB as f64;
 pub const RADIATION_FROM_SPACE: f64 =
 	STEFAN_BOLTZMANN_CONSTANT * SPACE_TEMP * SPACE_TEMP * SPACE_TEMP * SPACE_TEMP; // watts/meter^2
 
-/// FIRE
-
+// FIRE
 pub const FIRE_MINIMUM_TEMPERATURE_TO_SPREAD: f32 = 150.0 + T0C;
 pub const FIRE_MINIMUM_TEMPERATURE_TO_EXIST: f32 = 100.0 + T0C;
 pub const FIRE_SPREAD_RADIOSITY_SCALE: f32 = 0.85;
@@ -123,8 +118,7 @@ pub const PLASMA_UPPER_TEMPERATURE: f32 = 1370.0 + T0C;
 pub const PLASMA_OXYGEN_FULLBURN: f32 = 10.0;
 pub const FIRE_MAXIMUM_BURN_RATE: f32 = 0.2;
 
-/// GASES
-
+// GASES
 pub const MIN_TOXIC_GAS_DAMAGE: i32 = 1;
 pub const MAX_TOXIC_GAS_DAMAGE: i32 = 10;
 /// Moles in a standard cell after which gases are visible
@@ -135,8 +129,19 @@ pub const FACTOR_GAS_VISIBLE_MAX: f32 = 20.0;
 /// Mole step for alpha updates. This means alpha can update at 0.25, 0.5, 0.75 and so on
 pub const MOLES_GAS_VISIBLE_STEP: f32 = 0.25;
 
-/// REACTIONS
+#[cfg(test)]
+mod tests {
+	use super::harmonic_heat_capacity;
 
+	#[test]
+	fn harmonic_capacity_matches_product_over_sum() {
+		let capacity = harmonic_heat_capacity(100.0, 300.0);
+		assert!((capacity - 75.0).abs() < 1.0e-5);
+		assert_eq!(harmonic_heat_capacity(1.0e20, 1.0e20), 5.0e19);
+	}
+}
+
+// REACTIONS
 // Maximum amount of ReactionIdentifiers in the TinyVec that all_reactions returns.
 // We can't guarantee the max number of reactions that will ever be registered,
 // so this is here to prevent that from getting out of control.

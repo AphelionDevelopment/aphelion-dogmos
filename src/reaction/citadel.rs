@@ -66,12 +66,12 @@ fn plasma_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> 
 	let fire_amount = plasma_burn_rate * (1.0 + oxygen_burn_rate);
 	if fire_amount > 0.0 {
 		let temperature = with_mix_mut(&byond_air, |air| {
-			air.set_moles(plasma, initial_plasma - plasma_burn_rate);
-			air.set_moles(o2, initial_oxy - (plasma_burn_rate * oxygen_burn_rate));
+			air.set_moles(plasma, initial_plasma - plasma_burn_rate)?;
+			air.set_moles(o2, initial_oxy - (plasma_burn_rate * oxygen_burn_rate))?;
 			if initial_oxy / initial_plasma > SUPER_SATURATION_THRESHOLD {
-				air.adjust_moles(tritium, plasma_burn_rate);
+				air.adjust_moles(tritium, plasma_burn_rate)?;
 			} else {
-				air.adjust_moles(co2, plasma_burn_rate);
+				air.adjust_moles(co2, plasma_burn_rate)?;
 			}
 			let new_temp = (initial_energy + plasma_burn_rate * FIRE_PLASMA_ENERGY_RELEASED)
 				/ air.heat_capacity();
@@ -108,7 +108,7 @@ fn tritium_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue>
 		let burned_fuel = {
 			if initial_oxy < initial_trit {
 				let r = initial_oxy / TRITIUM_BURN_OXY_FACTOR;
-				air.set_moles(tritium, initial_trit - r);
+				air.set_moles(tritium, initial_trit - r)?;
 				r
 			} else {
 				// yes, we set burned_fuel to trit times ten. times ten!! and then the actual amount burned is 1% of that.
@@ -117,12 +117,12 @@ fn tritium_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue>
 				air.set_moles(
 					tritium,
 					initial_trit - initial_trit / TRITIUM_BURN_TRIT_FACTOR,
-				);
-				air.set_moles(o2, initial_oxy - initial_trit);
+				)?;
+				air.set_moles(o2, initial_oxy - initial_trit)?;
 				r
 			}
 		};
-		air.adjust_moles(water, burned_fuel / TRITIUM_BURN_OXY_FACTOR);
+		air.adjust_moles(water, burned_fuel / TRITIUM_BURN_OXY_FACTOR)?;
 		let energy_released = FIRE_HYDROGEN_ENERGY_RELEASED * burned_fuel;
 		let new_temp = (initial_energy + energy_released) / air.heat_capacity();
 		let mut cached_results = byond_air.read_var_id(byond_string!("reaction_results"))?;
@@ -250,19 +250,19 @@ fn fusion(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> {
 		scale_factor * (FUSION_TRITIUM_CONVERSION_COEFFICIENT * FUSION_TRITIUM_MOLES_USED);
 
 	let standard_energy = with_mix_mut(&byond_air, |air| {
-		air.set_moles(plas, plasma);
-		air.set_moles(co2, carbon);
+		air.set_moles(plas, plasma)?;
+		air.set_moles(co2, carbon)?;
 
 		//The reason why you should set up a tritium production line.
-		air.adjust_moles(trit, -FUSION_TRITIUM_MOLES_USED);
+		air.adjust_moles(trit, -FUSION_TRITIUM_MOLES_USED)?;
 
 		//Adds waste products
 		if delta_plasma > 0.0 {
-			air.adjust_moles(h2o, standard_waste_gas_output);
+			air.adjust_moles(h2o, standard_waste_gas_output)?;
 		} else {
-			air.adjust_moles(bz, standard_waste_gas_output);
+			air.adjust_moles(bz, standard_waste_gas_output)?;
 		}
-		air.adjust_moles(o2, standard_waste_gas_output); //Oxygen is a bit touchy subject
+		air.adjust_moles(o2, standard_waste_gas_output)?; //Oxygen is a bit touchy subject
 
 		let new_heat_cap = air.heat_capacity();
 		let standard_energy = 400_f32 * air.get_moles(plas) * air.get_temperature(); //Prevents putting meaningless waste gases to achieve high rads.
@@ -293,10 +293,8 @@ fn fusion(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> {
 fn generic_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue> {
 	use hashbrown::HashMap;
 	use rustc_hash::FxBuildHasher;
-	let mut burn_results: HashMap<GasIDX, f32, FxBuildHasher> = HashMap::with_capacity_and_hasher(
-		super::total_num_gases() as usize,
-		FxBuildHasher::default(),
-	);
+	let mut burn_results: HashMap<GasIDX, f32, FxBuildHasher> =
+		HashMap::with_capacity_and_hasher(super::total_num_gases() as usize, FxBuildHasher);
 	let mut radiation_released = 0.0;
 	with_gas_info(|gas_info| {
 		if let Some(fire_amount) = with_mix(&byond_air, |air| {
@@ -373,7 +371,7 @@ fn generic_fire(byond_air: ByondValue, holder: ByondValue) -> Result<ByondValue>
 					* (air.heat_capacity() + R_IDEAL_GAS_EQUATION * air.total_moles());
 				let mut delta_enthalpy = 0.0;
 				for (&i, &amt) in &burn_results {
-					air.adjust_moles(i, amt);
+					air.adjust_moles(i, amt)?;
 					delta_enthalpy -= amt * gas_info[i].enthalpy;
 				}
 				air.set_temperature(

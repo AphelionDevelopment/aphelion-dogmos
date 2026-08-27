@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "turf_heat_dense",
+  "seed": 54107,
+  "duration_seconds": 180,
+  "map": "MetaStation.dmm",
+  "driver": { "kind": "meridian_mcp_live", "profile": "turf_heat_dense" },
+  "expected_markers": ["DOGMOS_PERF_HEAT_DENSE_STARTED", "DOGMOS_PERF_HEAT_DENSE_COMPLETE"],
+  "correctness_assertions": ["finite-capacity heat energy remains within tolerance", "heat worker queue remains bounded"]
+}
