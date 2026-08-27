@@ -14,8 +14,30 @@ pub const T0C: f32 = 273.15;
 pub const T20C: f32 = 293.15;
 /// Amount of gas below which any amounts will be truncated to 0.
 pub const GAS_MIN_MOLES: f32 = 0.0001;
+/// Molar precision used when transferring gas through the DM API.
+pub const MOLAR_ACCURACY: f32 = 0.0001;
 /// Heat capacities below which heat will be considered 0.
 pub const MINIMUM_HEAT_CAPACITY: f32 = 0.0003;
+
+/// Returns `(cap_a * cap_b) / (cap_a + cap_b)` without overflowing finite `f32` inputs.
+#[inline]
+pub fn harmonic_heat_capacity(cap_a: f32, cap_b: f32) -> f32 {
+	if !(cap_a > 0.0 && cap_b > 0.0) {
+		return 0.0;
+	}
+	if cap_a.is_infinite() {
+		return cap_b.is_finite().then_some(cap_b).unwrap_or(0.0);
+	}
+	if cap_b.is_infinite() {
+		return cap_a;
+	}
+	let (smaller, larger) = if cap_a < cap_b {
+		(cap_a, cap_b)
+	} else {
+		(cap_b, cap_a)
+	};
+	smaller / (1.0 + larger / smaller)
+}
 
 /// liters in a cell
 pub const CELL_VOLUME: f32 = 2500.0;
@@ -57,8 +79,9 @@ pub const MINIMUM_TEMPERATURE_TO_MOVE: f32 = T20C + 100.0;
 pub const MINIMUM_TEMPERATURE_DELTA_TO_SUSPEND: f32 = 4.0;
 /// Minimum temperature difference before the gas temperatures are just set to be equal
 pub const MINIMUM_TEMPERATURE_DELTA_TO_CONSIDER: f32 = 0.5;
-pub const MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION: f32 = T20C + 10.0;
-pub const MINIMUM_TEMPERATURE_START_SUPERCONDUCTION: f32 = T20C + 200.0;
+// Match the DM superconductivity thresholds.
+pub const MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION: f32 = T20C + 80.0; // matches MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION
+pub const MINIMUM_TEMPERATURE_START_SUPERCONDUCTION: f32 = T20C + 400.0; // matches MINIMUM_TEMPERATURE_START_SUPERCONDUCTION
 
 /// The amount of gas that is diffused between tiles every tick. Must be less than 1/6.
 pub const GAS_DIFFUSION_CONSTANT: f32 = 0.125;
@@ -135,7 +158,7 @@ pub const GAS_N2: &str = "n2";
 pub const GAS_CO2: &str = "co2";
 pub const GAS_PLASMA: &str = "plasma";
 pub const GAS_H2O: &str = "water_vapor";
-pub const GAS_HYPERNOB: &str = "nob";
+pub const GAS_HYPER_NOBLIUM: &str = "hypernoblium";
 pub const GAS_NITROUS: &str = "n2o";
 pub const GAS_NITRYL: &str = "no2";
 pub const GAS_TRITIUM: &str = "tritium";
@@ -145,3 +168,7 @@ pub const GAS_PLUOXIUM: &str = "pluox";
 pub const GAS_MIASMA: &str = "miasma";
 pub const GAS_METHANE: &str = "methane";
 pub const GAS_METHYL_BROMIDE: &str = "methyl_bromide";
+
+// Mirror code/__DEFINES/reactions.dm; native reaction calls cannot enter the DM wrapper.
+pub const REACTION_OPPRESSION_THRESHOLD: f32 = 5.0;
+pub const REACTION_OPPRESSION_MIN_TEMP: f32 = 20.0;

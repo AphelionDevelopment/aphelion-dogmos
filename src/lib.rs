@@ -10,14 +10,77 @@ use gas::constants::{ReactionReturn, GAS_MIN_MOLES, MINIMUM_MOLES_DELTA_TO_MOVE}
 use gas::{
 	amt_gases, constants, gas_idx_from_string, gas_idx_from_value, gas_idx_to_id, tot_gases, types,
 	with_gas_info, with_mix, with_mix_mut, with_mixes, with_mixes_custom, with_mixes_mut, GasArena,
-	Mixture,
+	GasIDX, Mixture,
 };
-use reaction::react_by_id;
+use reaction::{react_by_id, reaction_name_by_id};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 static _SIMD_DETECTED: ::std::sync::OnceLock<bool> = ::std::sync::OnceLock::new();
+static DOGMOS_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static HYPERNOBLIUM_INDEX: OnceLock<Result<GasIDX, String>> = OnceLock::new();
+
+fn hypernoblium_index() -> Result<GasIDX> {
+	HYPERNOBLIUM_INDEX
+		.get_or_init(|| {
+			gas_idx_from_string(constants::GAS_HYPER_NOBLIUM).map_err(|error| error.to_string())
+		})
+		.as_ref()
+		.copied()
+		.map_err(|error| eyre::eyre!(error))
+}
+
+fn reactions_are_suppressed(hypernoblium_moles: f32, temperature: f32) -> bool {
+	hypernoblium_moles >= constants::REACTION_OPPRESSION_THRESHOLD
+		&& temperature > constants::REACTION_OPPRESSION_MIN_TEMP
+}
+
+fn try_begin_shutdown(shutdown: &AtomicBool) -> bool {
+	shutdown
+		.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+		.is_ok()
+}
+
+fn reset_shutdown_state(shutdown: &AtomicBool) {
+	shutdown.store(false, Ordering::Release);
+}
+
+/// Writes panic details from Rust worker threads to `dogmos_panic.log`.
+#[byondapi::init]
+pub fn install_diagnostic_panic_hook() {
+	std::panic::set_hook(Box::new(|info| {
+		let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+			(*s).to_string()
+		} else if let Some(s) = info.payload().downcast_ref::<String>() {
+			s.clone()
+		} else {
+			"<non-string panic payload>".to_string()
+		};
+		let location = info
+			.location()
+			.map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+			.unwrap_or_else(|| "<unknown location>".to_string());
+		let thread = std::thread::current();
+		let report = format!(
+			"[dogmos panic hook] thread {:?} panicked at {}: {}\n",
+			thread.name().unwrap_or("<unnamed>"),
+			location,
+			msg
+		);
+		use std::io::Write;
+		if let Ok(mut f) = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open("dogmos_panic.log")
+		{
+			let _ = f.write_all(report.as_bytes());
+			let _ = f.flush();
+		}
+	}));
+}
 
 #[cfg(feature = "tracy")]
 #[byondapi::init]
@@ -36,6 +99,35 @@ fn atmos_callback_handle(remaining: ByondValue) -> Result<ByondValue> {
 	auxcallback::callback_processing_hook(remaining)
 }
 
+/// Returns the number of callbacks rejected because the main-thread callback queue was already
+/// closed. A live server should keep this at zero; a non-zero value identifies teardown ordering
+/// that attempted to enqueue work after callback processing had stopped.
+#[byondapi::bind("/proc/dogmos_callback_enqueue_failures")]
+fn dogmos_callback_enqueue_failures() -> Result<ByondValue> {
+	Ok((auxcallback::callback_enqueue_failures() as f32).into())
+}
+
+/// Stops Dogmos' asynchronous worker, drains callbacks that can no longer run during world
+/// teardown, and releases the Rust-side gas, turf, and heat arenas. This is idempotent because BYOND
+/// can reach more than one shutdown path during a hard restart.
+#[byondapi::bind("/proc/dogmos_shutdown")]
+fn dogmos_shutdown_hook() -> Result<ByondValue> {
+	if !try_begin_shutdown(&DOGMOS_SHUTDOWN) {
+		return Ok(ByondValue::null());
+	}
+
+	#[cfg(feature = "turf_processing")]
+	{
+		#[cfg(feature = "superconductivity")]
+		crate::turfs::shutdown_turf_heat();
+		crate::turfs::shutdown_turfs();
+	}
+	auxcallback::clean_callbacks();
+	crate::gas::shut_down_gases();
+	crate::gas::types::destroy_gas_info_structs();
+	Ok(ByondValue::null())
+}
+
 /// Fills in the first unused slot in the gas mixtures vector, or adds another one, then sets the argument ByondValue to point to it.
 #[byondapi::bind("/datum/gas_mixture/proc/__gasmixture_register")]
 fn register_gasmixture_hook(src: ByondValue) -> Result<ByondValue> {
@@ -46,7 +138,7 @@ fn register_gasmixture_hook(src: ByondValue) -> Result<ByondValue> {
 /// This version is only if auxcleanup is not being used; it should be called from /datum/gas_mixture/Del.
 #[byondapi::bind("/datum/gas_mixture/proc/__gasmixture_unregister")]
 fn unregister_gasmixture_hook(src: ByondValue) -> Result<ByondValue> {
-	gas::GasArena::unregister_mix(&src);
+	gas::GasArena::unregister_mix(&src)?;
 	Ok(ByondValue::null())
 }
 
@@ -97,7 +189,9 @@ fn thermal_energy_hook(src: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (mixture). Merges the gas from the giver into src, without modifying the giver mix.
-#[byondapi::bind("/datum/gas_mixture/proc/merge")]
+/// Underscored because DM keeps a `merge()` wrapper of its own: it sends COMSIG_GASMIX_MERGED,
+/// which gas tanks and the atmos reaction recorder listen for, and returns a success boolean.
+#[byondapi::bind("/datum/gas_mixture/proc/__merge")]
 fn merge_hook(src: ByondValue, giver: ByondValue) -> Result<ByondValue> {
 	with_mixes_custom(&src, &giver, |src_mix, giver_mix| {
 		src_mix.write().merge(&giver_mix.read());
@@ -162,7 +256,9 @@ fn temperature_share_hook() -> Result<ByondValue> {
 }
 
 /// Returns: a list of the gases in the mixture, associated with their IDs.
-#[byondapi::bind("/datum/gas_mixture/proc/get_gases")]
+/// Raw FFI bind - returns Dogmos' native string ids. Use get_gases() in gas_mixture.dm, which
+/// translates back to the typepaths every DM call site expects.
+#[byondapi::bind("/datum/gas_mixture/proc/__get_gases")]
 fn get_gases_hook(src: ByondValue) -> Result<ByondValue> {
 	with_mix(&src, |mix| {
 		let mut gases_list = ByondValue::new_list()?;
@@ -194,7 +290,8 @@ fn set_temperature_hook(src: ByondValue, arg_temp: ByondValue) -> Result<ByondVa
 }
 
 /// Args: (gas_id). Returns the heat capacity from the given gas, in J/K (probably).
-#[byondapi::bind("/datum/gas_mixture/proc/partial_heat_capacity")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use partial_heat_capacity() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__partial_heat_capacity")]
 fn partial_heat_capacity(src: ByondValue, gas_id: ByondValue) -> Result<ByondValue> {
 	with_mix(&src, |mix| {
 		Ok(mix
@@ -207,6 +304,11 @@ fn partial_heat_capacity(src: ByondValue, gas_id: ByondValue) -> Result<ByondVal
 #[byondapi::bind("/datum/gas_mixture/proc/set_volume")]
 fn set_volume_hook(src: ByondValue, vol_arg: ByondValue) -> Result<ByondValue> {
 	let volume = vol_arg.get_number()?;
+	if !volume.is_finite() || volume < 0.0 {
+		return Err(eyre::eyre!(
+			"Gas mixture volume must be finite and non-negative, got {volume}"
+		));
+	}
 	with_mix_mut(&src, |mix| {
 		mix.volume = volume;
 		Ok(ByondValue::null())
@@ -214,7 +316,8 @@ fn set_volume_hook(src: ByondValue, vol_arg: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (gas_id). Returns: the amount of substance of the given gas, in moles.
-#[byondapi::bind("/datum/gas_mixture/proc/get_moles")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use get_moles() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__get_moles")]
 fn get_moles_hook(src: ByondValue, gas_id: ByondValue) -> Result<ByondValue> {
 	with_mix(&src, |mix| {
 		Ok(mix.get_moles(gas_idx_from_value(&gas_id)?).into())
@@ -222,7 +325,8 @@ fn get_moles_hook(src: ByondValue, gas_id: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (gas_id, moles). Sets the amount of substance of the given gas, in moles.
-#[byondapi::bind("/datum/gas_mixture/proc/set_moles")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use set_moles() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__set_moles")]
 fn set_moles_hook(src: ByondValue, gas_id: ByondValue, amt_val: ByondValue) -> Result<ByondValue> {
 	let vf = amt_val.get_number()?;
 	if !vf.is_finite() {
@@ -237,7 +341,8 @@ fn set_moles_hook(src: ByondValue, gas_id: ByondValue, amt_val: ByondValue) -> R
 	})
 }
 /// Args: (gas_id, moles). Adjusts the given gas's amount by the given amount, e.g. (GAS_O2, -0.1) will remove 0.1 moles of oxygen from the mixture.
-#[byondapi::bind("/datum/gas_mixture/proc/adjust_moles")]
+/// Raw FFI bind - id_val must already be Dogmos' string form. Use adjust_moles() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__adjust_moles")]
 fn adjust_moles_hook(
 	src: ByondValue,
 	id_val: ByondValue,
@@ -251,7 +356,8 @@ fn adjust_moles_hook(
 }
 
 /// Args: (gas_id, moles, temp). Adjusts the given gas's amount by the given amount, with that gas being treated as if it is at the given temperature.
-#[byondapi::bind("/datum/gas_mixture/proc/adjust_moles_temp")]
+/// Raw FFI bind - gas_id must already be Dogmos' string form. Use adjust_moles_temp() in gas_mixture.dm.
+#[byondapi::bind("/datum/gas_mixture/proc/__adjust_moles_temp")]
 fn adjust_moles_temp_hook(
 	src: ByondValue,
 	id_val: ByondValue,
@@ -278,7 +384,8 @@ fn adjust_moles_temp_hook(
 }
 
 /// Args: (gas_id_1, amount_1, gas_id_2, amount_2, ...). As adjust_moles, but with variadic arguments.
-#[byondapi::bind_raw_args("/datum/gas_mixture/proc/adjust_multi")]
+/// Raw FFI bind - gas ids must already be Dogmos' string form. Use adjust_multi() in gas_mixture.dm.
+#[byondapi::bind_raw_args("/datum/gas_mixture/proc/__adjust_multi")]
 fn adjust_multi_hook() -> Result<ByondValue> {
 	if args.len() % 2 == 0 {
 		Err(eyre::eyre!(
@@ -306,10 +413,19 @@ fn adjust_multi_hook() -> Result<ByondValue> {
 	}
 }
 
+fn finite_number_or_default(value: ByondValue, default: f32) -> Result<f32> {
+	let number = value.get_number().unwrap_or(default);
+	if number.is_finite() {
+		Ok(number)
+	} else {
+		Err(eyre::eyre!("Gas mixture scalar must be finite"))
+	}
+}
+
 /// Args: (amount). Adds the given amount to each gas.
 #[byondapi::bind("/datum/gas_mixture/proc/add")]
 fn add_hook(src: ByondValue, num_val: ByondValue) -> Result<ByondValue> {
-	let vf = num_val.get_number().unwrap_or_default();
+	let vf = finite_number_or_default(num_val, 0.0)?;
 	with_mix_mut(&src, |mix| {
 		mix.add(vf);
 		Ok(ByondValue::null())
@@ -319,7 +435,7 @@ fn add_hook(src: ByondValue, num_val: ByondValue) -> Result<ByondValue> {
 /// Args: (amount). Subtracts the given amount from each gas.
 #[byondapi::bind("/datum/gas_mixture/proc/subtract")]
 fn subtract_hook(src: ByondValue, num_val: ByondValue) -> Result<ByondValue> {
-	let vf = num_val.get_number().unwrap_or_default();
+	let vf = finite_number_or_default(num_val, 0.0)?;
 	with_mix_mut(&src, |mix| {
 		mix.add(-vf);
 		Ok(ByondValue::null())
@@ -329,7 +445,7 @@ fn subtract_hook(src: ByondValue, num_val: ByondValue) -> Result<ByondValue> {
 /// Args: (coefficient). Multiplies all gases by this amount.
 #[byondapi::bind("/datum/gas_mixture/proc/multiply")]
 fn multiply_hook(src: ByondValue, num_val: ByondValue) -> Result<ByondValue> {
-	let vf = num_val.get_number().unwrap_or(1.0);
+	let vf = finite_number_or_default(num_val, 1.0)?;
 	with_mix_mut(&src, |mix| {
 		mix.multiply(vf);
 		Ok(ByondValue::null())
@@ -339,7 +455,11 @@ fn multiply_hook(src: ByondValue, num_val: ByondValue) -> Result<ByondValue> {
 /// Args: (coefficient). Divides all gases by this amount.
 #[byondapi::bind("/datum/gas_mixture/proc/divide")]
 fn divide_hook(src: ByondValue, num_val: ByondValue) -> Result<ByondValue> {
-	let vf = num_val.get_number().unwrap_or(1.0).recip();
+	let divisor = finite_number_or_default(num_val, 1.0)?;
+	if divisor == 0.0 {
+		return Err(eyre::eyre!("Gas mixture divisor must be non-zero"));
+	}
+	let vf = divisor.recip();
 	with_mix_mut(&src, |mix| {
 		mix.multiply(vf);
 		Ok(ByondValue::null())
@@ -356,6 +476,9 @@ fn remove_by_flag_hook(
 ) -> Result<ByondValue> {
 	let flag = flag_val.get_number().map_or(0, |n: f32| n as u32);
 	let amount = amount_val.get_number().unwrap_or(0.0);
+	if !amount.is_finite() || amount <= 0.0 {
+		return Ok(false.into());
+	}
 	let pertinent_gases = with_gas_info(|gas_info| {
 		gas_info
 			.iter()
@@ -368,6 +491,9 @@ fn remove_by_flag_hook(
 	}
 	with_mixes_mut(&src, &into, |src_gas, dest_gas| {
 		let tot = src_gas.total_moles();
+		if !tot.is_finite() || tot <= 0.0 {
+			return Ok(false.into());
+		}
 		src_gas.transfer_gases_to(amount / tot, &pertinent_gases, dest_gas);
 		Ok(true.into())
 	})
@@ -403,6 +529,9 @@ fn scrub_into_hook(
 	gas_list: ByondValue,
 ) -> Result<ByondValue> {
 	let ratio = ratio_v.get_number()?;
+	if !ratio.is_finite() {
+		return Err(eyre::eyre!("Scrub ratio must be finite"));
+	}
 	if !gas_list.is_list() {
 		return Err(eyre::eyre!("Non-list gas_list passed to scrub_into!"));
 	}
@@ -428,6 +557,12 @@ fn mark_immutable_hook(src: ByondValue) -> Result<ByondValue> {
 	})
 }
 
+/// Returns whether the mix has been marked immutable.
+#[byondapi::bind("/datum/gas_mixture/proc/is_immutable")]
+fn is_immutable_hook(src: ByondValue) -> Result<ByondValue> {
+	with_mix(&src, |mix| Ok(mix.is_immutable().into()))
+}
+
 /// Clears the gas mixture my removing all of its gases.
 #[byondapi::bind("/datum/gas_mixture/proc/clear")]
 fn clear_hook(src: ByondValue) -> Result<ByondValue> {
@@ -448,15 +583,55 @@ fn compare_hook(src: ByondValue, other: ByondValue) -> Result<ByondValue> {
 }
 
 /// Args: (holder). Runs all reactions on this gas mixture. Holder is used by the reactions, and can be any arbitrary datum or null.
-#[byondapi::bind("/datum/gas_mixture/proc/react")]
+/// Underscored because DM keeps a `react()` wrapper of its own, carrying behaviour Dogmos has no
+/// equivalent for: the hypernoblium oppression gate that stops all reactions before any are
+/// considered, the reaction_results bookkeeping, and COMSIG_GASMIX_REACTED.
+///
+/// Optional profiling reads its toggle on each call and records slow reactions directly on the DM
+/// thread, avoiding callback overhead when profiling is disabled.
+#[byondapi::bind("/datum/gas_mixture/proc/__react")]
 fn react_hook(src: ByondValue, holder: ByondValue) -> Result<ByondValue> {
 	let mut ret = ReactionReturn::NO_REACTION;
-	let reactions = with_mix(&src, |mix| Ok(mix.all_reactable()))?;
+	let hypernoblium_idx = hypernoblium_index()?;
+	let reactions = with_mix(&src, |mix| {
+		if reactions_are_suppressed(mix.get_moles(hypernoblium_idx), mix.get_temperature()) {
+			return Ok(None);
+		}
+		Ok(Some(mix.all_reactable()))
+	})?;
+	let Some(reactions) = reactions else {
+		return Ok((ReactionReturn::STOP_REACTIONS.bits() as f32).into());
+	};
+
+	let ssair = ByondValue::new_global_ref().read_var_id(byond_string!("SSair"))?;
+	let profile_reactions = ssair
+		.read_number_id(byond_string!("kennel_profile_reactions"))
+		.map_or(false, |v| v != 0.0);
+	let cost_threshold_ms = profile_reactions
+		.then(|| {
+			ssair
+				.read_number_id(byond_string!("kennel_high_cost_ms_threshold"))
+				.unwrap_or(4.0)
+		})
+		.unwrap_or(0.0);
+
 	for reaction in reactions {
+		let started = profile_reactions.then(std::time::Instant::now);
+		let result = react_by_id(reaction, src, holder)?;
+		if let Some(started) = started {
+			let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
+			if elapsed_ms >= cost_threshold_ms {
+				let name = reaction_name_by_id(reaction).unwrap_or_else(|| "unknown".to_string());
+				if let Ok(name_val) = ByondValue::try_from(name) {
+					let _ = ssair.call_id(
+						byond_string!("kennel_record_reaction_cost"),
+						&[name_val, holder, elapsed_ms.into()],
+					);
+				}
+			}
+		}
 		ret |= ReactionReturn::from_bits_truncate(
-			react_by_id(reaction, src, holder)?
-				.get_number()
-				.unwrap_or_default() as u32,
+			result.get_number().unwrap_or_default() as u32,
 		);
 		if ret.contains(ReactionReturn::STOP_REACTIONS) {
 			return Ok((ret.bits() as f32).into());
@@ -503,6 +678,9 @@ fn equalize_with_hook(src: ByondValue, total: ByondValue) -> Result<ByondValue> 
 		let src_gas = &mut src_lock.write();
 		let vol = src_gas.volume;
 		let total_gas = total_lock.read();
+		if !total_gas.volume.is_finite() || total_gas.volume <= 0.0 {
+			return Ok(ByondValue::null());
+		}
 		src_gas.copy_from_mutable(&total_gas);
 		src_gas.multiply(vol / total_gas.volume);
 		Ok(ByondValue::null())
@@ -593,13 +771,8 @@ fn equalize_all_hook(gas_list: ByondValue) -> Result<ByondValue> {
 	use std::collections::BTreeSet;
 	let gas_list = gas_list
 		.iter()?
-		.filter_map(|(value, _)| {
-			value
-				.read_number_id(byond_string!("_extools_pointer_gasmixture"))
-				.ok()
-				.map(|f| f as usize)
-		})
-		.collect::<BTreeSet<_>>();
+		.map(|(value, _)| gas::gas_slot_for_mix(&value))
+		.collect::<Result<BTreeSet<_>>>()?;
 	GasArena::with_all_mixtures(move |all_mixtures| {
 		let mut tot = gas::Mixture::new();
 		let mut tot_vol: f64 = 0.0;
@@ -665,6 +838,50 @@ fn parse_gas_string(src: ByondValue, string: ByondValue) -> Result<ByondValue> {
 		Ok(())
 	})?;
 	Ok(true.into())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+	use super::{reset_shutdown_state, try_begin_shutdown};
+	use std::sync::atomic::AtomicBool;
+
+	#[test]
+	fn shutdown_transition_is_idempotent() {
+		let shutdown = AtomicBool::new(false);
+		assert!(try_begin_shutdown(&shutdown));
+		assert!(!try_begin_shutdown(&shutdown));
+	}
+
+	#[test]
+	fn shutdown_transition_can_be_rearmed_for_a_new_world() {
+		let shutdown = AtomicBool::new(true);
+		reset_shutdown_state(&shutdown);
+		assert!(try_begin_shutdown(&shutdown));
+	}
+}
+
+#[cfg(test)]
+mod reaction_tests {
+	use super::reactions_are_suppressed;
+	use crate::gas::constants::{REACTION_OPPRESSION_MIN_TEMP, REACTION_OPPRESSION_THRESHOLD};
+
+	#[test]
+	fn hypernoblium_oppression_matches_dm_boundaries() {
+		assert!(reactions_are_suppressed(
+			REACTION_OPPRESSION_THRESHOLD,
+			REACTION_OPPRESSION_MIN_TEMP + 1.0,
+		));
+
+		assert!(!reactions_are_suppressed(
+			REACTION_OPPRESSION_THRESHOLD - 0.01,
+			REACTION_OPPRESSION_MIN_TEMP + 1.0,
+		));
+
+		assert!(!reactions_are_suppressed(
+			REACTION_OPPRESSION_THRESHOLD,
+			REACTION_OPPRESSION_MIN_TEMP,
+		));
+	}
 }
 
 #[test]

@@ -2,14 +2,18 @@
 members = ["crates/*"]
 
 [workspace.dependencies]
-byondapi = "0.4.11"
+# BYOND changed the byondapi ABI at 516.1682, which crates.io does not carry - the newest published
+# release (0.5.14, Mar 2025) predates the "Migrate to 516.1682" merge (Jun 2026). Reading a DM var by
+# string id against a 515-era ABI access-violates BYOND rather than failing cleanly, so this must
+# track git until a release ships with 516 support.
+byondapi = { git = "https://github.com/spacestation13/byondapi-rs", branch = "main" }
 coarsetime = "0.1.35"
 flume = "0.11.1"
 eyre = "0.6.12"
 tracing = "0.1.41"
 
 [package]
-name = "auxmos"
+name = "dogmos"
 version = "2.3.0"
 authors = ["Putnam <putnam3145@gmail.com>"]
 edition = "2021"
@@ -17,7 +21,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["turf_processing", "katmos"]
+default = ["turf_processing", "katmos", "superconductivity", "katmos_slow_decompression", "aphelion_reactions"]
 zas_hooks = []
 turf_processing = []
 superconductivity = ["turf_processing"]
@@ -27,6 +31,9 @@ katmos_slow_decompression = ["fastmos"]
 reaction_hooks = []
 citadel_reactions = ["reaction_hooks"]
 yogs_reactions = ["reaction_hooks"]
+# Native implementations of this codebase's fire reactions. The alternative reaction sets have
+# different formulas and byproducts, so they cannot replace these without changing behavior.
+aphelion_reactions = ["reaction_hooks"]
 
 # Tracing will expose this application to a local port, use with care
 tracy = ["dep:tracing-tracy", "dep:tracing-subscriber", "dep:tracing"]
@@ -68,4 +75,6 @@ features = ["rustc_1_61", "alloc"]
 lto = 'fat'
 debug = true
 codegen-units = 1
-panic = 'abort'
+# Rayon worker threads need unwinding so a panic can be reported without terminating DreamDaemon
+# before the diagnostic hook records it.
+panic = 'unwind'

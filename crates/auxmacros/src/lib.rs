@@ -28,7 +28,7 @@ fn strip_mut_and_filter(arg: &syn::FnArg) -> Option<syn::FnArg> {
 /// allowing these functions to run in cpus without the required instructions.
 /// The specific simd feature used here is avx2.
 /// Example usage:
-/// ```
+/// ```ignore
 ///#[auxmacros::generate_simd_functions]
 ///#[byondapi::bind("/proc/process_atmos_callbacks")]
 ///fn atmos_callback_handle(remaining: ByondValue) -> Result<ByondValue> {
