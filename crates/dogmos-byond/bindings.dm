@@ -78,5 +78,8 @@
 /proc/dogmos_turf_heat_batch(entries)
 	return call_ext(DOGMOS, "byond:dogmos_turf_heat_batch_ffi")(entries)
 
+/proc/dogmos_turf_heat_snapshot(fields)
+	return call_ext(DOGMOS, "byond:dogmos_turf_heat_snapshot_ffi")(fields)
+
 /proc/dogmos_turf_lifecycle_batch(entries)
 	return call_ext(DOGMOS, "byond:dogmos_turf_lifecycle_batch_ffi")(entries)

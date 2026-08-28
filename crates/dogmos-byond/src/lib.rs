@@ -14,11 +14,12 @@ use dogmos_protocol::{
 	encode_mixture_state_batch, encode_reaction_metadata_batch, encode_turf_adjacency_batch,
 	encode_turf_heat_adjacency_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
 	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, ContinuationCommandRequest,
-	ContinuationToken, GasMetadataRegistration, LifecycleAction, LifecycleMutation,
-	MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot,
-	MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ReactionMetadataRegistration,
-	ScalarValue, ServiceTelemetry, SimulationStage, SimulationStageRequest,
-	SimulationStageResponse, TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation,
+	ContinuationResumeRequest, ContinuationToken, GasMetadataRegistration, LifecycleAction,
+	LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse,
+	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind,
+	ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
+	SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
+	TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatSnapshotRequest,
 	TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
 	WireGasRequirement, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
 	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, GAS_METADATA_RECORD_LEN,
@@ -26,7 +27,7 @@ use dogmos_protocol::{
 	MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN,
 	MIXTURE_STATE_MUTATION_LEN, REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN,
 	SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN,
-	TURF_HEAT_MUTATION_LEN, TURF_LIFECYCLE_MUTATION_LEN,
+	TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
 };
 use std::{fs, path::Path, sync::Mutex, time::Duration};
 
@@ -459,16 +460,37 @@ pub fn encode_production_continuation_adjust_multiple(fields: &[f32]) -> eyre::R
 fn dogmos_continuation_resume(fields: ByondValue) -> eyre::Result<ByondValue> {
 	let fields = bounded_number_list(
 		fields,
-		"continuation resume token",
-		PRODUCTION_CONTINUATION_TOKEN_FIELDS,
+		"continuation resume",
+		PRODUCTION_CONTINUATION_TOKEN_FIELDS + 1,
 	)?;
-	let token = decode_production_continuation_token(&fields)?;
+	let request = encode_production_continuation_resume(&fields)?;
 	let response = production_request(
 		OperationKind::ContinuationResume,
-		&token.encode()?,
+		&request,
 		MIXTURE_COMMAND_RESPONSE_LEN,
 	)?;
 	mixture_command_response_value(MixtureCommandResponse::decode(&response)?)
+}
+
+#[doc(hidden)]
+pub fn encode_production_continuation_resume(fields: &[f32]) -> eyre::Result<Vec<u8>> {
+	if fields.len() != PRODUCTION_CONTINUATION_TOKEN_FIELDS + 1 {
+		return Err(eyre::eyre!(
+			"continuation resume requires a 10-field token and reaction result"
+		));
+	}
+	let token =
+		decode_production_continuation_token(&fields[..PRODUCTION_CONTINUATION_TOKEN_FIELDS])?;
+	let reaction_result = exact_u32(
+		fields[PRODUCTION_CONTINUATION_TOKEN_FIELDS],
+		"continuation reaction result",
+	)?;
+	Ok(ContinuationResumeRequest {
+		token,
+		reaction_result,
+	}
+	.encode()?
+	.to_vec())
 }
 
 #[auxmacros::bind("/proc/dogmos_continuation_cancel")]
@@ -1257,6 +1279,52 @@ pub fn encode_production_turf_heat_batch(values: &[f32]) -> eyre::Result<Vec<u8>
 	Ok(output)
 }
 
+#[auxmacros::bind("/proc/dogmos_turf_heat_snapshot")]
+fn dogmos_turf_heat_snapshot(fields: ByondValue) -> eyre::Result<ByondValue> {
+	let fields = bounded_number_list(fields, "turf heat snapshot", 2)?;
+	if fields.len() != 2 {
+		return Err(eyre::eyre!(
+			"turf heat snapshot requires exactly slot and generation"
+		));
+	}
+	let request = TurfHeatSnapshotRequest {
+		turf: WireHandle {
+			slot: exact_u32(fields[0], "turf heat snapshot slot")?,
+			generation: exact_u32(fields[1], "turf heat snapshot generation")?,
+		},
+	}
+	.encode();
+	let response = production_request(
+		OperationKind::TurfHeatSnapshot,
+		&request,
+		TURF_HEAT_SNAPSHOT_LEN,
+	)?;
+	let fields = decode_production_turf_heat_snapshot(&response)?;
+	let mut output = ByondValue::new_list()?;
+	for field in fields {
+		output.push_list(field.into())?;
+	}
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn decode_production_turf_heat_snapshot(response: &[u8]) -> eyre::Result<[f32; 5]> {
+	let snapshot = TurfHeatSnapshot::decode(response)?;
+	let Some(state) = snapshot.state else {
+		return Ok([0.0; 5]);
+	};
+	Ok([
+		1.0,
+		finite_byond_scalar(state.temperature.0, "turf heat snapshot temperature")?,
+		finite_byond_scalar(
+			state.thermal_conductivity.0,
+			"turf heat snapshot thermal conductivity",
+		)?,
+		finite_byond_scalar(state.heat_capacity.0, "turf heat snapshot heat capacity")?,
+		f32::from(state.adjacent_to_space),
+	])
+}
+
 #[auxmacros::bind("/proc/dogmos_turf_heat_adjacency_batch")]
 fn dogmos_turf_heat_adjacency_batch(entries: ByondValue) -> eyre::Result<ByondValue> {
 	let values = bounded_number_list(
@@ -1975,16 +2043,24 @@ fn encode_dm_mixture_command(
 }
 
 fn mixture_command_response_value(response: MixtureCommandResponse) -> eyre::Result<ByondValue> {
-	let (kind, first, second) = match response {
-		MixtureCommandResponse::Applied { updated } => (1.0, updated as f32, 0.0),
-		MixtureCommandResponse::Scalar(value) => (2.0, value.0 as f32, 0.0),
-		MixtureCommandResponse::Scalars(values) => (3.0, values[0].0 as f32, values[1].0 as f32),
-		MixtureCommandResponse::Boolean(value) => (4.0, f32::from(value), 0.0),
+	let (kind, first, second, third) = match response {
+		MixtureCommandResponse::Applied { updated } => (1.0, updated as f32, 0.0, 0.0),
+		MixtureCommandResponse::Scalar(value) => (2.0, value.0 as f32, 0.0, 0.0),
+		MixtureCommandResponse::Scalars(values) => {
+			(3.0, values[0].0 as f32, values[1].0 as f32, 0.0)
+		}
+		MixtureCommandResponse::Boolean(value) => (4.0, f32::from(value), 0.0, 0.0),
+		MixtureCommandResponse::ReactionProgress {
+			flags,
+			work_items,
+			pending,
+		} => (5.0, flags as f32, work_items as f32, f32::from(pending)),
 	};
 	let mut output = ByondValue::new_list()?;
 	output.push_list(kind.into())?;
 	output.push_list(first.into())?;
 	output.push_list(second.into())?;
+	output.push_list(third.into())?;
 	Ok(output)
 }
 
@@ -2015,8 +2091,9 @@ mod tests {
 		callback_count_from_number, decode_production_callback_batch,
 		decode_production_continuation_token, decode_production_mixture_snapshot,
 		decode_production_service_telemetry, decode_production_simulation_stage,
-		diagnostic_bytes_from_number, encode_dm_mixture_command,
-		encode_production_continuation_adjust_multiple, encode_production_continuation_command,
+		decode_production_turf_heat_snapshot, diagnostic_bytes_from_number,
+		encode_dm_mixture_command, encode_production_continuation_adjust_multiple,
+		encode_production_continuation_command, encode_production_continuation_resume,
 		encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
 		encode_production_mixture_lifecycle_batch, encode_production_mixture_state_batch,
 		encode_production_reaction_metadata, encode_production_simulation_stage,
@@ -2031,12 +2108,13 @@ mod tests {
 		decode_reaction_metadata_batch, decode_turf_adjacency_batch,
 		decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
 		CallbackBatchHeader, CallbackEvent, CallbackEventKind, ContinuationCommandRequest,
-		ContinuationToken, GasMetadataRegistration, LifecycleAction, LifecycleMutation,
-		MixtureAdjustment, MixtureCommandRequest, MixtureSnapshot, ReactionMetadataRegistration,
-		ScalarValue, ServiceTelemetry, SimulationStage, SimulationStageRequest,
-		SimulationStageResponse, TurfAdjacencyMutation, TurfHeatAdjacencyMutation,
-		TurfHeatMutation, TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole,
-		WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution, MAX_GAS_SLOTS,
+		ContinuationResumeRequest, ContinuationToken, GasMetadataRegistration, LifecycleAction,
+		LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureSnapshot,
+		ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
+		SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
+		TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatState,
+		TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
+		WireGasRequirement, WireHandle, WireReactionExecution, MAX_GAS_SLOTS,
 	};
 
 	fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -2074,6 +2152,24 @@ mod tests {
 			aux: 0,
 		});
 		assert!(error.is_err(), "unused scalar must fail closed");
+
+		let direct_reaction = encode_dm_mixture_command(DmMixtureCommandFields {
+			kind: 36,
+			flags: 0,
+			primary: handle(7, 2),
+			secondary: handle(41, 9),
+			scalars: [0.0; 3],
+			gas_id: 0,
+			aux: 0,
+		})
+		.unwrap();
+		assert_eq!(
+			MixtureCommandRequest::decode(&direct_reaction),
+			Ok(MixtureCommandRequest::React {
+				handle: handle(7, 2),
+				target: handle(41, 9),
+			})
+		);
 	}
 
 	#[test]
@@ -2155,6 +2251,29 @@ mod tests {
 		assert_eq!(&fields[3..7], &[293.15, 2_500.0, 0.5, 1.0]);
 		assert_eq!(fields[7], 1.25);
 		assert_eq!(fields[7 + 31], 9.5);
+	}
+
+	#[test]
+	fn production_turf_heat_snapshot_preserves_presence_and_values() {
+		let response = TurfHeatSnapshot {
+			state: Some(TurfHeatState {
+				temperature: ScalarValue(700.0),
+				thermal_conductivity: ScalarValue(0.4),
+				heat_capacity: ScalarValue(2500.0),
+				adjacent_to_space: true,
+			}),
+		}
+		.encode()
+		.unwrap();
+		assert_eq!(
+			decode_production_turf_heat_snapshot(&response).unwrap(),
+			[1.0, 700.0, 0.4, 2500.0, 1.0]
+		);
+		let absent = TurfHeatSnapshot { state: None }.encode().unwrap();
+		assert_eq!(
+			decode_production_turf_heat_snapshot(&absent).unwrap(),
+			[0.0; 5]
+		);
 	}
 
 	#[test]
@@ -2539,6 +2658,17 @@ mod tests {
 		assert_eq!(actual_token, token);
 		assert_eq!(actual_handle, handle(7, 2));
 		assert_eq!(adjustments[0].delta, ScalarValue(-0.5));
+		let mut resume_fields = token_fields.to_vec();
+		resume_fields.push(5.0);
+		assert_eq!(
+			ContinuationResumeRequest::decode(
+				&encode_production_continuation_resume(&resume_fields).unwrap()
+			),
+			Ok(ContinuationResumeRequest {
+				token,
+				reaction_result: 5,
+			})
+		);
 		let mut invalid = token_fields;
 		invalid[2] = 65_536.0;
 		assert!(decode_production_continuation_token(&invalid).is_err());

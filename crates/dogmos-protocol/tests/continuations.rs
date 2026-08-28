@@ -1,8 +1,8 @@
 use dogmos_protocol::{
 	decode_continuation_adjust_multiple_request, encode_continuation_adjust_multiple_request,
-	ContinuationCommandRequest, ContinuationToken, MixtureAdjustment, MixtureCommandRequest,
-	OperationKind, ProtocolError, ScalarValue, ServiceErrorCode, WireHandle,
-	CONTINUATION_COMMAND_REQUEST_LEN, CONTINUATION_TOKEN_LEN,
+	ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken, MixtureAdjustment,
+	MixtureCommandRequest, OperationKind, ProtocolError, ScalarValue, ServiceErrorCode, WireHandle,
+	CONTINUATION_COMMAND_REQUEST_LEN, CONTINUATION_RESUME_REQUEST_LEN, CONTINUATION_TOKEN_LEN,
 };
 
 fn token() -> ContinuationToken {
@@ -65,6 +65,27 @@ fn continuation_token_rejects_reserved_and_zero_identity_fields() {
 	assert_eq!(
 		ContinuationToken::decode(&zero_deadline),
 		Err(ProtocolError::InvalidContinuationDeadline)
+	);
+}
+
+#[test]
+fn continuation_resume_carries_validated_dm_reaction_flags() {
+	let request = ContinuationResumeRequest {
+		token: token(),
+		reaction_result: 5,
+	};
+	let bytes = request.encode().unwrap();
+	assert_eq!(bytes.len(), CONTINUATION_RESUME_REQUEST_LEN);
+	assert_eq!(&bytes[..CONTINUATION_TOKEN_LEN], &token().encode().unwrap());
+	assert_eq!(&bytes[24..28], &5_u32.to_le_bytes());
+	assert_eq!(&bytes[28..32], &[0; 4]);
+	assert_eq!(ContinuationResumeRequest::decode(&bytes), Ok(request));
+
+	let mut invalid = bytes;
+	invalid[24..28].copy_from_slice(&8_u32.to_le_bytes());
+	assert_eq!(
+		ContinuationResumeRequest::decode(&invalid),
+		Err(ProtocolError::InvalidReactionFlags(8))
 	);
 }
 

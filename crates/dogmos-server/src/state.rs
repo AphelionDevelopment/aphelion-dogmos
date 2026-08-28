@@ -1,7 +1,8 @@
 use dogmos_core::{
 	metadata::{
-		FireProductRule, GasFireRole, GasId, GasMetadata, GasProduct, GasRequirement,
-		NativeReactionKind, ReactionExecution, ReactionId, ReactionMetadata, TurfHandle,
+		FireProductRule, GameplayHandle, GasFireRole, GasId, GasMetadata, GasProduct,
+		GasRequirement, NativeReactionKind, ReactionExecution, ReactionId, ReactionMetadata,
+		TurfHandle,
 	},
 	world::{
 		AdjacencyMutation as CoreAdjacencyMutation, Command as CoreCommand,
@@ -23,9 +24,10 @@ use dogmos_protocol::{
 	MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot, MixtureStateMutation,
 	ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
 	TurfAdjacencyMutation, TurfDestructionReason, TurfHeatAdjacencyMutation, TurfHeatMutation,
-	TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireHandle, WireReactionExecution,
-	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_KIND_COUNT, CALLBACK_EVENT_LEN,
-	CONTINUATION_TICK_MILLIS, DEFAULT_CONTINUATION_TIMEOUT_TICKS, MAX_GAS_SLOTS,
+	TurfHeatSnapshot, TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole,
+	WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_KIND_COUNT,
+	CALLBACK_EVENT_LEN, CONTINUATION_TICK_MILLIS, DEFAULT_CONTINUATION_TIMEOUT_TICKS,
+	MAX_GAS_SLOTS,
 };
 use std::{
 	collections::{BTreeMap, BTreeSet, VecDeque},
@@ -124,7 +126,7 @@ impl PendingCallbackEvent {
 struct PendingContinuation {
 	core_token: CoreContinuationToken,
 	deadline_ticks: u64,
-	turf: WireHandle,
+	turf: Option<WireHandle>,
 	mixture: WireHandle,
 }
 
@@ -612,7 +614,9 @@ impl ServiceState {
 		self.pending_continuations.retain(|_, continuation| {
 			!mutations.iter().any(|mutation| {
 				mutation.action == LifecycleAction::Unregister
-					&& mutation.turf.slot == continuation.turf.slot
+					&& continuation
+						.turf
+						.is_some_and(|turf| mutation.turf.slot == turf.slot)
 			})
 		});
 		self.remove_orphaned_continuation_callbacks();
@@ -741,6 +745,20 @@ impl ServiceState {
 		})
 	}
 
+	pub fn turf_heat_snapshot(&self, handle: WireHandle) -> Result<TurfHeatSnapshot, StateError> {
+		let state = self
+			.world
+			.turf_heat(core_turf_handle(handle))
+			.map_err(map_world_error)?
+			.map(|state| TurfHeatState {
+				temperature: ScalarValue(f64::from(state.temperature)),
+				thermal_conductivity: ScalarValue(f64::from(state.thermal_conductivity)),
+				heat_capacity: ScalarValue(f64::from(state.heat_capacity)),
+				adjacent_to_space: state.adjacent_to_space,
+			});
+		Ok(TurfHeatSnapshot { state })
+	}
+
 	pub fn apply_adjust_multiple(
 		&mut self,
 		handle: WireHandle,
@@ -772,6 +790,28 @@ impl ServiceState {
 		&mut self,
 		request: MixtureCommandRequest,
 	) -> Result<MixtureCommandResponse, StateError> {
+		if let MixtureCommandRequest::React { handle, target } = request {
+			let queue_depth = u32::try_from(self.callback_events.len())
+				.map_err(|_| StateError::CallbackBackpressure)?;
+			let event_limit = self
+				.max_callback_events
+				.checked_sub(queue_depth)
+				.ok_or(StateError::CallbackBackpressure)?;
+			let progress = self
+				.world
+				.react_mixture_with_event_limit(
+					core_handle(handle),
+					core_gameplay_handle(target),
+					event_limit,
+				)
+				.map_err(map_world_error)?;
+			self.enqueue_world_events_at(event_limit, self.current_ticks())?;
+			return Ok(MixtureCommandResponse::ReactionProgress {
+				flags: progress.flags,
+				work_items: progress.work_items,
+				pending: progress.pending,
+			});
+		}
 		let command = match request {
 			MixtureCommandRequest::SetMoles {
 				handle,
@@ -993,6 +1033,7 @@ impl ServiceState {
 				ratio: ratio.0 as f32,
 				one_way,
 			},
+			MixtureCommandRequest::React { .. } => unreachable!("direct reaction handled above"),
 		};
 		match self.world.apply_command(command).map_err(map_world_error)? {
 			CoreCommandResult::Applied { updated } => {
@@ -1120,6 +1161,7 @@ impl ServiceState {
 		self.apply_continuation_adjust_multiple_at(token, handle, adjustments, now_ticks)
 	}
 
+	#[cfg(test)]
 	pub fn resume_continuation_at(
 		&mut self,
 		token: ContinuationToken,
@@ -1143,12 +1185,44 @@ impl ServiceState {
 		Ok(MixtureCommandResponse::Applied { updated })
 	}
 
-	pub fn resume_continuation(
+	pub fn resume_continuation_with_result_at(
 		&mut self,
 		token: ContinuationToken,
+		reaction_result: u32,
+		now_ticks: u64,
+	) -> Result<MixtureCommandResponse, StateError> {
+		let continuation = self.require_continuation_at(token, now_ticks)?;
+		let queue_depth = u32::try_from(self.callback_events.len())
+			.map_err(|_| StateError::CallbackBackpressure)?;
+		let event_limit = self
+			.max_callback_events
+			.checked_sub(queue_depth)
+			.ok_or(StateError::CallbackBackpressure)?;
+		let progress = self
+			.world
+			.resume_reaction_with_result_and_event_limit(
+				continuation.core_token,
+				reaction_result,
+				event_limit,
+			)
+			.map_err(map_world_error)?;
+		self.pending_continuations.remove(&token.id);
+		self.remove_queued_continuation(token.id);
+		self.enqueue_world_events_at(event_limit, now_ticks)?;
+		Ok(MixtureCommandResponse::ReactionProgress {
+			flags: progress.flags,
+			work_items: progress.work_items,
+			pending: progress.pending,
+		})
+	}
+
+	pub fn resume_continuation_with_result(
+		&mut self,
+		token: ContinuationToken,
+		reaction_result: u32,
 	) -> Result<MixtureCommandResponse, StateError> {
 		let now_ticks = self.current_ticks();
-		self.resume_continuation_at(token, now_ticks)
+		self.resume_continuation_with_result_at(token, reaction_result, now_ticks)
 	}
 
 	pub fn cancel_continuation_at(
@@ -1264,7 +1338,7 @@ impl ServiceState {
 						PendingContinuation {
 							core_token,
 							deadline_ticks,
-							turf: wire_handle_from_turf(turf),
+							turf: turf.map(wire_handle_from_turf),
 							mixture: wire_handle(mixture),
 						},
 					));
@@ -1351,6 +1425,13 @@ fn core_turf_handle(handle: WireHandle) -> TurfHandle {
 	}
 }
 
+fn core_gameplay_handle(handle: WireHandle) -> GameplayHandle {
+	GameplayHandle {
+		slot: handle.slot,
+		generation: handle.generation,
+	}
+}
+
 fn wire_handle(handle: MixtureHandle) -> WireHandle {
 	WireHandle {
 		slot: handle.slot,
@@ -1359,6 +1440,13 @@ fn wire_handle(handle: MixtureHandle) -> WireHandle {
 }
 
 fn wire_handle_from_turf(handle: TurfHandle) -> WireHandle {
+	WireHandle {
+		slot: handle.slot,
+		generation: handle.generation,
+	}
+}
+
+fn wire_handle_from_gameplay(handle: GameplayHandle) -> WireHandle {
 	WireHandle {
 		slot: handle.slot,
 		generation: handle.generation,
@@ -1419,27 +1507,27 @@ fn pending_callback_from_world_event(
 			callback.target = wire_handle_from_turf(target);
 		}
 		WorldEvent::RunDmReaction {
-			turf,
 			mixture,
+			target,
 			reaction,
 			..
 		} => {
 			callback.kind = CallbackEventKind::RunDmReaction;
-			callback.subject = wire_handle_from_turf(turf);
-			callback.target = wire_handle(mixture);
+			callback.subject = wire_handle(mixture);
+			callback.target = wire_handle_from_gameplay(target);
 			callback.aux = reaction.0;
 			callback.continuation = continuation;
 		}
 		WorldEvent::ReactionFinished {
-			turf,
 			mixture,
+			target,
 			kind,
 			values,
 			..
 		} => {
 			callback.kind = CallbackEventKind::ReactionFinished;
-			callback.subject = wire_handle_from_turf(turf);
-			callback.target = wire_handle(mixture);
+			callback.subject = wire_handle(mixture);
+			callback.target = wire_handle_from_gameplay(target);
 			for (output, value) in callback.values.iter_mut().zip(values) {
 				*output = ScalarValue(f64::from(value));
 			}
@@ -1535,6 +1623,9 @@ fn map_world_error(error: WorldError) -> StateError {
 		WorldError::State(message) => StateError::State(message),
 		WorldError::StateCapacityExceeded => StateError::StateCapacityExceeded,
 		WorldError::AllocationFailed => StateError::AllocationFailed,
+		WorldError::InvalidReactionResult(result) => {
+			StateError::State(format!("invalid reaction result flags: {result}"))
+		}
 		WorldError::Cancelled => StateError::Cancelled,
 	}
 }
@@ -2173,6 +2264,17 @@ mod tests {
 				.temperature,
 			700.0
 		);
+		assert_eq!(
+			state.turf_heat_snapshot(first).unwrap(),
+			TurfHeatSnapshot {
+				state: Some(WireTurfHeatState {
+					temperature: ScalarValue(700.0),
+					thermal_conductivity: ScalarValue(f64::from(0.4_f32)),
+					heat_capacity: ScalarValue(100.0),
+					adjacent_to_space: false,
+				}),
+			}
+		);
 	}
 
 	#[test]
@@ -2208,6 +2310,76 @@ mod tests {
 				.apply_mixture_command(MixtureCommandRequest::IsImmutable { handle: mixture })
 				.unwrap(),
 			MixtureCommandResponse::Boolean(true)
+		);
+	}
+
+	#[test]
+	fn direct_reaction_routes_mixture_and_arbitrary_holder_through_callback_and_resume() {
+		let mixture = handle(0, 1);
+		let holder = handle(41, 9);
+		let mut state = ServiceState::new_for_world(1024 * 1024, 8, 1, 7);
+		state
+			.install_gases(vec![GasMetadataRegistration {
+				id: 0,
+				key: "o2".into(),
+				name: "Oxygen".into(),
+				flags: 0,
+				specific_heat: ScalarValue(20.0),
+				fusion_power: ScalarValue(0.0),
+				moles_visible: None,
+				enthalpy: ScalarValue(0.0),
+				fire_radiation_released: ScalarValue(0.0),
+				fire_role: WireGasFireRole::None,
+				fire_products: None,
+			}])
+			.unwrap();
+		state
+			.install_reactions(vec![ReactionMetadataRegistration {
+				id: 0,
+				key: "dm".into(),
+				priority: ScalarValue(1.0),
+				minimum_temperature: None,
+				maximum_temperature: None,
+				minimum_energy: None,
+				minimum_fire_reagents: None,
+				gas_requirements: Vec::new(),
+				execution: WireReactionExecution::Dm,
+			}])
+			.unwrap();
+		state
+			.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: mixture,
+			}])
+			.unwrap();
+
+		assert_eq!(
+			state
+				.apply_mixture_command(MixtureCommandRequest::React {
+					handle: mixture,
+					target: holder,
+				})
+				.unwrap(),
+			MixtureCommandResponse::ReactionProgress {
+				flags: 0,
+				work_items: 1,
+				pending: true,
+			}
+		);
+		let mut output = vec![0_u8; CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN];
+		state.drain_callbacks_at(1, &mut output, 10).unwrap();
+		let event = CallbackEvent::decode(&output[CALLBACK_BATCH_HEADER_LEN..]).unwrap();
+		assert_eq!(event.kind, CallbackEventKind::RunDmReaction);
+		assert_eq!(event.subject, mixture);
+		assert_eq!(event.target, holder);
+		let token = event.continuation.unwrap();
+		assert_eq!(
+			state.resume_continuation_with_result_at(token, 1, 11),
+			Ok(MixtureCommandResponse::ReactionProgress {
+				flags: 1,
+				work_items: 0,
+				pending: false,
+			})
 		);
 	}
 

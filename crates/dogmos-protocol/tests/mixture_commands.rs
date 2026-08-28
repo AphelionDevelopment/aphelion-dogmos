@@ -193,6 +193,10 @@ fn every_fixed_mixture_command_round_trips() {
 			ratio: ScalarValue(0.4),
 			one_way: true,
 		},
+		MixtureCommandRequest::React {
+			handle: first,
+			target: second,
+		},
 	];
 	for (index, command) in commands.into_iter().enumerate() {
 		let bytes = command.encode().unwrap();
@@ -264,6 +268,11 @@ fn mixture_command_responses_have_one_fixed_layout() {
 		MixtureCommandResponse::Scalar(ScalarValue(4.5)),
 		MixtureCommandResponse::Scalars([ScalarValue(1.0), ScalarValue(2.0)]),
 		MixtureCommandResponse::Boolean(true),
+		MixtureCommandResponse::ReactionProgress {
+			flags: 5,
+			work_items: 2,
+			pending: true,
+		},
 	];
 	for (index, response) in responses.into_iter().enumerate() {
 		let bytes = response.encode().unwrap();

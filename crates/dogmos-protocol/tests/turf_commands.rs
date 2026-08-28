@@ -3,8 +3,9 @@ use dogmos_protocol::{
 	decode_turf_lifecycle_batch, encode_turf_adjacency_batch, encode_turf_heat_adjacency_batch,
 	encode_turf_heat_batch, encode_turf_lifecycle_batch, LifecycleAction, ProtocolError,
 	ScalarValue, TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation,
-	TurfLifecycleMutation, WireHandle, TURF_ADJACENCY_MUTATION_LEN,
-	TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN, TURF_LIFECYCLE_MUTATION_LEN,
+	TurfHeatSnapshot, TurfHeatSnapshotRequest, TurfLifecycleMutation, WireHandle,
+	TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN,
+	TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
 };
 
 fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -143,5 +144,40 @@ fn turf_heat_adjacency_batch_has_a_fixed_width_layout() {
 	assert_eq!(
 		decode_turf_heat_adjacency_batch(&bytes, 1),
 		Err(ProtocolError::InvalidBoolean(3))
+	);
+}
+
+#[test]
+fn turf_heat_snapshot_has_a_fixed_width_golden_layout() {
+	let request = TurfHeatSnapshotRequest { turf: handle(7, 8) };
+	assert_eq!(request.encode(), handle(7, 8).encode());
+	assert_eq!(
+		TurfHeatSnapshotRequest::decode(&request.encode()),
+		Ok(request)
+	);
+
+	let snapshot = TurfHeatSnapshot {
+		state: Some(dogmos_protocol::TurfHeatState {
+			temperature: ScalarValue(700.0),
+			thermal_conductivity: ScalarValue(0.4),
+			heat_capacity: ScalarValue(2500.0),
+			adjacent_to_space: true,
+		}),
+	};
+	let bytes = snapshot.encode().unwrap();
+	assert_eq!(bytes.len(), TURF_HEAT_SNAPSHOT_LEN);
+	assert_eq!(&bytes[0..4], &3_u32.to_le_bytes());
+	assert_eq!(TurfHeatSnapshot::decode(&bytes), Ok(snapshot));
+
+	let absent = TurfHeatSnapshot { state: None }.encode().unwrap();
+	assert_eq!(
+		TurfHeatSnapshot::decode(&absent),
+		Ok(TurfHeatSnapshot { state: None })
+	);
+	let mut malformed = absent;
+	malformed[8..16].copy_from_slice(&700_f64.to_le_bytes());
+	assert_eq!(
+		TurfHeatSnapshot::decode(&malformed),
+		Err(ProtocolError::NonZeroAbsentTurfHeatState)
 	);
 }

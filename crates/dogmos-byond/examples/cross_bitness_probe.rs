@@ -1,12 +1,12 @@
 use dogmos_byond::{
 	decode_production_callback_batch, decode_production_continuation_token,
 	decode_production_mixture_snapshot, decode_production_simulation_stage,
-	encode_production_continuation_adjust_multiple, encode_production_gas_metadata,
-	encode_production_mixture_adjust_multiple, encode_production_mixture_command,
-	encode_production_mixture_lifecycle_batch, encode_production_mixture_state_batch,
-	encode_production_reaction_metadata, encode_production_simulation_stage,
-	encode_production_turf_adjacency_batch, encode_production_turf_lifecycle_batch, ClientError,
-	DogmosClient,
+	encode_production_continuation_adjust_multiple, encode_production_continuation_resume,
+	encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
+	encode_production_mixture_command, encode_production_mixture_lifecycle_batch,
+	encode_production_mixture_state_batch, encode_production_reaction_metadata,
+	encode_production_simulation_stage, encode_production_turf_adjacency_batch,
+	encode_production_turf_lifecycle_batch, ClientError, DogmosClient,
 };
 use dogmos_protocol::{
 	encode_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CapacityLimits, HandshakePayload,
@@ -341,7 +341,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 	)?;
 	let callback_fields = decode_production_callback_batch(&callback_response, 1)?;
 	let continuation_fields = &callback_fields[33..43];
-	let continuation = decode_production_continuation_token(continuation_fields)?;
 	let mut continuation_adjust_fields = continuation_fields.to_vec();
 	continuation_adjust_fields.extend([0.0, 1.0, 0.0, -0.125]);
 	adjust_multiple_request =
@@ -353,7 +352,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 	)?;
 	client.round_trip_into(
 		OperationKind::ContinuationResume,
-		&continuation.encode()?,
+		&encode_production_continuation_resume(
+			&continuation_fields
+				.iter()
+				.copied()
+				.chain(std::iter::once(1.0))
+				.collect::<Vec<_>>(),
+		)?,
 		&mut command_response,
 	)?;
 

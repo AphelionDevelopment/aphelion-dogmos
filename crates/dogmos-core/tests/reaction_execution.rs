@@ -1,12 +1,12 @@
 use dogmos_core::{
 	metadata::{
-		GasFireRole, GasId, GasMetadata, GasRequirement, NativeReactionKind, ReactionExecution,
-		ReactionId, ReactionMetadata, TurfHandle,
+		GameplayHandle, GasFireRole, GasId, GasMetadata, GasRequirement, NativeReactionKind,
+		ReactionExecution, ReactionId, ReactionMetadata, TurfHandle,
 	},
 	world::{
 		Command, CommandResult, DogmosWorld, LifecycleAction, LifecycleMutation,
-		MixtureStateMutation, ReactionContinuationToken, StageResult, TurfLifecycleMutation,
-		WorldError, WorldEvent, WorldStage,
+		MixtureStateMutation, ReactionContinuationToken, ReactionProgress, StageResult,
+		TurfLifecycleMutation, WorldError, WorldEvent, WorldStage,
 	},
 	MixtureHandle, MAX_GAS_SLOTS,
 };
@@ -25,6 +25,121 @@ fn gas(id: u16, key: &str) -> GasMetadata {
 		fire_role: GasFireRole::None,
 		fire_products: None,
 	}
+}
+
+#[test]
+fn direct_reaction_preserves_arbitrary_holder_across_dm_continuation_without_a_turf() {
+	let mixture = MixtureHandle {
+		slot: 0,
+		generation: 1,
+	};
+	let holder = GameplayHandle {
+		slot: 41,
+		generation: 9,
+	};
+	let mut world = DogmosWorld::new_with_event_capacity(1024 * 1024, 8);
+	world
+		.install_gases(vec![
+			gas(0, "o2"),
+			gas(1, "hydrogen"),
+			gas(2, "water_vapor"),
+		])
+		.unwrap();
+	world
+		.install_reactions(vec![
+			ReactionMetadata {
+				id: ReactionId(0),
+				key: "dm_first".into(),
+				priority: 2.0,
+				minimum_temperature: None,
+				maximum_temperature: None,
+				minimum_energy: None,
+				minimum_fire_reagents: None,
+				gas_requirements: Box::new([]),
+				execution: ReactionExecution::Dm,
+			},
+			ReactionMetadata {
+				id: ReactionId(1),
+				key: "h2fire".into(),
+				priority: 1.0,
+				minimum_temperature: None,
+				maximum_temperature: None,
+				minimum_energy: None,
+				minimum_fire_reagents: None,
+				gas_requirements: vec![
+					GasRequirement {
+						gas: GasId(0),
+						minimum_moles: 0.01,
+					},
+					GasRequirement {
+						gas: GasId(1),
+						minimum_moles: 0.01,
+					},
+				]
+				.into_boxed_slice(),
+				execution: ReactionExecution::Native(NativeReactionKind::Hydrogen),
+			},
+		])
+		.unwrap();
+	world
+		.apply_lifecycle(&[LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle: mixture,
+		}])
+		.unwrap();
+	let mut gases = [0.0; MAX_GAS_SLOTS];
+	gases[0] = 100.0;
+	gases[1] = 10.0;
+	world
+		.apply_mixture_state(&[MixtureStateMutation {
+			handle: mixture,
+			expected_revision: 0,
+			temperature: 500.0,
+			volume: 2500.0,
+			gases,
+		}])
+		.unwrap();
+
+	assert_eq!(
+		world.react_mixture_with_event_limit(mixture, holder, 8),
+		Ok(ReactionProgress {
+			flags: 0,
+			work_items: 1,
+			pending: true,
+		})
+	);
+	let mut events = Vec::new();
+	assert_eq!(world.drain_events_into(8, &mut events), 1);
+	let token = match events.as_slice() {
+		[WorldEvent::RunDmReaction {
+			turf: None,
+			mixture: event_mixture,
+			target,
+			reaction: ReactionId(0),
+			continuation,
+		}] if *event_mixture == mixture && *target == holder => *continuation,
+		actual => panic!("unexpected direct reaction event: {actual:?}"),
+	};
+
+	assert_eq!(
+		world.resume_reaction_with_result_and_event_limit(token, 1, 8),
+		Ok(ReactionProgress {
+			flags: 5,
+			work_items: 1,
+			pending: false,
+		})
+	);
+	assert_eq!(world.drain_events_into(8, &mut events), 1);
+	assert!(matches!(
+		events.as_slice(),
+		[WorldEvent::ReactionFinished {
+			mixture: event_mixture,
+			target: event_target,
+			reaction: ReactionId(1),
+			kind: NativeReactionKind::Hydrogen,
+			..
+		}] if *event_mixture == mixture && *event_target == holder
+	));
 }
 
 #[test]
@@ -117,11 +232,17 @@ fn dm_reaction_continuation_resumes_priority_order_and_rejects_duplicate_resume(
 	assert_eq!(world.drain_events_into(8, &mut events), 1);
 	let token = match events.as_slice() {
 		[WorldEvent::RunDmReaction {
-			turf: event_turf,
+			turf: Some(event_turf),
 			mixture: event_mixture,
+			target,
 			reaction: ReactionId(0),
 			continuation,
-		}] if *event_turf == turf && *event_mixture == mixture => *continuation,
+		}] if *event_turf == turf
+			&& *target == GameplayHandle::from(turf)
+			&& *event_mixture == mixture =>
+		{
+			*continuation
+		}
 		actual => panic!("unexpected continuation event: {actual:?}"),
 	};
 	assert_ne!(token, ReactionContinuationToken::default());
@@ -352,11 +473,11 @@ fn plasma_kernel_mutates_service_state_and_emits_typed_finish_event() {
 	assert!(matches!(
 		events.as_slice(),
 		[WorldEvent::ReactionFinished {
-			turf: event_turf,
 			mixture: event_mixture,
+			target,
 			reaction: ReactionId(0),
 			kind: NativeReactionKind::Plasma,
 			..
-		}] if *event_turf == turf && *event_mixture == mixture
+		}] if *target == GameplayHandle::from(turf) && *event_mixture == mixture
 	));
 }

@@ -34,7 +34,7 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 #[test]
 fn compound_operation_ids_are_stable() {
-	assert_eq!(DOGMOS_PROTOCOL_VERSION, 5);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 6);
 	assert_eq!(OperationKind::MixtureSnapshot as u16, 18);
 	assert_eq!(OperationKind::MixtureLifecycleBatch as u16, 19);
 	assert_eq!(OperationKind::AdjacencyBatch as u16, 20);
@@ -44,6 +44,7 @@ fn compound_operation_ids_are_stable() {
 	assert_eq!(OperationKind::TurfAdjacencyBatch as u16, 25);
 	assert_eq!(OperationKind::TurfHeatBatch as u16, 26);
 	assert_eq!(OperationKind::TurfHeatAdjacencyBatch as u16, 27);
+	assert_eq!(OperationKind::TurfHeatSnapshot as u16, 37);
 	assert_eq!(OperationKind::MixtureCommand as u16, 28);
 	assert_eq!(OperationKind::GasMetadataInstall as u16, 29);
 	assert_eq!(OperationKind::ReactionMetadataInstall as u16, 30);
@@ -86,7 +87,7 @@ fn mixture_state_batch_round_trips_exact_fixed_records() {
 }
 
 #[test]
-fn mixture_state_batch_matches_complete_protocol_v5_golden_bytes() {
+fn mixture_state_batch_matches_complete_protocol_v6_golden_bytes() {
 	const GOLDEN_HEX: &str = concat!(
 		"01000000070000000b0000000400000000000000000000000000104000000000",
 		"00002040000000000000f03f0000000000000000000000000000000000000000",

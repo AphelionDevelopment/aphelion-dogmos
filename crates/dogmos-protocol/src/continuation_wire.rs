@@ -3,6 +3,7 @@ use super::*;
 pub const CONTINUATION_TOKEN_LEN: usize = 24;
 pub const CONTINUATION_COMMAND_REQUEST_LEN: usize =
 	CONTINUATION_TOKEN_LEN + MIXTURE_COMMAND_REQUEST_LEN;
+pub const CONTINUATION_RESUME_REQUEST_LEN: usize = CONTINUATION_TOKEN_LEN + 8;
 pub const CONTINUATION_TICK_MILLIS: u64 = 100;
 pub const DEFAULT_CONTINUATION_TIMEOUT_TICKS: u64 = 50;
 pub const MAX_PENDING_CONTINUATIONS: u32 = 65_536;
@@ -66,6 +67,41 @@ impl ContinuationCommandRequest {
 			token: ContinuationToken::decode(&input[..CONTINUATION_TOKEN_LEN])?,
 			command: MixtureCommandRequest::decode(&input[CONTINUATION_TOKEN_LEN..])?,
 		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContinuationResumeRequest {
+	pub token: ContinuationToken,
+	pub reaction_result: u32,
+}
+
+impl ContinuationResumeRequest {
+	pub fn encode(self) -> Result<[u8; CONTINUATION_RESUME_REQUEST_LEN], ProtocolError> {
+		if self.reaction_result & !REACTION_FLAGS != 0 {
+			return Err(ProtocolError::InvalidReactionFlags(self.reaction_result));
+		}
+		let mut output = [0_u8; CONTINUATION_RESUME_REQUEST_LEN];
+		output[..CONTINUATION_TOKEN_LEN].copy_from_slice(&self.token.encode()?);
+		output[CONTINUATION_TOKEN_LEN..CONTINUATION_TOKEN_LEN + 4]
+			.copy_from_slice(&self.reaction_result.to_le_bytes());
+		Ok(output)
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, CONTINUATION_RESUME_REQUEST_LEN)?;
+		if read_u32(input, CONTINUATION_TOKEN_LEN + 4) != 0 {
+			return Err(ProtocolError::ReservedContinuationField(read_u32(
+				input,
+				CONTINUATION_TOKEN_LEN + 4,
+			)));
+		}
+		let request = Self {
+			token: ContinuationToken::decode(&input[..CONTINUATION_TOKEN_LEN])?,
+			reaction_result: read_u32(input, CONTINUATION_TOKEN_LEN),
+		};
+		request.encode()?;
+		Ok(request)
 	}
 }
 

@@ -4,12 +4,13 @@ use dogmos_byond::{ClientError, DogmosClient};
 use dogmos_protocol::{
 	encode_gas_metadata_batch, encode_lifecycle_batch, encode_reaction_metadata_batch,
 	encode_turf_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CallbackEvent,
-	CapacityLimits, ContinuationCommandRequest, GasMetadataRegistration, HandshakePayload,
-	LifecycleAction, LifecycleMutation, MixtureCommandRequest, MixtureCommandResponse,
-	OperationKind, ReactionMetadataRegistration, ScalarValue, ServiceErrorCode, SimulationStage,
-	SimulationStageRequest, TurfLifecycleMutation, WireGasFireRole, WireHandle,
-	WireReactionExecution, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION,
-	DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MIXTURE_COMMAND_RESPONSE_LEN,
+	CapacityLimits, ContinuationCommandRequest, ContinuationResumeRequest, GasMetadataRegistration,
+	HandshakePayload, LifecycleAction, LifecycleMutation, MixtureCommandRequest,
+	MixtureCommandResponse, OperationKind, ReactionMetadataRegistration, ScalarValue,
+	ServiceErrorCode, SimulationStage, SimulationStageRequest, TurfLifecycleMutation,
+	WireGasFireRole, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
+	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD,
+	MIXTURE_COMMAND_RESPONSE_LEN,
 };
 use std::{
 	error::Error,
@@ -179,19 +180,28 @@ fn dm_reaction_continuation_allows_nested_commands_then_fails_closed_on_service_
 		MixtureCommandResponse::decode(&command_response)?,
 		MixtureCommandResponse::Applied { updated: 1 }
 	);
+	let resume = ContinuationResumeRequest {
+		token,
+		reaction_result: 1,
+	}
+	.encode()?;
 	client.round_trip_into(
 		OperationKind::ContinuationResume,
-		&token.encode()?,
+		&resume,
 		&mut command_response,
 	)?;
 	assert_eq!(
 		MixtureCommandResponse::decode(&command_response)?,
-		MixtureCommandResponse::Applied { updated: 0 }
+		MixtureCommandResponse::ReactionProgress {
+			flags: 1,
+			work_items: 0,
+			pending: false,
+		}
 	);
 	assert!(matches!(
 		client.round_trip_into(
 			OperationKind::ContinuationResume,
-			&token.encode()?,
+			&resume,
 			&mut command_response,
 		),
 		Err(ClientError::Server(ServiceErrorCode::UnknownContinuation))
@@ -234,10 +244,15 @@ fn dm_reaction_continuation_allows_nested_commands_then_fails_closed_on_service_
 		.ok_or("DM reaction callback omitted its service-death token")?;
 	service.0.kill()?;
 	service.0.wait()?;
+	let lost_resume = ContinuationResumeRequest {
+		token: lost_token,
+		reaction_result: 1,
+	}
+	.encode()?;
 	assert!(matches!(
 		client.round_trip_into(
 			OperationKind::ContinuationResume,
-			&lost_token.encode()?,
+			&lost_resume,
 			&mut command_response,
 		),
 		Err(ClientError::Io(_) | ClientError::Transport(_))

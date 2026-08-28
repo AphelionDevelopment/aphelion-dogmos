@@ -18,6 +18,22 @@ pub struct TurfHandle {
 	pub generation: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(C)]
+pub struct GameplayHandle {
+	pub slot: u32,
+	pub generation: u32,
+}
+
+impl From<TurfHandle> for GameplayHandle {
+	fn from(handle: TurfHandle) -> Self {
+		Self {
+			slot: handle.slot,
+			generation: handle.generation,
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GasFireRole {
 	Oxidizer {

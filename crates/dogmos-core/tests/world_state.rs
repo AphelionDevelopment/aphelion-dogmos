@@ -43,6 +43,37 @@ fn oxygen() -> GasMetadata {
 }
 
 #[test]
+fn turf_heat_snapshot_is_generation_checked_and_reports_absence() {
+	let mut world = DogmosWorld::new(1024 * 1024);
+	let turf = turf_handle(7, 3);
+	world
+		.apply_turf_lifecycle(&[TurfLifecycleMutation::Register {
+			handle: turf,
+			mixture: None,
+		}])
+		.unwrap();
+	assert_eq!(world.turf_heat(turf).unwrap(), None);
+
+	let state = TurfHeatState {
+		temperature: 700.0,
+		thermal_conductivity: 0.4,
+		heat_capacity: 2500.0,
+		adjacent_to_space: true,
+	};
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle: turf,
+			state: Some(state),
+		}])
+		.unwrap();
+	assert_eq!(world.turf_heat(turf).unwrap(), Some(state));
+	assert!(matches!(
+		world.turf_heat(turf_handle(7, 2)),
+		Err(WorldError::StaleTurfHandle { .. })
+	));
+}
+
+#[test]
 fn mixture_state_batches_are_revision_checked_and_atomic() {
 	let mut world = DogmosWorld::new(1024 * 1024);
 	world

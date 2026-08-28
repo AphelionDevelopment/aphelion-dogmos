@@ -14,7 +14,7 @@ pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 1;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 5;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 6;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 160;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
@@ -28,6 +28,7 @@ pub const TURF_LIFECYCLE_MUTATION_LEN: usize = 24;
 pub const TURF_ADJACENCY_MUTATION_LEN: usize = 24;
 pub const TURF_HEAT_MUTATION_LEN: usize = 40;
 pub const TURF_HEAT_ADJACENCY_MUTATION_LEN: usize = 24;
+pub const TURF_HEAT_SNAPSHOT_LEN: usize = 32;
 pub const MIXTURE_COMMAND_REQUEST_LEN: usize = 56;
 pub const MIXTURE_COMMAND_RESPONSE_LEN: usize = 24;
 pub const MIXTURE_ADJUST_MULTIPLE_HEADER_LEN: usize = 12;
@@ -40,6 +41,10 @@ pub const CALLBACK_EVENT_LEN: usize = 88;
 pub const FLAG_RESPONSE: u16 = 1 << 0;
 pub const FLAG_ERROR: u16 = 1 << 1;
 const KNOWN_FLAGS: u16 = FLAG_RESPONSE | FLAG_ERROR;
+pub const REACTION_REACTING: u32 = 1 << 0;
+pub const REACTION_STOP: u32 = 1 << 1;
+pub const REACTION_VOLATILE: u32 = 1 << 2;
+pub const REACTION_FLAGS: u32 = REACTION_REACTING | REACTION_STOP | REACTION_VOLATILE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -74,6 +79,7 @@ pub enum OperationKind {
 	ContinuationResume = 34,
 	ContinuationCancel = 35,
 	ServiceTelemetry = 36,
+	TurfHeatSnapshot = 37,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +179,7 @@ impl TryFrom<u16> for OperationKind {
 			34 => Ok(Self::ContinuationResume),
 			35 => Ok(Self::ContinuationCancel),
 			36 => Ok(Self::ServiceTelemetry),
+			37 => Ok(Self::TurfHeatSnapshot),
 			actual => Err(ProtocolError::UnknownOperationKind(actual)),
 		}
 	}
@@ -1251,6 +1258,84 @@ pub struct TurfHeatMutation {
 	pub state: Option<TurfHeatState>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurfHeatSnapshotRequest {
+	pub turf: WireHandle,
+}
+
+impl TurfHeatSnapshotRequest {
+	pub fn encode(self) -> [u8; 8] {
+		self.turf.encode()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, 8)?;
+		Ok(Self {
+			turf: WireHandle::decode(input)?,
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurfHeatSnapshot {
+	pub state: Option<TurfHeatState>,
+}
+
+impl TurfHeatSnapshot {
+	pub fn encode(self) -> Result<[u8; TURF_HEAT_SNAPSHOT_LEN], ProtocolError> {
+		let mut output = [0_u8; TURF_HEAT_SNAPSHOT_LEN];
+		let (flags, temperature, conductivity, capacity) = self.state.map_or(
+			(0, ScalarValue(0.0), ScalarValue(0.0), ScalarValue(0.0)),
+			|state| {
+				(
+					1 | (u32::from(state.adjacent_to_space) << 1),
+					state.temperature,
+					state.thermal_conductivity,
+					state.heat_capacity,
+				)
+			},
+		);
+		output[0..4].copy_from_slice(&flags.to_le_bytes());
+		output[8..16].copy_from_slice(&temperature.encode()?);
+		output[16..24].copy_from_slice(&conductivity.encode()?);
+		output[24..32].copy_from_slice(&capacity.encode()?);
+		Ok(output)
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, TURF_HEAT_SNAPSHOT_LEN)?;
+		let flags = read_u32(input, 0);
+		if flags & !3 != 0 {
+			return Err(ProtocolError::UnknownTurfHeatFlags(flags));
+		}
+		let reserved = read_u32(input, 4);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedTurfHeatField(reserved));
+		}
+		let present = flags & 1 != 0;
+		let adjacent_to_space = flags & 2 != 0;
+		if adjacent_to_space && !present {
+			return Err(ProtocolError::UnknownTurfHeatFlags(flags));
+		}
+		let temperature = ScalarValue::decode(&input[8..16])?;
+		let thermal_conductivity = ScalarValue::decode(&input[16..24])?;
+		let heat_capacity = ScalarValue::decode(&input[24..32])?;
+		if !present
+			&& (temperature.0 != 0.0 || thermal_conductivity.0 != 0.0 || heat_capacity.0 != 0.0)
+		{
+			return Err(ProtocolError::NonZeroAbsentTurfHeatState);
+		}
+		Ok(Self {
+			state: present.then_some(TurfHeatState {
+				temperature,
+				thermal_conductivity,
+				heat_capacity,
+				adjacent_to_space,
+			}),
+		})
+	}
+}
+
 pub fn encode_turf_heat_batch(
 	entries: &[TurfHeatMutation],
 	output: &mut Vec<u8>,
@@ -1519,6 +1604,10 @@ pub enum MixtureCommandRequest {
 		ratio: ScalarValue,
 		one_way: bool,
 	},
+	React {
+		handle: WireHandle,
+		target: WireHandle,
+	},
 }
 
 impl MixtureCommandRequest {
@@ -1655,6 +1744,7 @@ impl MixtureCommandRequest {
 				ratio,
 				one_way,
 			} => (35, u16::from(one_way), first, second, [ratio, z, z], 0, 0),
+			Self::React { handle, target } => (36, 0, handle, target, [z, z, z], 0, 0),
 		};
 		let mut output = [0_u8; MIXTURE_COMMAND_REQUEST_LEN];
 		output[0..2].copy_from_slice(&kind.to_le_bytes());
@@ -1674,7 +1764,7 @@ impl MixtureCommandRequest {
 		require_exact_len(input, MIXTURE_COMMAND_REQUEST_LEN)?;
 		let kind = read_u16(input, 0);
 		let flags = read_u16(input, 2);
-		if !(1..=35).contains(&kind) {
+		if !(1..=36).contains(&kind) {
 			return Err(ProtocolError::UnknownMixtureCommand(kind));
 		}
 		if read_u16(input, 46) != 0 || read_u32(input, 52) != 0 {
@@ -1691,7 +1781,7 @@ impl MixtureCommandRequest {
 		let s3 = ScalarValue::decode(&input[36..44])?;
 		let gas_id = read_u16(input, 44);
 		let aux = read_u32(input, 48);
-		let uses_secondary = matches!(kind, 20 | 22..=24 | 28..=35);
+		let uses_secondary = matches!(kind, 20 | 22..=24 | 28..=36);
 		let uses_s1 = matches!(kind, 1..=3 | 14..=16 | 18..=19 | 21 | 24..=25 | 29..=35)
 			|| kind == 13 && flags & 1 != 0;
 		let uses_s2 = matches!(kind, 3 | 25);
@@ -1838,6 +1928,10 @@ impl MixtureCommandRequest {
 				ratio: s1,
 				one_way: flags & 1 != 0,
 			}),
+			36 => Ok(Self::React {
+				handle: primary,
+				target: secondary,
+			}),
 			actual => Err(ProtocolError::UnknownMixtureCommand(actual)),
 		}
 	}
@@ -1845,25 +1939,53 @@ impl MixtureCommandRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MixtureCommandResponse {
-	Applied { updated: u32 },
+	Applied {
+		updated: u32,
+	},
 	Scalar(ScalarValue),
 	Scalars([ScalarValue; 2]),
 	Boolean(bool),
+	ReactionProgress {
+		flags: u32,
+		work_items: u32,
+		pending: bool,
+	},
 }
 
 impl MixtureCommandResponse {
 	pub fn encode(self) -> Result<[u8; MIXTURE_COMMAND_RESPONSE_LEN], ProtocolError> {
-		let (kind, value, scalars) = match self {
-			Self::Applied { updated } => (1_u32, updated, [ScalarValue(0.0); 2]),
-			Self::Scalar(scalar) => (2, 0, [scalar, ScalarValue(0.0)]),
-			Self::Scalars(scalars) => (3, 0, scalars),
-			Self::Boolean(value) => (4, u32::from(value), [ScalarValue(0.0); 2]),
+		let (kind, value, payload) = match self {
+			Self::Applied { updated } => (1_u32, updated, [0_u8; 16]),
+			Self::Scalar(scalar) => {
+				let mut payload = [0_u8; 16];
+				payload[..8].copy_from_slice(&scalar.encode()?);
+				(2, 0, payload)
+			}
+			Self::Scalars(scalars) => {
+				let mut payload = [0_u8; 16];
+				payload[..8].copy_from_slice(&scalars[0].encode()?);
+				payload[8..].copy_from_slice(&scalars[1].encode()?);
+				(3, 0, payload)
+			}
+			Self::Boolean(value) => (4, u32::from(value), [0_u8; 16]),
+			Self::ReactionProgress {
+				flags,
+				work_items,
+				pending,
+			} => {
+				if flags & !REACTION_FLAGS != 0 {
+					return Err(ProtocolError::InvalidReactionFlags(flags));
+				}
+				let mut payload = [0_u8; 16];
+				payload[..4].copy_from_slice(&work_items.to_le_bytes());
+				payload[4..8].copy_from_slice(&u32::from(pending).to_le_bytes());
+				(5, flags, payload)
+			}
 		};
 		let mut output = [0_u8; MIXTURE_COMMAND_RESPONSE_LEN];
 		output[0..4].copy_from_slice(&kind.to_le_bytes());
 		output[4..8].copy_from_slice(&value.to_le_bytes());
-		output[8..16].copy_from_slice(&scalars[0].encode()?);
-		output[16..24].copy_from_slice(&scalars[1].encode()?);
+		output[8..24].copy_from_slice(&payload);
 		Ok(output)
 	}
 
@@ -1876,10 +1998,24 @@ impl MixtureCommandResponse {
 			ScalarValue::decode(&input[16..24])?,
 		];
 		match kind {
-			1 => Ok(Self::Applied { updated: value }),
-			2 => Ok(Self::Scalar(scalars[0])),
-			3 => Ok(Self::Scalars(scalars)),
-			4 => Ok(Self::Boolean(decode_boolean(value)?)),
+			1 if input[8..24].iter().all(|byte| *byte == 0) => Ok(Self::Applied { updated: value }),
+			2 if value == 0 && input[16..24].iter().all(|byte| *byte == 0) => {
+				Ok(Self::Scalar(scalars[0]))
+			}
+			3 if value == 0 => Ok(Self::Scalars(scalars)),
+			4 if input[8..24].iter().all(|byte| *byte == 0) => {
+				Ok(Self::Boolean(decode_boolean(value)?))
+			}
+			5 => {
+				if value & !REACTION_FLAGS != 0 || input[16..24].iter().any(|byte| *byte != 0) {
+					return Err(ProtocolError::InvalidReactionFlags(value));
+				}
+				Ok(Self::ReactionProgress {
+					flags: value,
+					work_items: read_u32(input, 8),
+					pending: decode_boolean(read_u32(input, 12))?,
+				})
+			}
 			actual => Err(ProtocolError::UnknownMixtureCommandResponse(actual)),
 		}
 	}
@@ -2126,6 +2262,7 @@ pub enum ProtocolError {
 	ReservedContinuationField(u32),
 	InvalidContinuationId,
 	InvalidContinuationDeadline,
+	InvalidReactionFlags(u32),
 	UnknownMixtureCommandResponse(u32),
 	UnknownMixtureSnapshotFlags(u32),
 	ReservedMixtureSnapshotField(u32),

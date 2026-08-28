@@ -362,6 +362,18 @@ pub struct ReactionContinuationToken {
 	pub generation: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReactionProgress {
+	pub flags: u32,
+	pub work_items: u32,
+	pub pending: bool,
+}
+
+pub const REACTION_REACTING: u32 = 1 << 0;
+pub const REACTION_STOP: u32 = 1 << 1;
+pub const REACTION_VOLATILE: u32 = 1 << 2;
+const REACTION_FLAGS: u32 = REACTION_REACTING | REACTION_STOP | REACTION_VOLATILE;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WorldEvent {
 	PressureDifference {
@@ -378,14 +390,15 @@ pub enum WorldEvent {
 		target: TurfHandle,
 	},
 	RunDmReaction {
-		turf: TurfHandle,
+		turf: Option<TurfHandle>,
 		mixture: MixtureHandle,
+		target: crate::metadata::GameplayHandle,
 		reaction: crate::metadata::ReactionId,
 		continuation: ReactionContinuationToken,
 	},
 	ReactionFinished {
-		turf: TurfHandle,
 		mixture: MixtureHandle,
+		target: crate::metadata::GameplayHandle,
 		reaction: crate::metadata::ReactionId,
 		kind: crate::metadata::NativeReactionKind,
 		values: [f32; 4],
@@ -469,6 +482,7 @@ pub enum WorldError {
 		current: u32,
 	},
 	ReactionContinuationCapacityExceeded,
+	InvalidReactionResult(u32),
 	InvalidConductivity,
 	InvalidEqualizeHardTurfLimit,
 	InvalidSecondsPerTick,
@@ -513,8 +527,9 @@ pub struct DogmosWorld {
 
 #[derive(Clone)]
 struct ReactionContinuation {
-	turf: TurfHandle,
+	turf: Option<TurfHandle>,
 	mixture: MixtureHandle,
+	target: crate::metadata::GameplayHandle,
 	next_reaction_index: u32,
 }
 
@@ -533,6 +548,7 @@ struct ReactionSequence {
 	mixture: MixtureRecord,
 	events: Vec<WorldEvent>,
 	pending: Option<PendingDmReaction>,
+	flags: u32,
 	work_items: u32,
 	native_updates: u32,
 }
@@ -1947,7 +1963,7 @@ impl DogmosWorld {
 			if should_cancel() {
 				return Err(WorldError::Cancelled);
 			}
-			let sequence = self.evaluate_reaction_sequence(turf, mixture, 0)?;
+			let sequence = self.evaluate_reaction_sequence(turf.into(), mixture, 0, 0)?;
 			work_items = work_items
 				.checked_add(sequence.work_items)
 				.ok_or_else(|| WorldError::State("reaction work count exceeds u32".into()))?;
@@ -1976,13 +1992,15 @@ impl DogmosWorld {
 		}
 		let continuation_event = if let Some((turf, mixture, pending)) = pending {
 			let token = self.allocate_continuation(ReactionContinuation {
-				turf,
+				turf: Some(turf),
 				mixture,
+				target: turf.into(),
 				next_reaction_index: pending.next_reaction_index,
 			})?;
 			Some(WorldEvent::RunDmReaction {
-				turf,
+				turf: Some(turf),
 				mixture,
+				target: turf.into(),
 				reaction: pending.reaction,
 				continuation: token,
 			})
@@ -2003,9 +2021,10 @@ impl DogmosWorld {
 
 	fn evaluate_reaction_sequence(
 		&self,
-		turf: TurfHandle,
+		target: crate::metadata::GameplayHandle,
 		mixture_handle: MixtureHandle,
 		start_index: u32,
+		initial_flags: u32,
 	) -> Result<ReactionSequence, WorldError> {
 		let gases = self
 			.gas_registry
@@ -2019,11 +2038,13 @@ impl DogmosWorld {
 		let mut events = Vec::new();
 		let mut work_items = 0_u32;
 		let mut native_updates = 0_u32;
+		let mut flags = initial_flags;
 		if mixture.immutable {
 			return Ok(ReactionSequence {
 				mixture,
 				events,
 				pending: None,
+				flags,
 				work_items,
 				native_updates,
 			});
@@ -2060,9 +2081,10 @@ impl DogmosWorld {
 					native_updates = native_updates.checked_add(1).ok_or_else(|| {
 						WorldError::State("native reaction count exceeds u32".into())
 					})?;
+					flags |= REACTION_REACTING | REACTION_VOLATILE;
 					events.push(WorldEvent::ReactionFinished {
-						turf,
 						mixture: mixture_handle,
+						target,
 						reaction: *reaction_id,
 						kind,
 						values: result.values,
@@ -2084,6 +2106,7 @@ impl DogmosWorld {
 								WorldError::State("reaction index exceeds u32".into())
 							})?,
 						}),
+						flags,
 						work_items,
 						native_updates,
 					});
@@ -2097,9 +2120,74 @@ impl DogmosWorld {
 			mixture,
 			events,
 			pending: None,
+			flags,
 			work_items,
 			native_updates,
 		})
+	}
+
+	pub fn react_mixture_with_event_limit(
+		&mut self,
+		mixture: MixtureHandle,
+		target: crate::metadata::GameplayHandle,
+		event_limit: u32,
+	) -> Result<ReactionProgress, WorldError> {
+		let sequence = self.evaluate_reaction_sequence(target, mixture, 0, 0)?;
+		let requested_events = self
+			.events
+			.len()
+			.saturating_add(sequence.events.len())
+			.saturating_add(usize::from(sequence.pending.is_some()));
+		let event_capacity = self.max_events.min(event_limit);
+		if requested_events > event_capacity as usize {
+			return Err(WorldError::EventCapacityExceeded {
+				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
+				capacity: event_capacity,
+			});
+		}
+		let continuation_event = if let Some(pending) = &sequence.pending {
+			let token = self.allocate_continuation(ReactionContinuation {
+				turf: None,
+				mixture,
+				target,
+				next_reaction_index: pending.next_reaction_index,
+			})?;
+			Some(WorldEvent::RunDmReaction {
+				turf: None,
+				mixture,
+				target,
+				reaction: pending.reaction,
+				continuation: token,
+			})
+		} else {
+			None
+		};
+		if sequence.native_updates > 0 {
+			let current = self.require_handle_mut(mixture)?;
+			let mut updated = sequence.mixture;
+			updated.revision = current.revision + 1;
+			*current = updated;
+		}
+		let progress = ReactionProgress {
+			flags: sequence.flags,
+			work_items: sequence.work_items,
+			pending: continuation_event.is_some(),
+		};
+		self.events.extend(sequence.events);
+		if let Some(event) = continuation_event {
+			self.events.push(event);
+		}
+		Ok(progress)
+	}
+
+	pub fn resume_reaction_with_result_and_event_limit(
+		&mut self,
+		token: ReactionContinuationToken,
+		reaction_result: u32,
+		event_limit: u32,
+	) -> Result<ReactionProgress, WorldError> {
+		self.resume_reaction_inner(token, reaction_result, event_limit)
+			.map(|(progress, _)| progress)
 	}
 
 	pub fn resume_reaction_with_event_limit(
@@ -2107,15 +2195,43 @@ impl DogmosWorld {
 		token: ReactionContinuationToken,
 		event_limit: u32,
 	) -> Result<u32, WorldError> {
+		self.resume_reaction_inner(token, 0, event_limit)
+			.map(|(_, native_updates)| native_updates)
+	}
+
+	fn resume_reaction_inner(
+		&mut self,
+		token: ReactionContinuationToken,
+		reaction_result: u32,
+		event_limit: u32,
+	) -> Result<(ReactionProgress, u32), WorldError> {
+		if reaction_result & !REACTION_FLAGS != 0 {
+			return Err(WorldError::InvalidReactionResult(reaction_result));
+		}
 		let continuation = self.require_continuation(token)?.clone();
-		let turf = self.require_turf_handle(continuation.turf)?;
-		if turf.mixture != Some(continuation.mixture) {
-			return Err(WorldError::TurfMissingMixture(continuation.turf));
+		self.require_handle(continuation.mixture)?;
+		if let Some(turf_handle) = continuation.turf {
+			let turf = self.require_turf_handle(turf_handle)?;
+			if turf.mixture != Some(continuation.mixture) {
+				return Err(WorldError::TurfMissingMixture(turf_handle));
+			}
+		}
+		if reaction_result & REACTION_STOP != 0 {
+			self.complete_continuation(token)?;
+			return Ok((
+				ReactionProgress {
+					flags: reaction_result,
+					work_items: 0,
+					pending: false,
+				},
+				0,
+			));
 		}
 		let sequence = self.evaluate_reaction_sequence(
-			continuation.turf,
+			continuation.target,
 			continuation.mixture,
 			continuation.next_reaction_index,
+			reaction_result,
 		)?;
 		let requested_events = self
 			.events
@@ -2135,12 +2251,14 @@ impl DogmosWorld {
 				ReactionContinuation {
 					turf: continuation.turf,
 					mixture: continuation.mixture,
+					target: continuation.target,
 					next_reaction_index: pending.next_reaction_index,
 				},
 			)?;
 			Some(WorldEvent::RunDmReaction {
 				turf: continuation.turf,
 				mixture: continuation.mixture,
+				target: continuation.target,
 				reaction: pending.reaction,
 				continuation: next_token,
 			})
@@ -2158,7 +2276,14 @@ impl DogmosWorld {
 		if let Some(event) = continuation_event {
 			self.events.push(event);
 		}
-		Ok(sequence.native_updates)
+		Ok((
+			ReactionProgress {
+				flags: sequence.flags,
+				work_items: sequence.work_items,
+				pending: continuation_event.is_some(),
+			},
+			sequence.native_updates,
+		))
 	}
 
 	fn allocate_continuation(
@@ -2253,11 +2378,9 @@ impl DogmosWorld {
 
 	fn invalidate_continuations_for_turf_slot(&mut self, turf_slot: u32) {
 		for (slot, entry) in self.continuations.iter_mut().enumerate() {
-			if entry
-				.continuation
-				.as_ref()
-				.is_some_and(|continuation| continuation.turf.slot == turf_slot)
-			{
+			if entry.continuation.as_ref().is_some_and(|continuation| {
+				continuation.turf.is_some_and(|turf| turf.slot == turf_slot)
+			}) {
 				entry.continuation = None;
 				self.free_continuations.push(slot as u32);
 			}

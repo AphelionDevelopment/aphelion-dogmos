@@ -18,6 +18,7 @@ fn generated_bindings_include_the_production_mixture_command_family() {
 		"/proc/dogmos_turf_adjacency_batch",
 		"/proc/dogmos_turf_heat_adjacency_batch",
 		"/proc/dogmos_turf_heat_batch",
+		"/proc/dogmos_turf_heat_snapshot",
 		"/proc/dogmos_turf_lifecycle_batch",
 	] {
 		assert!(

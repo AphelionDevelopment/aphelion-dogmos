@@ -2,14 +2,16 @@
 
 use dogmos_byond::{ClientError, DogmosClient};
 use dogmos_protocol::{
-	encode_adjacency_batch, encode_lifecycle_batch, encode_mixture_state_batch, read_frame_into,
-	write_frame, AdjacencyMutation, BuildIdentity, CallbackBatchHeader, CallbackBatchRequest,
-	CallbackEvent, CapacityLimits, HandshakePayload, LifecycleAction, LifecycleMutation,
-	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolHeader,
-	ScalarValue, ServiceErrorCode, ServiceTelemetry, SimulationStage, SimulationStageRequest,
-	WireHandle, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION,
-	DOGMOS_PROTOCOL_VERSION, FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS,
-	MIXTURE_SNAPSHOT_LEN, SERVICE_TELEMETRY_LEN,
+	encode_adjacency_batch, encode_lifecycle_batch, encode_mixture_state_batch,
+	encode_turf_heat_batch, encode_turf_lifecycle_batch, read_frame_into, write_frame,
+	AdjacencyMutation, BuildIdentity, CallbackBatchHeader, CallbackBatchRequest, CallbackEvent,
+	CapacityLimits, HandshakePayload, LifecycleAction, LifecycleMutation, MixtureSnapshot,
+	MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolHeader, ScalarValue,
+	ServiceErrorCode, ServiceTelemetry, SimulationStage, SimulationStageRequest, TurfHeatMutation,
+	TurfHeatSnapshot, TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireHandle,
+	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
+	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
+	SERVICE_TELEMETRY_LEN, TURF_HEAT_SNAPSHOT_LEN,
 };
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, Stream};
 use std::{
@@ -363,6 +365,66 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 	assert_eq!(snapshot.gas_count, 32);
 	assert_eq!(snapshot.revision, 1);
 	assert_eq!(snapshot.gases[0], ScalarValue(8.0));
+
+	let turf = WireHandle {
+		slot: 7,
+		generation: 1,
+	};
+	let mut turf_lifecycle_request = Vec::new();
+	encode_turf_lifecycle_batch(
+		&[TurfLifecycleMutation {
+			action: LifecycleAction::Register,
+			turf,
+			mixture: Some(snapshot_request.handle),
+		}],
+		&mut turf_lifecycle_request,
+	)
+	.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::TurfLifecycleBatch,
+			&turf_lifecycle_request,
+			&mut processed,
+		)
+		.unwrap();
+	let mut turf_heat_request = Vec::new();
+	encode_turf_heat_batch(
+		&[TurfHeatMutation {
+			turf,
+			state: Some(TurfHeatState {
+				temperature: ScalarValue(700.0),
+				thermal_conductivity: ScalarValue(0.4),
+				heat_capacity: ScalarValue(2500.0),
+				adjacent_to_space: true,
+			}),
+		}],
+		&mut turf_heat_request,
+	)
+	.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::TurfHeatBatch,
+			&turf_heat_request,
+			&mut processed,
+		)
+		.unwrap();
+	let mut turf_heat_snapshot = [0_u8; TURF_HEAT_SNAPSHOT_LEN];
+	client
+		.round_trip_into(
+			OperationKind::TurfHeatSnapshot,
+			&TurfHeatSnapshotRequest { turf }.encode(),
+			&mut turf_heat_snapshot,
+		)
+		.unwrap();
+	assert_eq!(
+		TurfHeatSnapshot::decode(&turf_heat_snapshot).unwrap().state,
+		Some(TurfHeatState {
+			temperature: ScalarValue(700.0),
+			thermal_conductivity: ScalarValue(f64::from(0.4_f32)),
+			heat_capacity: ScalarValue(2500.0),
+			adjacent_to_space: true,
+		})
+	);
 
 	let adjacency = (0..64)
 		.map(|slot| AdjacencyMutation {

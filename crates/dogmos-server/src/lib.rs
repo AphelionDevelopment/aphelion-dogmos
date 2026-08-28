@@ -6,9 +6,10 @@ use dogmos_protocol::{
 	decode_mixture_state_batch, decode_reaction_metadata_batch, decode_turf_adjacency_batch,
 	decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
 	read_frame_into, write_frame, CallbackBatchRequest, ContinuationCommandRequest,
-	ContinuationToken, HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest,
-	OperationKind, ProtocolHeader, ServiceErrorCode, SimulationStageRequest,
-	SimulationStageResponse, FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
+	ContinuationResumeRequest, ContinuationToken, HandshakePayload, MixtureCommandRequest,
+	MixtureSnapshotRequest, OperationKind, ProtocolHeader, ServiceErrorCode,
+	SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR,
+	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -325,6 +326,22 @@ fn handle_primary(
 				let response = snapshot.encode()?;
 				write_response(&mut stream, request, &response)?;
 			}
+			OperationKind::TurfHeatSnapshot => {
+				let Ok(snapshot_request) = TurfHeatSnapshotRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let snapshot = match service_state.turf_heat_snapshot(snapshot_request.turf) {
+					Ok(snapshot) => snapshot,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &snapshot.encode()?)?;
+			}
 			OperationKind::MixtureCommand => {
 				let Ok(command) = MixtureCommandRequest::decode(&payload[..payload_len]) else {
 					service_state.record_protocol_error();
@@ -397,12 +414,14 @@ fn handle_primary(
 				write_response(&mut stream, request, &response.encode()?)?;
 			}
 			OperationKind::ContinuationResume => {
-				let Ok(token) = ContinuationToken::decode(&payload[..payload_len]) else {
+				let Ok(resume) = ContinuationResumeRequest::decode(&payload[..payload_len]) else {
 					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
-				let response = match service_state.resume_continuation(token) {
+				let response = match service_state
+					.resume_continuation_with_result(resume.token, resume.reaction_result)
+				{
 					Ok(response) => response,
 					Err(error) => {
 						write_error_response(&mut stream, request, service_error_code(&error))?;
