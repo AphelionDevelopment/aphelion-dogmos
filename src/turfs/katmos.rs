@@ -795,6 +795,88 @@ fn finalize_eq_zone(
 	(!pressures.is_empty()).then_some(pressures)
 }
 
+#[cfg(all(test, feature = "superconductivity"))]
+#[derive(Debug, PartialEq)]
+pub(crate) struct LegacyStageTrace {
+	pub work_items: u32,
+	pub left_value: f32,
+	pub right_value: f32,
+	pub pressure_events: Vec<(f32, TurfID, u32, TurfID, u32)>,
+}
+
+#[cfg(all(test, feature = "superconductivity"))]
+pub(crate) fn capture_two_turf_equalize_trace() -> LegacyStageTrace {
+	use crate::gas::{
+		install_mixtures_for_test, shut_down_gases,
+		types::{destroy_gas_statics, register_gas_manually, set_gas_statics_manually},
+		GAS_TEST_LOCK,
+	};
+
+	struct LegacyGasState;
+
+	impl Drop for LegacyGasState {
+		fn drop(&mut self) {
+			shut_down_gases();
+			destroy_gas_statics();
+		}
+	}
+
+	let _lock = GAS_TEST_LOCK.lock().unwrap();
+	set_gas_statics_manually();
+	register_gas_manually("o2", 20.0);
+	let _gas_state = LegacyGasState;
+
+	let mut left_gas = Mixture::from_vol(crate::constants::CELL_VOLUME);
+	left_gas.set_moles(0, 100.0).unwrap();
+	let right_gas = Mixture::from_vol(crate::constants::CELL_VOLUME);
+	install_mixtures_for_test(vec![left_gas, right_gas]);
+
+	let mut arena = TurfGases {
+		graph: StableDiGraph::with_capacity(0, 0),
+		map: IndexMap::with_hasher(FxBuildHasher),
+	};
+	arena.insert_turf(TurfMixture {
+		mix: 0,
+		id: 10,
+		generation: 1,
+		flags: SimulationFlags::SIMULATION_ALL,
+		planetary_atmos: None,
+		vis_hash: AtomicU64::new(0),
+	});
+	arena.insert_turf(TurfMixture {
+		mix: 1,
+		id: 11,
+		generation: 1,
+		flags: SimulationFlags::SIMULATION_ALL,
+		planetary_atmos: None,
+		vis_hash: AtomicU64::new(0),
+	});
+	let left = arena.get_id(10).unwrap();
+	let right = arena.get_id(11).unwrap();
+	arena.graph.add_edge(left, right, AdjacentFlags::empty());
+	arena.graph.add_edge(right, left, AdjacentFlags::empty());
+
+	let mut zone = DiGraphMap::new();
+	zone.add_edge(left, right, Cell::new(0.0));
+	zone.add_edge(right, left, Cell::new(0.0));
+	let work_items = zone.node_count() as u32;
+	let zone = process_zone(zone, 50.0, &arena, None);
+	let pressure_events = finalize_eq_zone(&arena, zone).unwrap_or_default();
+	let (left_value, right_value) = GasArena::with_all_mixtures(|mixtures| {
+		(
+			mixtures[0].read().total_moles(),
+			mixtures[1].read().total_moles(),
+		)
+	});
+
+	LegacyStageTrace {
+		work_items,
+		left_value,
+		right_value,
+		pressure_events,
+	}
+}
+
 fn send_pressure_differences(pressures: Vec<PressureDifference>) {
 	const PRESSURE_CALLBACK_BATCH_SIZE: usize = 256;
 	let mut pressures = pressures;

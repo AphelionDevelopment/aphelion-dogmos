@@ -4,6 +4,8 @@ pub mod katmos;
 pub mod processing;
 #[cfg(feature = "superconductivity")]
 mod superconduct;
+#[cfg(all(test, feature = "superconductivity", feature = "katmos"))]
+pub(crate) use superconduct::capture_two_turf_heat_trace;
 
 use crate::{
 	constants::*,

@@ -2,18 +2,20 @@
 
 use dogmos_byond::{ClientError, DogmosClient};
 use dogmos_protocol::{
-	encode_adjacency_batch, encode_lifecycle_batch, encode_mixture_state_batch, AdjacencyMutation,
-	BuildIdentity, CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CapacityLimits,
-	HandshakePayload, LifecycleAction, LifecycleMutation, MixtureSnapshot, MixtureSnapshotRequest,
-	MixtureStateMutation, OperationKind, ScalarValue, ServiceErrorCode, SimulationStage,
-	SimulationStageRequest, WireHandle, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN,
-	DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS,
-	MIXTURE_SNAPSHOT_LEN,
+	encode_adjacency_batch, encode_lifecycle_batch, encode_mixture_state_batch, read_frame_into,
+	write_frame, AdjacencyMutation, BuildIdentity, CallbackBatchHeader, CallbackBatchRequest,
+	CallbackEvent, CapacityLimits, HandshakePayload, LifecycleAction, LifecycleMutation,
+	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolHeader,
+	ScalarValue, ServiceErrorCode, ServiceTelemetry, SimulationStage, SimulationStageRequest,
+	WireHandle, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION,
+	DOGMOS_PROTOCOL_VERSION, FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS,
+	MIXTURE_SNAPSHOT_LEN, SERVICE_TELEMETRY_LEN,
 };
+use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, Stream};
 use std::{
-	io::Write,
+	io::{self, Write},
 	process::{Child, Command, Stdio},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct ChildGuard(Child);
@@ -39,13 +41,133 @@ fn handshake(service_path: &std::path::Path) -> HandshakePayload {
 			max_control_payload: MAX_CONTROL_PAYLOAD,
 			max_batch_operations: 4096,
 			max_callback_events: 1024,
-			reserved: 0,
+			max_pending_continuations: 1024,
 			max_world_bytes: 8 * 1024 * 1024 * 1024,
 		},
 		process_id: std::process::id(),
 		world_generation: 1,
 		world_nonce: 0x1234_5678_90ab_cdef,
 	}
+}
+
+fn connect_raw(endpoint: &str, timeout: Duration) -> Stream {
+	let name = endpoint.to_ns_name::<GenericNamespaced>().unwrap();
+	let deadline = Instant::now() + timeout;
+	loop {
+		match ConnectOptions::new().name(name.clone()).connect_sync() {
+			Ok(stream) => return stream,
+			Err(error)
+				if Instant::now() < deadline
+					&& matches!(
+						error.kind(),
+						io::ErrorKind::NotFound
+							| io::ErrorKind::ConnectionRefused
+							| io::ErrorKind::WouldBlock
+					) =>
+			{
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			Err(error) => panic!("failed to connect to dogmosd: {error}"),
+		}
+	}
+}
+
+fn raw_round_trip(
+	stream: &mut Stream,
+	expected: HandshakePayload,
+	operation: OperationKind,
+	request_id: u64,
+	payload: &[u8],
+) -> (ProtocolHeader, Vec<u8>) {
+	let request = ProtocolHeader::request(
+		operation,
+		request_id,
+		expected.world_generation,
+		expected.world_nonce,
+		payload.len() as u32,
+		0,
+	);
+	write_frame(stream, request, payload).unwrap();
+	let mut response_payload = vec![0_u8; MAX_CONTROL_PAYLOAD as usize];
+	let (response, response_len) = read_frame_into(stream, &mut response_payload).unwrap();
+	response.validate_response_to(&request).unwrap();
+	response_payload.truncate(response_len);
+	(response, response_payload)
+}
+
+#[test]
+fn service_rejects_duplicate_and_decreasing_request_ids_without_losing_the_session() {
+	let unique = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_nanos();
+	let endpoint = format!("dogmos-sequence-{pid}-{unique}", pid = std::process::id());
+	let service_path = std::path::Path::new(env!("CARGO_BIN_EXE_dogmosd"));
+	let expected = handshake(service_path);
+	let mut service = ChildGuard(
+		Command::new(service_path)
+			.arg("--echo-server")
+			.arg(&endpoint)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.stderr(Stdio::inherit())
+			.spawn()
+			.unwrap(),
+	);
+	service
+		.0
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(&expected.encode())
+		.unwrap();
+	let mut stream = connect_raw(&endpoint, Duration::from_secs(5));
+
+	let (response, payload) = raw_round_trip(
+		&mut stream,
+		expected,
+		OperationKind::Handshake,
+		10,
+		&expected.encode(),
+	);
+	assert_eq!(response.flags & FLAG_ERROR, 0);
+	assert_eq!(payload.len(), HANDSHAKE_PAYLOAD_LEN);
+
+	let (response, payload) =
+		raw_round_trip(&mut stream, expected, OperationKind::Echo, 11, b"first");
+	assert_eq!(response.flags & FLAG_ERROR, 0);
+	assert_eq!(payload, b"first");
+
+	for rejected_id in [11, 10, 1] {
+		let (response, payload) = raw_round_trip(
+			&mut stream,
+			expected,
+			OperationKind::Echo,
+			rejected_id,
+			b"replay",
+		);
+		assert_ne!(response.flags & FLAG_ERROR, 0);
+		assert_eq!(
+			ServiceErrorCode::decode(&payload).unwrap(),
+			ServiceErrorCode::InvalidRequest
+		);
+	}
+
+	let (response, payload) = raw_round_trip(
+		&mut stream,
+		expected,
+		OperationKind::Echo,
+		12,
+		b"still live",
+	);
+	assert_eq!(response.flags & FLAG_ERROR, 0);
+	assert_eq!(payload, b"still live");
+
+	let (response, payload) =
+		raw_round_trip(&mut stream, expected, OperationKind::Shutdown, 13, &[]);
+	assert_eq!(response.flags & FLAG_ERROR, 0);
+	assert!(payload.is_empty());
+	assert!(service.0.wait().unwrap().success());
 }
 
 #[test]
@@ -334,6 +456,25 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 		Err(ClientError::Server(ServiceErrorCode::InvalidRequest))
 	));
 	assert_eq!(client.echo(b"still connected").unwrap(), b"still connected");
+	let mut telemetry_bytes = [0_u8; SERVICE_TELEMETRY_LEN];
+	assert_eq!(
+		client
+			.round_trip_into(OperationKind::ServiceTelemetry, &[], &mut telemetry_bytes)
+			.unwrap(),
+		SERVICE_TELEMETRY_LEN
+	);
+	let telemetry = ServiceTelemetry::decode(&telemetry_bytes).unwrap();
+	assert_eq!(telemetry.callback_depth, 960);
+	assert_eq!(telemetry.callback_capacity, 1024);
+	assert_eq!(telemetry.callback_high_water, 1024);
+	assert_eq!(telemetry.callback_enqueued, 1024);
+	assert_eq!(telemetry.callback_drained, 64);
+	assert_eq!(telemetry.callback_rejected, 1);
+	assert_eq!(telemetry.callback_enqueued_by_kind[0], 1024);
+	assert_eq!(telemetry.callback_drained_by_kind[0], 64);
+	assert_eq!(telemetry.callback_rejected_by_kind[0], 1);
+	assert_eq!(telemetry.request_timeouts, 1);
+	assert_eq!(telemetry.protocol_errors, 1);
 
 	assert!(matches!(
 		DogmosClient::connect(&endpoint, expected, Duration::from_secs(1)),
@@ -343,6 +484,57 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 	client.shutdown().unwrap();
 	let status = service.0.wait().unwrap();
 	assert!(status.success());
+}
+
+#[test]
+fn service_exits_when_the_authenticated_client_disconnects() {
+	let unique = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_nanos();
+	let endpoint = format!("dogmos-disconnect-{pid}-{unique}", pid = std::process::id());
+	let service_path = std::path::Path::new(env!("CARGO_BIN_EXE_dogmosd"));
+	let expected = handshake(service_path);
+	let mut service = ChildGuard(
+		Command::new(service_path)
+			.arg("--echo-server")
+			.arg(&endpoint)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()
+			.unwrap(),
+	);
+	service
+		.0
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(&expected.encode())
+		.unwrap();
+	let mut stream = connect_raw(&endpoint, Duration::from_secs(5));
+	let (response, _) = raw_round_trip(
+		&mut stream,
+		expected,
+		OperationKind::Handshake,
+		1,
+		&expected.encode(),
+	);
+	assert_eq!(response.flags & FLAG_ERROR, 0);
+	drop(stream);
+
+	let deadline = Instant::now() + Duration::from_secs(5);
+	let status = loop {
+		if let Some(status) = service.0.try_wait().unwrap() {
+			break status;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"dogmosd survived its authenticated client"
+		);
+		std::thread::sleep(Duration::from_millis(5));
+	};
+	assert!(!status.success());
 }
 
 #[test]

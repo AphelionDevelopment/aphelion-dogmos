@@ -3,8 +3,9 @@ use dogmos_protocol::{
 	encode_mixture_state_batch, AdjacencyMutation, LifecycleAction, LifecycleMutation,
 	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolError,
 	ScalarValue, SimulationStage, SimulationStageRequest, SimulationStageResponse, WireHandle,
-	ADJACENCY_MUTATION_LEN, LIFECYCLE_MUTATION_LEN, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
-	MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	ADJACENCY_MUTATION_LEN, DOGMOS_PROTOCOL_VERSION, LIFECYCLE_MUTATION_LEN, MAX_GAS_SLOTS,
+	MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN,
+	SIMULATION_STAGE_RESPONSE_LEN,
 };
 
 fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -33,11 +34,20 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 #[test]
 fn compound_operation_ids_are_stable() {
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 5);
 	assert_eq!(OperationKind::MixtureSnapshot as u16, 18);
 	assert_eq!(OperationKind::MixtureLifecycleBatch as u16, 19);
 	assert_eq!(OperationKind::AdjacencyBatch as u16, 20);
 	assert_eq!(OperationKind::SimulationStage as u16, 21);
 	assert_eq!(OperationKind::MixtureStateBatch as u16, 23);
+	assert_eq!(OperationKind::TurfLifecycleBatch as u16, 24);
+	assert_eq!(OperationKind::TurfAdjacencyBatch as u16, 25);
+	assert_eq!(OperationKind::TurfHeatBatch as u16, 26);
+	assert_eq!(OperationKind::TurfHeatAdjacencyBatch as u16, 27);
+	assert_eq!(OperationKind::MixtureCommand as u16, 28);
+	assert_eq!(OperationKind::GasMetadataInstall as u16, 29);
+	assert_eq!(OperationKind::ReactionMetadataInstall as u16, 30);
+	assert_eq!(OperationKind::MixtureAdjustMultiple as u16, 31);
 	assert_eq!(
 		OperationKind::try_from(18),
 		Ok(OperationKind::MixtureSnapshot)
@@ -76,7 +86,7 @@ fn mixture_state_batch_round_trips_exact_fixed_records() {
 }
 
 #[test]
-fn mixture_state_batch_matches_complete_protocol_v4_golden_bytes() {
+fn mixture_state_batch_matches_complete_protocol_v5_golden_bytes() {
 	const GOLDEN_HEX: &str = concat!(
 		"01000000070000000b0000000400000000000000000000000000104000000000",
 		"00002040000000000000f03f0000000000000000000000000000000000000000",
@@ -161,12 +171,16 @@ fn mixture_snapshot_has_a_fixed_cross_bitness_layout() {
 		gas_count: 2,
 		temperature: ScalarValue(293.15),
 		volume: ScalarValue(2500.0),
+		minimum_heat_capacity: ScalarValue(80.0),
+		immutable: true,
 		gases,
 	};
 	let bytes = snapshot.encode().unwrap();
 	assert_eq!(bytes.len(), MIXTURE_SNAPSHOT_LEN);
 	assert_eq!(&bytes[0..4], &0x1122_3344_u32.to_le_bytes());
 	assert_eq!(&bytes[4..8], &2_u32.to_le_bytes());
+	assert_eq!(&bytes[24..32], &80.0_f64.to_le_bytes());
+	assert_eq!(&bytes[32..36], &1_u32.to_le_bytes());
 	assert_eq!(MixtureSnapshot::decode(&bytes), Ok(snapshot));
 }
 
@@ -183,6 +197,12 @@ fn mixture_snapshot_rejects_invalid_gas_counts_and_non_finite_values() {
 	assert_eq!(
 		MixtureSnapshot::decode(&bytes),
 		Err(ProtocolError::NonFiniteScalar)
+	);
+	bytes[8..16].copy_from_slice(&293.15_f64.to_le_bytes());
+	bytes[32..36].copy_from_slice(&2_u32.to_le_bytes());
+	assert_eq!(
+		MixtureSnapshot::decode(&bytes),
+		Err(ProtocolError::UnknownMixtureSnapshotFlags(2))
 	);
 }
 
@@ -223,6 +243,12 @@ fn lifecycle_batch_rejects_unknown_actions_and_capacity_overruns() {
 		decode_lifecycle_batch(&bytes, 1),
 		Err(ProtocolError::OperationCountExceeded { .. })
 	));
+	bytes.truncate(4);
+	bytes[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+	assert!(matches!(
+		decode_lifecycle_batch(&bytes, u32::MAX),
+		Err(ProtocolError::InvalidPayloadLength { .. })
+	));
 }
 
 #[test]
@@ -258,6 +284,17 @@ fn simulation_stage_request_is_fixed_width_and_validated() {
 		SimulationStageRequest::decode(&unknown),
 		Err(ProtocolError::UnknownSimulationStage(99))
 	);
+}
+
+#[test]
+fn reaction_stage_has_a_stable_wire_discriminant() {
+	let request = SimulationStageRequest {
+		stage: SimulationStage::ProcessReactions,
+		seconds_per_tick: ScalarValue(0.5),
+	};
+	let bytes = request.encode().unwrap();
+	assert_eq!(&bytes[0..4], &5_u32.to_le_bytes());
+	assert_eq!(SimulationStageRequest::decode(&bytes), Ok(request));
 }
 
 #[test]

@@ -22,6 +22,9 @@ static NEXT_GAS_IDS: RwLock<Option<Vec<usize>>> = const_rwlock(None);
 static ACTIVE_MIXTURE_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static MIXTURE_SLOT_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+pub(crate) static GAS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GasRuntimeMetrics {
 	pub arena_len: usize,
@@ -88,6 +91,15 @@ pub fn shut_down_gases() {
 	if let Some(next_gas_ids) = NEXT_GAS_IDS.write().as_mut() {
 		next_gas_ids.clear();
 	}
+}
+
+#[cfg(all(test, feature = "katmos", feature = "superconductivity"))]
+pub(crate) fn install_mixtures_for_test(mixtures: Vec<Mixture>) {
+	let active = mixtures.len();
+	*GAS_MIXTURES.write() = Some(mixtures.into_iter().map(RwLock::new).collect());
+	*NEXT_GAS_IDS.write() = Some(Vec::new());
+	ACTIVE_MIXTURE_SLOTS.store(active, Ordering::Relaxed);
+	MIXTURE_SLOT_HIGH_WATER.store(active, Ordering::Relaxed);
 }
 
 impl GasArena {
@@ -404,6 +416,7 @@ pub(crate) fn gas_runtime_metrics() -> GasRuntimeMetrics {
 mod tests {
 	use super::{
 		ensure_distinct_mixture_slots, gas_runtime_metrics, gas_slot_from_number, initialize_gases,
+		GAS_TEST_LOCK,
 	};
 
 	#[test]
@@ -423,6 +436,7 @@ mod tests {
 
 	#[test]
 	fn gas_runtime_metrics_report_source_layout_and_reserved_capacity() {
+		let _guard = GAS_TEST_LOCK.lock().unwrap();
 		initialize_gases();
 		let metrics = gas_runtime_metrics();
 		assert_eq!(metrics.mixture_bytes, 60);

@@ -4,6 +4,50 @@ use dogmos_protocol::{
 };
 
 #[test]
+fn operation_ids_are_complete_and_stable() {
+	let operations = [
+		OperationKind::Handshake,
+		OperationKind::Echo,
+		OperationKind::Shutdown,
+		OperationKind::ScalarGet,
+		OperationKind::ScalarSet,
+		OperationKind::Transfer,
+		OperationKind::GasVector,
+		OperationKind::AdjacencyUpdate,
+		OperationKind::Batch,
+		OperationKind::CallbackBatch,
+		OperationKind::AllocateDiagnostic,
+		OperationKind::MixtureSnapshot,
+		OperationKind::MixtureLifecycleBatch,
+		OperationKind::AdjacencyBatch,
+		OperationKind::SimulationStage,
+		OperationKind::DiagnosticCallbackEnqueue,
+		OperationKind::MixtureStateBatch,
+		OperationKind::TurfLifecycleBatch,
+		OperationKind::TurfAdjacencyBatch,
+		OperationKind::TurfHeatBatch,
+		OperationKind::TurfHeatAdjacencyBatch,
+		OperationKind::MixtureCommand,
+		OperationKind::GasMetadataInstall,
+		OperationKind::ReactionMetadataInstall,
+		OperationKind::MixtureAdjustMultiple,
+		OperationKind::ContinuationCommand,
+		OperationKind::ContinuationAdjustMultiple,
+		OperationKind::ContinuationResume,
+		OperationKind::ContinuationCancel,
+		OperationKind::ServiceTelemetry,
+	];
+	let expected = [
+		1_u16, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+		29, 30, 31, 32, 33, 34, 35, 36,
+	];
+	for (operation, expected) in operations.into_iter().zip(expected) {
+		assert_eq!(operation as u16, expected);
+		assert_eq!(OperationKind::try_from(expected), Ok(operation));
+	}
+}
+
+#[test]
 fn golden_header_bytes_are_architecture_independent() {
 	let header = ProtocolHeader::request(
 		OperationKind::Transfer,
@@ -14,7 +58,7 @@ fn golden_header_bytes_are_architecture_independent() {
 		0x8877_6655_4433_2211,
 	);
 	let expected = [
-		0x44, 0x47, 0x4d, 0x53, 0x04, 0x00, 0x30, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
+		0x44, 0x47, 0x4d, 0x53, 0x05, 0x00, 0x30, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
 		0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x44, 0x33, 0x22, 0x11, 0x00, 0x00,
 		0x00, 0x00, 0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x11, 0x22, 0x33, 0x44, 0x55,
 		0x66, 0x77, 0x88,
@@ -49,7 +93,7 @@ fn golden_handshake_bytes_are_architecture_independent() {
 			max_control_payload: 0x0008_0304,
 			max_batch_operations: 0x1112_1314,
 			max_callback_events: 0x0002_2324,
-			reserved: 0,
+			max_pending_continuations: 1024,
 			max_world_bytes: 0x3132_3334_3536_3738,
 		},
 		process_id: 0x4142_4344,
@@ -66,7 +110,7 @@ fn golden_handshake_bytes_are_architecture_independent() {
 	assert_eq!(&bytes[120..124], &[0x04, 0x03, 0x08, 0x00]);
 	assert_eq!(&bytes[124..128], &[0x14, 0x13, 0x12, 0x11]);
 	assert_eq!(&bytes[128..132], &[0x24, 0x23, 0x02, 0x00]);
-	assert_eq!(&bytes[132..136], &[0; 4]);
+	assert_eq!(&bytes[132..136], &1024_u32.to_le_bytes());
 	assert_eq!(
 		&bytes[136..144],
 		&[0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31]

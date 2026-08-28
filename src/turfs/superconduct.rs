@@ -513,6 +513,27 @@ fn record_heat_metrics(
 	telemetry.increment_metric(RuntimeMetric::HeatEdgesApplied, edges_applied);
 }
 
+#[cfg(all(test, feature = "katmos"))]
+pub(crate) fn capture_two_turf_heat_trace() -> super::katmos::LegacyStageTrace {
+	let mut temperatures = [1000.0, 300.0];
+	let conductivities = [0.05, 0.05];
+	let heat_capacities = [100.0, 200.0];
+	conduction_step(
+		&mut temperatures,
+		&conductivities,
+		&heat_capacities,
+		&[(0, 1)],
+		0.5,
+	)
+	.unwrap();
+	super::katmos::LegacyStageTrace {
+		work_items: 2,
+		left_value: temperatures[0],
+		right_value: temperatures[1],
+		pressure_events: Vec::new(),
+	}
+}
+
 #[cfg(test)]
 fn accumulate_heat_edge_deltas(
 	edges: &[(HeatNodeIndex, HeatNodeIndex)],

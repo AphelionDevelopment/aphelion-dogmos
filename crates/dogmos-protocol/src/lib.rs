@@ -1,28 +1,42 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
+mod continuation_wire;
+mod metadata_wire;
+mod telemetry_wire;
 mod transport;
 
+pub use continuation_wire::*;
+pub use metadata_wire::*;
+pub use telemetry_wire::*;
 pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 1;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 4;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 5;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 160;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
 pub const MAX_CALLBACK_EVENTS: u32 = 1024 * 1024;
 pub const MAX_GAS_SLOTS: usize = 32;
-pub const MIXTURE_SNAPSHOT_LEN: usize = 24 + MAX_GAS_SLOTS * 8;
+pub const MIXTURE_SNAPSHOT_LEN: usize = 40 + MAX_GAS_SLOTS * 8;
 pub const MIXTURE_STATE_MUTATION_LEN: usize = 32 + MAX_GAS_SLOTS * 8;
 pub const LIFECYCLE_MUTATION_LEN: usize = 12;
 pub const ADJACENCY_MUTATION_LEN: usize = 24;
+pub const TURF_LIFECYCLE_MUTATION_LEN: usize = 24;
+pub const TURF_ADJACENCY_MUTATION_LEN: usize = 24;
+pub const TURF_HEAT_MUTATION_LEN: usize = 40;
+pub const TURF_HEAT_ADJACENCY_MUTATION_LEN: usize = 24;
+pub const MIXTURE_COMMAND_REQUEST_LEN: usize = 56;
+pub const MIXTURE_COMMAND_RESPONSE_LEN: usize = 24;
+pub const MIXTURE_ADJUST_MULTIPLE_HEADER_LEN: usize = 12;
+pub const MIXTURE_ADJUSTMENT_LEN: usize = 16;
 pub const SIMULATION_STAGE_REQUEST_LEN: usize = 12;
 pub const SIMULATION_STAGE_RESPONSE_LEN: usize = 8;
 pub const CALLBACK_BATCH_REQUEST_LEN: usize = 4;
 pub const CALLBACK_BATCH_HEADER_LEN: usize = 24;
-pub const CALLBACK_EVENT_LEN: usize = 64;
+pub const CALLBACK_EVENT_LEN: usize = 88;
 pub const FLAG_RESPONSE: u16 = 1 << 0;
 pub const FLAG_ERROR: u16 = 1 << 1;
 const KNOWN_FLAGS: u16 = FLAG_RESPONSE | FLAG_ERROR;
@@ -47,6 +61,19 @@ pub enum OperationKind {
 	SimulationStage = 21,
 	DiagnosticCallbackEnqueue = 22,
 	MixtureStateBatch = 23,
+	TurfLifecycleBatch = 24,
+	TurfAdjacencyBatch = 25,
+	TurfHeatBatch = 26,
+	TurfHeatAdjacencyBatch = 27,
+	MixtureCommand = 28,
+	GasMetadataInstall = 29,
+	ReactionMetadataInstall = 30,
+	MixtureAdjustMultiple = 31,
+	ContinuationCommand = 32,
+	ContinuationAdjustMultiple = 33,
+	ContinuationResume = 34,
+	ContinuationCancel = 35,
+	ServiceTelemetry = 36,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +94,11 @@ pub enum ServiceErrorCode {
 	StateCapacityExceeded = 13,
 	AllocationFailed = 14,
 	InvalidGraph = 15,
+	UnknownContinuation = 16,
+	ContinuationExpired = 17,
+	ContinuationCapacityExceeded = 18,
+	ContinuationWorldMismatch = 19,
+	ContinuationTokenMismatch = 20,
 }
 
 impl ServiceErrorCode {
@@ -96,6 +128,11 @@ impl ServiceErrorCode {
 			13 => Ok(Self::StateCapacityExceeded),
 			14 => Ok(Self::AllocationFailed),
 			15 => Ok(Self::InvalidGraph),
+			16 => Ok(Self::UnknownContinuation),
+			17 => Ok(Self::ContinuationExpired),
+			18 => Ok(Self::ContinuationCapacityExceeded),
+			19 => Ok(Self::ContinuationWorldMismatch),
+			20 => Ok(Self::ContinuationTokenMismatch),
 			actual => Err(ProtocolError::UnknownServiceErrorCode(actual)),
 		}
 	}
@@ -123,6 +160,19 @@ impl TryFrom<u16> for OperationKind {
 			21 => Ok(Self::SimulationStage),
 			22 => Ok(Self::DiagnosticCallbackEnqueue),
 			23 => Ok(Self::MixtureStateBatch),
+			24 => Ok(Self::TurfLifecycleBatch),
+			25 => Ok(Self::TurfAdjacencyBatch),
+			26 => Ok(Self::TurfHeatBatch),
+			27 => Ok(Self::TurfHeatAdjacencyBatch),
+			28 => Ok(Self::MixtureCommand),
+			29 => Ok(Self::GasMetadataInstall),
+			30 => Ok(Self::ReactionMetadataInstall),
+			31 => Ok(Self::MixtureAdjustMultiple),
+			32 => Ok(Self::ContinuationCommand),
+			33 => Ok(Self::ContinuationAdjustMultiple),
+			34 => Ok(Self::ContinuationResume),
+			35 => Ok(Self::ContinuationCancel),
+			36 => Ok(Self::ServiceTelemetry),
 			actual => Err(ProtocolError::UnknownOperationKind(actual)),
 		}
 	}
@@ -321,7 +371,7 @@ pub struct CapacityLimits {
 	pub max_control_payload: u32,
 	pub max_batch_operations: u32,
 	pub max_callback_events: u32,
-	pub reserved: u32,
+	pub max_pending_continuations: u32,
 	pub max_world_bytes: u64,
 }
 
@@ -348,7 +398,7 @@ impl HandshakePayload {
 		output[120..124].copy_from_slice(&self.capacities.max_control_payload.to_le_bytes());
 		output[124..128].copy_from_slice(&self.capacities.max_batch_operations.to_le_bytes());
 		output[128..132].copy_from_slice(&self.capacities.max_callback_events.to_le_bytes());
-		output[132..136].copy_from_slice(&self.capacities.reserved.to_le_bytes());
+		output[132..136].copy_from_slice(&self.capacities.max_pending_continuations.to_le_bytes());
 		output[136..144].copy_from_slice(&self.capacities.max_world_bytes.to_le_bytes());
 		output[144..148].copy_from_slice(&self.process_id.to_le_bytes());
 		output[148..152].copy_from_slice(&self.world_generation.to_le_bytes());
@@ -384,7 +434,7 @@ impl HandshakePayload {
 				max_control_payload: read_u32(input, 120),
 				max_batch_operations: read_u32(input, 124),
 				max_callback_events: read_u32(input, 128),
-				reserved: read_u32(input, 132),
+				max_pending_continuations: read_u32(input, 132),
 				max_world_bytes: read_u64(input, 136),
 			},
 			process_id: read_u32(input, 144),
@@ -401,6 +451,9 @@ impl HandshakePayload {
 		}
 		if self.identity != expected.identity {
 			return Err(ProtocolError::BuildIdentityMismatch);
+		}
+		if self.capacities != expected.capacities {
+			return Err(ProtocolError::CapacityMismatch);
 		}
 		if self.world_generation != expected.world_generation {
 			return Err(ProtocolError::WorldGenerationMismatch {
@@ -437,11 +490,6 @@ impl HandshakePayload {
 		if self.identity.executable_digest == [0; 32] {
 			return Err(ProtocolError::EmptyExecutableDigest);
 		}
-		if self.capacities.reserved != 0 {
-			return Err(ProtocolError::ReservedHandshakeField(
-				self.capacities.reserved,
-			));
-		}
 		if self.process_id == 0 {
 			return Err(ProtocolError::InvalidProcessId);
 		}
@@ -459,6 +507,14 @@ impl HandshakePayload {
 			return Err(ProtocolError::InvalidCallbackCapacity {
 				actual: self.capacities.max_callback_events,
 				maximum: MAX_CALLBACK_EVENTS,
+			});
+		}
+		if self.capacities.max_pending_continuations == 0
+			|| self.capacities.max_pending_continuations > MAX_PENDING_CONTINUATIONS
+		{
+			return Err(ProtocolError::InvalidContinuationCapacity {
+				actual: self.capacities.max_pending_continuations,
+				maximum: MAX_PENDING_CONTINUATIONS,
 			});
 		}
 		Ok(())
@@ -528,6 +584,7 @@ pub enum CallbackEventKind {
 	DecompressionFloorRip = 4,
 	FirelockConsideration = 5,
 	TurfDestructionRequest = 6,
+	RunDmReaction = 7,
 }
 
 impl TryFrom<u16> for CallbackEventKind {
@@ -541,6 +598,7 @@ impl TryFrom<u16> for CallbackEventKind {
 			4 => Ok(Self::DecompressionFloorRip),
 			5 => Ok(Self::FirelockConsideration),
 			6 => Ok(Self::TurfDestructionRequest),
+			7 => Ok(Self::RunDmReaction),
 			actual => Err(ProtocolError::UnknownCallbackEventKind(actual)),
 		}
 	}
@@ -601,6 +659,7 @@ pub struct CallbackEvent {
 	pub target: WireHandle,
 	pub values: [ScalarValue; 4],
 	pub aux: u32,
+	pub continuation: Option<ContinuationToken>,
 }
 
 impl CallbackEvent {
@@ -609,6 +668,14 @@ impl CallbackEvent {
 			return Err(ProtocolError::UnknownCallbackFlags(self.flags));
 		}
 		validate_callback_aux(self.kind, self.aux)?;
+		match (self.kind, self.continuation) {
+			(CallbackEventKind::RunDmReaction, Some(_)) => {}
+			(CallbackEventKind::RunDmReaction, None) => {
+				return Err(ProtocolError::MissingContinuationToken);
+			}
+			(_, Some(_)) => return Err(ProtocolError::UnexpectedContinuationToken),
+			(_, None) => {}
+		}
 		let mut output = [0_u8; CALLBACK_EVENT_LEN];
 		output[0..8].copy_from_slice(&self.sequence.to_le_bytes());
 		output[8..10].copy_from_slice(&(self.kind as u16).to_le_bytes());
@@ -620,6 +687,9 @@ impl CallbackEvent {
 			output[offset..offset + 8].copy_from_slice(&value.encode()?);
 		}
 		output[60..64].copy_from_slice(&self.aux.to_le_bytes());
+		if let Some(continuation) = self.continuation {
+			output[64..88].copy_from_slice(&continuation.encode()?);
+		}
 		Ok(output)
 	}
 
@@ -632,6 +702,17 @@ impl CallbackEvent {
 		let kind = CallbackEventKind::try_from(read_u16(input, 8))?;
 		let aux = read_u32(input, 60);
 		validate_callback_aux(kind, aux)?;
+		let continuation_present = input[64..88].iter().any(|byte| *byte != 0);
+		let continuation = match (kind, continuation_present) {
+			(CallbackEventKind::RunDmReaction, true) => {
+				Some(ContinuationToken::decode(&input[64..88])?)
+			}
+			(CallbackEventKind::RunDmReaction, false) => {
+				return Err(ProtocolError::MissingContinuationToken);
+			}
+			(_, true) => return Err(ProtocolError::UnexpectedContinuationToken),
+			(_, false) => None,
+		};
 		let event = Self {
 			sequence: read_u64(input, 0),
 			kind,
@@ -645,6 +726,7 @@ impl CallbackEvent {
 				ScalarValue::decode(&input[52..60])?,
 			],
 			aux,
+			continuation,
 		};
 		Ok(event)
 	}
@@ -658,6 +740,7 @@ fn validate_callback_aux(kind: CallbackEventKind, aux: u32) -> Result<(), Protoc
 		CallbackEventKind::TurfDestructionRequest => {
 			TurfDestructionReason::try_from(aux)?;
 		}
+		CallbackEventKind::RunDmReaction => {}
 		CallbackEventKind::Diagnostic
 		| CallbackEventKind::PressureDifference
 		| CallbackEventKind::DecompressionFloorRip
@@ -747,6 +830,8 @@ pub struct MixtureSnapshot {
 	pub gas_count: u32,
 	pub temperature: ScalarValue,
 	pub volume: ScalarValue,
+	pub minimum_heat_capacity: ScalarValue,
+	pub immutable: bool,
 	pub gases: [ScalarValue; MAX_GAS_SLOTS],
 }
 
@@ -758,8 +843,10 @@ impl MixtureSnapshot {
 		output[4..8].copy_from_slice(&self.gas_count.to_le_bytes());
 		output[8..16].copy_from_slice(&self.temperature.encode()?);
 		output[16..24].copy_from_slice(&self.volume.encode()?);
+		output[24..32].copy_from_slice(&self.minimum_heat_capacity.encode()?);
+		output[32..36].copy_from_slice(&u32::from(self.immutable).to_le_bytes());
 		for (index, value) in self.gases.into_iter().enumerate() {
-			let offset = 24 + index * 8;
+			let offset = 40 + index * 8;
 			output[offset..offset + 8].copy_from_slice(&value.encode()?);
 		}
 		Ok(output)
@@ -769,9 +856,17 @@ impl MixtureSnapshot {
 		require_exact_len(input, MIXTURE_SNAPSHOT_LEN)?;
 		let gas_count = read_u32(input, 4);
 		validate_gas_count(gas_count)?;
+		let flags = read_u32(input, 32);
+		if flags & !1 != 0 {
+			return Err(ProtocolError::UnknownMixtureSnapshotFlags(flags));
+		}
+		let reserved = read_u32(input, 36);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedMixtureSnapshotField(reserved));
+		}
 		let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
 		for (index, value) in gases.iter_mut().enumerate() {
-			let offset = 24 + index * 8;
+			let offset = 40 + index * 8;
 			*value = ScalarValue::decode(&input[offset..offset + 8])?;
 		}
 		Ok(Self {
@@ -779,6 +874,8 @@ impl MixtureSnapshot {
 			gas_count,
 			temperature: ScalarValue::decode(&input[8..16])?,
 			volume: ScalarValue::decode(&input[16..24])?,
+			minimum_heat_capacity: ScalarValue::decode(&input[24..32])?,
+			immutable: flags & 1 != 0,
 			gases,
 		})
 	}
@@ -791,6 +888,86 @@ pub struct MixtureStateMutation {
 	pub temperature: ScalarValue,
 	pub volume: ScalarValue,
 	pub gases: [ScalarValue; MAX_GAS_SLOTS],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixtureAdjustment {
+	pub gas_id: u16,
+	pub delta: ScalarValue,
+}
+
+pub fn encode_adjust_multiple_request(
+	handle: WireHandle,
+	adjustments: &[MixtureAdjustment],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	let count =
+		u32::try_from(adjustments.len()).map_err(|_| ProtocolError::OperationCountExceeded {
+			actual: u32::MAX,
+			maximum: MAX_GAS_SLOTS as u32,
+		})?;
+	if count > MAX_GAS_SLOTS as u32 {
+		return Err(ProtocolError::OperationCountExceeded {
+			actual: count,
+			maximum: MAX_GAS_SLOTS as u32,
+		});
+	}
+	output.clear();
+	output.resize(
+		MIXTURE_ADJUST_MULTIPLE_HEADER_LEN + adjustments.len() * MIXTURE_ADJUSTMENT_LEN,
+		0,
+	);
+	output[0..8].copy_from_slice(&handle.encode());
+	output[8..12].copy_from_slice(&count.to_le_bytes());
+	for (index, adjustment) in adjustments.iter().enumerate() {
+		let offset = MIXTURE_ADJUST_MULTIPLE_HEADER_LEN + index * MIXTURE_ADJUSTMENT_LEN;
+		output[offset..offset + 2].copy_from_slice(&adjustment.gas_id.to_le_bytes());
+		output[offset + 8..offset + 16].copy_from_slice(&adjustment.delta.encode()?);
+	}
+	Ok(())
+}
+
+pub fn decode_adjust_multiple_request(
+	input: &[u8],
+) -> Result<(WireHandle, Vec<MixtureAdjustment>), ProtocolError> {
+	if input.len() < MIXTURE_ADJUST_MULTIPLE_HEADER_LEN {
+		return Err(ProtocolError::InvalidPayloadLength {
+			expected: MIXTURE_ADJUST_MULTIPLE_HEADER_LEN as u32,
+			actual: input.len() as u32,
+		});
+	}
+	let handle = WireHandle::decode(&input[0..8])?;
+	let count = read_u32(input, 8);
+	if count > MAX_GAS_SLOTS as u32 {
+		return Err(ProtocolError::OperationCountExceeded {
+			actual: count,
+			maximum: MAX_GAS_SLOTS as u32,
+		});
+	}
+	let expected = MIXTURE_ADJUST_MULTIPLE_HEADER_LEN
+		.checked_add((count as usize).checked_mul(MIXTURE_ADJUSTMENT_LEN).ok_or(
+			ProtocolError::InvalidPayloadLength {
+				expected: u32::MAX,
+				actual: input.len().min(u32::MAX as usize) as u32,
+			},
+		)?)
+		.ok_or(ProtocolError::InvalidPayloadLength {
+			expected: u32::MAX,
+			actual: input.len().min(u32::MAX as usize) as u32,
+		})?;
+	require_exact_len(input, expected)?;
+	let mut adjustments = Vec::with_capacity(count as usize);
+	for index in 0..count as usize {
+		let offset = MIXTURE_ADJUST_MULTIPLE_HEADER_LEN + index * MIXTURE_ADJUSTMENT_LEN;
+		if read_u16(input, offset + 2) != 0 || read_u32(input, offset + 4) != 0 {
+			return Err(ProtocolError::ReservedMixtureAdjustmentField);
+		}
+		adjustments.push(MixtureAdjustment {
+			gas_id: read_u16(input, offset),
+			delta: ScalarValue::decode(&input[offset + 8..offset + 16])?,
+		});
+	}
+	Ok((handle, adjustments))
 }
 
 pub fn encode_mixture_state_batch(
@@ -923,6 +1100,791 @@ pub fn validate_lifecycle_batch(input: &[u8], maximum: u32) -> Result<u32, Proto
 	Ok(count)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurfLifecycleMutation {
+	pub action: LifecycleAction,
+	pub turf: WireHandle,
+	pub mixture: Option<WireHandle>,
+}
+
+pub fn encode_turf_lifecycle_batch(
+	entries: &[TurfLifecycleMutation],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	let count = checked_encode_count(entries.len())?;
+	output.clear();
+	output.reserve(4 + entries.len() * TURF_LIFECYCLE_MUTATION_LEN);
+	output.extend_from_slice(&count.to_le_bytes());
+	for entry in entries {
+		if entry.action == LifecycleAction::Unregister && entry.mixture.is_some() {
+			return Err(ProtocolError::UnexpectedUnregisterMixture);
+		}
+		output.extend_from_slice(&(entry.action as u32).to_le_bytes());
+		output.extend_from_slice(&entry.turf.encode());
+		output.extend_from_slice(&u32::from(entry.mixture.is_some()).to_le_bytes());
+		output.extend_from_slice(
+			&entry
+				.mixture
+				.unwrap_or(WireHandle {
+					slot: 0,
+					generation: 0,
+				})
+				.encode(),
+		);
+	}
+	Ok(())
+}
+
+pub fn decode_turf_lifecycle_batch(
+	input: &[u8],
+	maximum: u32,
+) -> Result<Vec<TurfLifecycleMutation>, ProtocolError> {
+	let count = validate_counted_payload(input, TURF_LIFECYCLE_MUTATION_LEN, maximum)?;
+	let mut entries = Vec::with_capacity(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * TURF_LIFECYCLE_MUTATION_LEN;
+		let action = LifecycleAction::try_from(read_u32(input, offset))?;
+		let turf = WireHandle::decode(&input[offset + 4..offset + 12])?;
+		let present = decode_boolean(read_u32(input, offset + 12))?;
+		let mixture = WireHandle::decode(&input[offset + 16..offset + 24])?;
+		if !present
+			&& mixture
+				!= (WireHandle {
+					slot: 0,
+					generation: 0,
+				}) {
+			return Err(ProtocolError::NonZeroAbsentHandle);
+		}
+		if action == LifecycleAction::Unregister && present {
+			return Err(ProtocolError::UnexpectedUnregisterMixture);
+		}
+		entries.push(TurfLifecycleMutation {
+			action,
+			turf,
+			mixture: present.then_some(mixture),
+		});
+	}
+	Ok(entries)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurfAdjacencyMutation {
+	pub left: WireHandle,
+	pub right: WireHandle,
+	pub connected: bool,
+	pub firelock: bool,
+}
+
+pub fn encode_turf_adjacency_batch(
+	entries: &[TurfAdjacencyMutation],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	let count = checked_encode_count(entries.len())?;
+	validate_unique_turf_adjacency(entries)?;
+	output.clear();
+	output.reserve(4 + entries.len() * TURF_ADJACENCY_MUTATION_LEN);
+	output.extend_from_slice(&count.to_le_bytes());
+	for entry in entries {
+		if entry.firelock && !entry.connected {
+			return Err(ProtocolError::FirelockOnDisconnectedEdge);
+		}
+		output.extend_from_slice(&entry.left.encode());
+		output.extend_from_slice(&entry.right.encode());
+		output.extend_from_slice(&u32::from(entry.connected).to_le_bytes());
+		output.extend_from_slice(&u32::from(entry.firelock).to_le_bytes());
+	}
+	Ok(())
+}
+
+pub fn decode_turf_adjacency_batch(
+	input: &[u8],
+	maximum: u32,
+) -> Result<Vec<TurfAdjacencyMutation>, ProtocolError> {
+	let count = validate_counted_payload(input, TURF_ADJACENCY_MUTATION_LEN, maximum)?;
+	let mut entries = Vec::with_capacity(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * TURF_ADJACENCY_MUTATION_LEN;
+		let connected = decode_boolean(read_u32(input, offset + 16))?;
+		let firelock = decode_boolean(read_u32(input, offset + 20))?;
+		if firelock && !connected {
+			return Err(ProtocolError::FirelockOnDisconnectedEdge);
+		}
+		entries.push(TurfAdjacencyMutation {
+			left: WireHandle::decode(&input[offset..offset + 8])?,
+			right: WireHandle::decode(&input[offset + 8..offset + 16])?,
+			connected,
+			firelock,
+		});
+	}
+	validate_unique_turf_adjacency(&entries)?;
+	Ok(entries)
+}
+
+fn validate_unique_turf_adjacency(entries: &[TurfAdjacencyMutation]) -> Result<(), ProtocolError> {
+	let mut edges = BTreeSet::new();
+	for entry in entries {
+		let edge = (
+			entry.left.slot.min(entry.right.slot),
+			entry.left.slot.max(entry.right.slot),
+		);
+		if !edges.insert(edge) {
+			return Err(ProtocolError::DuplicateTurfAdjacency {
+				left: edge.0,
+				right: edge.1,
+			});
+		}
+	}
+	Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurfHeatState {
+	pub temperature: ScalarValue,
+	pub thermal_conductivity: ScalarValue,
+	pub heat_capacity: ScalarValue,
+	pub adjacent_to_space: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurfHeatMutation {
+	pub turf: WireHandle,
+	pub state: Option<TurfHeatState>,
+}
+
+pub fn encode_turf_heat_batch(
+	entries: &[TurfHeatMutation],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	let count = checked_encode_count(entries.len())?;
+	output.clear();
+	output.reserve(4 + entries.len() * TURF_HEAT_MUTATION_LEN);
+	output.extend_from_slice(&count.to_le_bytes());
+	for entry in entries {
+		output.extend_from_slice(&entry.turf.encode());
+		let (flags, temperature, conductivity, capacity) = entry.state.map_or(
+			(0, ScalarValue(0.0), ScalarValue(0.0), ScalarValue(0.0)),
+			|state| {
+				(
+					1 | (u32::from(state.adjacent_to_space) << 1),
+					state.temperature,
+					state.thermal_conductivity,
+					state.heat_capacity,
+				)
+			},
+		);
+		output.extend_from_slice(&flags.to_le_bytes());
+		output.extend_from_slice(&0_u32.to_le_bytes());
+		output.extend_from_slice(&temperature.encode()?);
+		output.extend_from_slice(&conductivity.encode()?);
+		output.extend_from_slice(&capacity.encode()?);
+	}
+	Ok(())
+}
+
+pub fn decode_turf_heat_batch(
+	input: &[u8],
+	maximum: u32,
+) -> Result<Vec<TurfHeatMutation>, ProtocolError> {
+	let count = validate_counted_payload(input, TURF_HEAT_MUTATION_LEN, maximum)?;
+	let mut entries = Vec::with_capacity(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * TURF_HEAT_MUTATION_LEN;
+		let flags = read_u32(input, offset + 8);
+		if flags & !3 != 0 {
+			return Err(ProtocolError::UnknownTurfHeatFlags(flags));
+		}
+		let reserved = read_u32(input, offset + 12);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedTurfHeatField(reserved));
+		}
+		let present = flags & 1 != 0;
+		let adjacent_to_space = flags & 2 != 0;
+		if adjacent_to_space && !present {
+			return Err(ProtocolError::UnknownTurfHeatFlags(flags));
+		}
+		let temperature = ScalarValue::decode(&input[offset + 16..offset + 24])?;
+		let thermal_conductivity = ScalarValue::decode(&input[offset + 24..offset + 32])?;
+		let heat_capacity = ScalarValue::decode(&input[offset + 32..offset + 40])?;
+		if !present
+			&& (temperature.0 != 0.0 || thermal_conductivity.0 != 0.0 || heat_capacity.0 != 0.0)
+		{
+			return Err(ProtocolError::NonZeroAbsentTurfHeatState);
+		}
+		entries.push(TurfHeatMutation {
+			turf: WireHandle::decode(&input[offset..offset + 8])?,
+			state: present.then_some(TurfHeatState {
+				temperature,
+				thermal_conductivity,
+				heat_capacity,
+				adjacent_to_space,
+			}),
+		});
+	}
+	Ok(entries)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurfHeatAdjacencyMutation {
+	pub left: WireHandle,
+	pub right: WireHandle,
+	pub connected: bool,
+}
+
+pub fn encode_turf_heat_adjacency_batch(
+	entries: &[TurfHeatAdjacencyMutation],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	let count = checked_encode_count(entries.len())?;
+	output.clear();
+	output.reserve(4 + entries.len() * TURF_HEAT_ADJACENCY_MUTATION_LEN);
+	output.extend_from_slice(&count.to_le_bytes());
+	for entry in entries {
+		output.extend_from_slice(&entry.left.encode());
+		output.extend_from_slice(&entry.right.encode());
+		output.extend_from_slice(&u32::from(entry.connected).to_le_bytes());
+		output.extend_from_slice(&0_u32.to_le_bytes());
+	}
+	Ok(())
+}
+
+pub fn decode_turf_heat_adjacency_batch(
+	input: &[u8],
+	maximum: u32,
+) -> Result<Vec<TurfHeatAdjacencyMutation>, ProtocolError> {
+	let count = validate_counted_payload(input, TURF_HEAT_ADJACENCY_MUTATION_LEN, maximum)?;
+	let mut entries = Vec::with_capacity(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * TURF_HEAT_ADJACENCY_MUTATION_LEN;
+		let connected = decode_boolean(read_u32(input, offset + 16))?;
+		let reserved = read_u32(input, offset + 20);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedTurfHeatField(reserved));
+		}
+		entries.push(TurfHeatAdjacencyMutation {
+			left: WireHandle::decode(&input[offset..offset + 8])?,
+			right: WireHandle::decode(&input[offset + 8..offset + 16])?,
+			connected,
+		});
+	}
+	Ok(entries)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MixtureCommandRequest {
+	SetMoles {
+		handle: WireHandle,
+		gas_id: u16,
+		amount: ScalarValue,
+	},
+	AdjustMoles {
+		handle: WireHandle,
+		gas_id: u16,
+		delta: ScalarValue,
+	},
+	AdjustMolesTemperature {
+		handle: WireHandle,
+		gas_id: u16,
+		amount: ScalarValue,
+		temperature: ScalarValue,
+	},
+	GetMoles {
+		handle: WireHandle,
+		gas_id: u16,
+	},
+	Temperature {
+		handle: WireHandle,
+	},
+	Volume {
+		handle: WireHandle,
+	},
+	HeatCapacity {
+		handle: WireHandle,
+	},
+	PartialHeatCapacity {
+		handle: WireHandle,
+		gas_id: u16,
+	},
+	TotalMoles {
+		handle: WireHandle,
+	},
+	Pressure {
+		handle: WireHandle,
+	},
+	ThermalEnergy {
+		handle: WireHandle,
+	},
+	GetMolesByFlags {
+		handle: WireHandle,
+		flags: u32,
+	},
+	Burnability {
+		handle: WireHandle,
+		temperature: Option<ScalarValue>,
+	},
+	SetTemperature {
+		handle: WireHandle,
+		temperature: ScalarValue,
+	},
+	SetVolume {
+		handle: WireHandle,
+		volume: ScalarValue,
+	},
+	SetMinimumHeatCapacity {
+		handle: WireHandle,
+		amount: ScalarValue,
+	},
+	Clear {
+		handle: WireHandle,
+	},
+	Add {
+		handle: WireHandle,
+		amount: ScalarValue,
+	},
+	Multiply {
+		handle: WireHandle,
+		factor: ScalarValue,
+	},
+	CopyFrom {
+		receiver: WireHandle,
+		giver: WireHandle,
+	},
+	AdjustHeat {
+		handle: WireHandle,
+		heat: ScalarValue,
+	},
+	Compare {
+		left: WireHandle,
+		right: WireHandle,
+	},
+	EqualizeWith {
+		receiver: WireHandle,
+		total: WireHandle,
+	},
+	TemperatureShare {
+		first: WireHandle,
+		second: WireHandle,
+		conduction_coefficient: ScalarValue,
+	},
+	TemperatureShareNonGas {
+		handle: WireHandle,
+		conduction_coefficient: ScalarValue,
+		sharer_temperature: ScalarValue,
+		sharer_heat_capacity: ScalarValue,
+	},
+	MarkImmutable {
+		handle: WireHandle,
+	},
+	IsImmutable {
+		handle: WireHandle,
+	},
+	Merge {
+		receiver: WireHandle,
+		giver: WireHandle,
+	},
+	RemoveRatioInto {
+		source: WireHandle,
+		destination: WireHandle,
+		ratio: ScalarValue,
+	},
+	RemoveAmountInto {
+		source: WireHandle,
+		destination: WireHandle,
+		amount: ScalarValue,
+	},
+	TransferGases {
+		source: WireHandle,
+		destination: WireHandle,
+		ratio: ScalarValue,
+		gas_mask: u32,
+	},
+	TransferAmount {
+		source: WireHandle,
+		destination: WireHandle,
+		amount: ScalarValue,
+	},
+	TransferRatio {
+		source: WireHandle,
+		destination: WireHandle,
+		ratio: ScalarValue,
+	},
+	TransferByFlags {
+		source: WireHandle,
+		destination: WireHandle,
+		flags: u32,
+		amount: ScalarValue,
+	},
+	ShareRatio {
+		first: WireHandle,
+		second: WireHandle,
+		ratio: ScalarValue,
+		one_way: bool,
+	},
+}
+
+impl MixtureCommandRequest {
+	pub fn encode(self) -> Result<[u8; MIXTURE_COMMAND_REQUEST_LEN], ProtocolError> {
+		let zero = WireHandle {
+			slot: 0,
+			generation: 0,
+		};
+		let z = ScalarValue(0.0);
+		let (kind, flags, primary, secondary, scalars, gas_id, aux): (
+			u16,
+			u16,
+			WireHandle,
+			WireHandle,
+			[ScalarValue; 3],
+			u16,
+			u32,
+		) = match self {
+			Self::SetMoles {
+				handle,
+				gas_id,
+				amount,
+			} => (1, 0, handle, zero, [amount, z, z], gas_id, 0),
+			Self::AdjustMoles {
+				handle,
+				gas_id,
+				delta,
+			} => (2, 0, handle, zero, [delta, z, z], gas_id, 0),
+			Self::AdjustMolesTemperature {
+				handle,
+				gas_id,
+				amount,
+				temperature,
+			} => (3, 0, handle, zero, [amount, temperature, z], gas_id, 0),
+			Self::GetMoles { handle, gas_id } => (4, 0, handle, zero, [z, z, z], gas_id, 0),
+			Self::Temperature { handle } => (5, 0, handle, zero, [z, z, z], 0, 0),
+			Self::Volume { handle } => (6, 0, handle, zero, [z, z, z], 0, 0),
+			Self::HeatCapacity { handle } => (7, 0, handle, zero, [z, z, z], 0, 0),
+			Self::PartialHeatCapacity { handle, gas_id } => {
+				(8, 0, handle, zero, [z, z, z], gas_id, 0)
+			}
+			Self::TotalMoles { handle } => (9, 0, handle, zero, [z, z, z], 0, 0),
+			Self::Pressure { handle } => (10, 0, handle, zero, [z, z, z], 0, 0),
+			Self::ThermalEnergy { handle } => (11, 0, handle, zero, [z, z, z], 0, 0),
+			Self::GetMolesByFlags { handle, flags } => (12, 0, handle, zero, [z, z, z], 0, flags),
+			Self::Burnability {
+				handle,
+				temperature,
+			} => (
+				13,
+				u16::from(temperature.is_some()),
+				handle,
+				zero,
+				[temperature.unwrap_or(z), z, z],
+				0,
+				0,
+			),
+			Self::SetTemperature {
+				handle,
+				temperature,
+			} => (14, 0, handle, zero, [temperature, z, z], 0, 0),
+			Self::SetVolume { handle, volume } => (15, 0, handle, zero, [volume, z, z], 0, 0),
+			Self::SetMinimumHeatCapacity { handle, amount } => {
+				(16, 0, handle, zero, [amount, z, z], 0, 0)
+			}
+			Self::Clear { handle } => (17, 0, handle, zero, [z, z, z], 0, 0),
+			Self::Add { handle, amount } => (18, 0, handle, zero, [amount, z, z], 0, 0),
+			Self::Multiply { handle, factor } => (19, 0, handle, zero, [factor, z, z], 0, 0),
+			Self::CopyFrom { receiver, giver } => (20, 0, receiver, giver, [z, z, z], 0, 0),
+			Self::AdjustHeat { handle, heat } => (21, 0, handle, zero, [heat, z, z], 0, 0),
+			Self::Compare { left, right } => (22, 0, left, right, [z, z, z], 0, 0),
+			Self::EqualizeWith { receiver, total } => (23, 0, receiver, total, [z, z, z], 0, 0),
+			Self::TemperatureShare {
+				first,
+				second,
+				conduction_coefficient,
+			} => (24, 0, first, second, [conduction_coefficient, z, z], 0, 0),
+			Self::TemperatureShareNonGas {
+				handle,
+				conduction_coefficient,
+				sharer_temperature,
+				sharer_heat_capacity,
+			} => (
+				25,
+				0,
+				handle,
+				zero,
+				[
+					conduction_coefficient,
+					sharer_temperature,
+					sharer_heat_capacity,
+				],
+				0,
+				0,
+			),
+			Self::MarkImmutable { handle } => (26, 0, handle, zero, [z, z, z], 0, 0),
+			Self::IsImmutable { handle } => (27, 0, handle, zero, [z, z, z], 0, 0),
+			Self::Merge { receiver, giver } => (28, 0, receiver, giver, [z, z, z], 0, 0),
+			Self::RemoveRatioInto {
+				source,
+				destination,
+				ratio,
+			} => (29, 0, source, destination, [ratio, z, z], 0, 0),
+			Self::RemoveAmountInto {
+				source,
+				destination,
+				amount,
+			} => (30, 0, source, destination, [amount, z, z], 0, 0),
+			Self::TransferGases {
+				source,
+				destination,
+				ratio,
+				gas_mask,
+			} => (31, 0, source, destination, [ratio, z, z], 0, gas_mask),
+			Self::TransferAmount {
+				source,
+				destination,
+				amount,
+			} => (32, 0, source, destination, [amount, z, z], 0, 0),
+			Self::TransferRatio {
+				source,
+				destination,
+				ratio,
+			} => (33, 0, source, destination, [ratio, z, z], 0, 0),
+			Self::TransferByFlags {
+				source,
+				destination,
+				flags,
+				amount,
+			} => (34, 0, source, destination, [amount, z, z], 0, flags),
+			Self::ShareRatio {
+				first,
+				second,
+				ratio,
+				one_way,
+			} => (35, u16::from(one_way), first, second, [ratio, z, z], 0, 0),
+		};
+		let mut output = [0_u8; MIXTURE_COMMAND_REQUEST_LEN];
+		output[0..2].copy_from_slice(&kind.to_le_bytes());
+		output[2..4].copy_from_slice(&flags.to_le_bytes());
+		output[4..12].copy_from_slice(&primary.encode());
+		output[12..20].copy_from_slice(&secondary.encode());
+		for (index, scalar) in scalars.into_iter().enumerate() {
+			let offset = 20 + index * 8;
+			output[offset..offset + 8].copy_from_slice(&scalar.encode()?);
+		}
+		output[44..46].copy_from_slice(&gas_id.to_le_bytes());
+		output[48..52].copy_from_slice(&aux.to_le_bytes());
+		Ok(output)
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_COMMAND_REQUEST_LEN)?;
+		let kind = read_u16(input, 0);
+		let flags = read_u16(input, 2);
+		if !(1..=35).contains(&kind) {
+			return Err(ProtocolError::UnknownMixtureCommand(kind));
+		}
+		if read_u16(input, 46) != 0 || read_u32(input, 52) != 0 {
+			return Err(ProtocolError::ReservedMixtureCommandField);
+		}
+		let allowed_flags = if kind == 13 || kind == 35 { 1 } else { 0 };
+		if flags & !allowed_flags != 0 {
+			return Err(ProtocolError::UnknownMixtureCommandFlags { kind, flags });
+		}
+		let primary = WireHandle::decode(&input[4..12])?;
+		let secondary = WireHandle::decode(&input[12..20])?;
+		let s1 = ScalarValue::decode(&input[20..28])?;
+		let s2 = ScalarValue::decode(&input[28..36])?;
+		let s3 = ScalarValue::decode(&input[36..44])?;
+		let gas_id = read_u16(input, 44);
+		let aux = read_u32(input, 48);
+		let uses_secondary = matches!(kind, 20 | 22..=24 | 28..=35);
+		let uses_s1 = matches!(kind, 1..=3 | 14..=16 | 18..=19 | 21 | 24..=25 | 29..=35)
+			|| kind == 13 && flags & 1 != 0;
+		let uses_s2 = matches!(kind, 3 | 25);
+		let uses_s3 = kind == 25;
+		let uses_gas_id = matches!(kind, 1..=4 | 8);
+		let uses_aux = matches!(kind, 12 | 31 | 34);
+		if (!uses_secondary && input[12..20].iter().any(|byte| *byte != 0))
+			|| (!uses_s1 && input[20..28].iter().any(|byte| *byte != 0))
+			|| (!uses_s2 && input[28..36].iter().any(|byte| *byte != 0))
+			|| (!uses_s3 && input[36..44].iter().any(|byte| *byte != 0))
+			|| (!uses_gas_id && gas_id != 0)
+			|| (!uses_aux && aux != 0)
+		{
+			return Err(ProtocolError::ReservedMixtureCommandField);
+		}
+		match kind {
+			1 => Ok(Self::SetMoles {
+				handle: primary,
+				gas_id,
+				amount: s1,
+			}),
+			2 => Ok(Self::AdjustMoles {
+				handle: primary,
+				gas_id,
+				delta: s1,
+			}),
+			3 => Ok(Self::AdjustMolesTemperature {
+				handle: primary,
+				gas_id,
+				amount: s1,
+				temperature: s2,
+			}),
+			4 => Ok(Self::GetMoles {
+				handle: primary,
+				gas_id,
+			}),
+			5 => Ok(Self::Temperature { handle: primary }),
+			6 => Ok(Self::Volume { handle: primary }),
+			7 => Ok(Self::HeatCapacity { handle: primary }),
+			8 => Ok(Self::PartialHeatCapacity {
+				handle: primary,
+				gas_id,
+			}),
+			9 => Ok(Self::TotalMoles { handle: primary }),
+			10 => Ok(Self::Pressure { handle: primary }),
+			11 => Ok(Self::ThermalEnergy { handle: primary }),
+			12 => Ok(Self::GetMolesByFlags {
+				handle: primary,
+				flags: aux,
+			}),
+			13 => Ok(Self::Burnability {
+				handle: primary,
+				temperature: (flags & 1 != 0).then_some(s1),
+			}),
+			14 => Ok(Self::SetTemperature {
+				handle: primary,
+				temperature: s1,
+			}),
+			15 => Ok(Self::SetVolume {
+				handle: primary,
+				volume: s1,
+			}),
+			16 => Ok(Self::SetMinimumHeatCapacity {
+				handle: primary,
+				amount: s1,
+			}),
+			17 => Ok(Self::Clear { handle: primary }),
+			18 => Ok(Self::Add {
+				handle: primary,
+				amount: s1,
+			}),
+			19 => Ok(Self::Multiply {
+				handle: primary,
+				factor: s1,
+			}),
+			20 => Ok(Self::CopyFrom {
+				receiver: primary,
+				giver: secondary,
+			}),
+			21 => Ok(Self::AdjustHeat {
+				handle: primary,
+				heat: s1,
+			}),
+			22 => Ok(Self::Compare {
+				left: primary,
+				right: secondary,
+			}),
+			23 => Ok(Self::EqualizeWith {
+				receiver: primary,
+				total: secondary,
+			}),
+			24 => Ok(Self::TemperatureShare {
+				first: primary,
+				second: secondary,
+				conduction_coefficient: s1,
+			}),
+			25 => Ok(Self::TemperatureShareNonGas {
+				handle: primary,
+				conduction_coefficient: s1,
+				sharer_temperature: s2,
+				sharer_heat_capacity: s3,
+			}),
+			26 => Ok(Self::MarkImmutable { handle: primary }),
+			27 => Ok(Self::IsImmutable { handle: primary }),
+			28 => Ok(Self::Merge {
+				receiver: primary,
+				giver: secondary,
+			}),
+			29 => Ok(Self::RemoveRatioInto {
+				source: primary,
+				destination: secondary,
+				ratio: s1,
+			}),
+			30 => Ok(Self::RemoveAmountInto {
+				source: primary,
+				destination: secondary,
+				amount: s1,
+			}),
+			31 => Ok(Self::TransferGases {
+				source: primary,
+				destination: secondary,
+				ratio: s1,
+				gas_mask: aux,
+			}),
+			32 => Ok(Self::TransferAmount {
+				source: primary,
+				destination: secondary,
+				amount: s1,
+			}),
+			33 => Ok(Self::TransferRatio {
+				source: primary,
+				destination: secondary,
+				ratio: s1,
+			}),
+			34 => Ok(Self::TransferByFlags {
+				source: primary,
+				destination: secondary,
+				flags: aux,
+				amount: s1,
+			}),
+			35 => Ok(Self::ShareRatio {
+				first: primary,
+				second: secondary,
+				ratio: s1,
+				one_way: flags & 1 != 0,
+			}),
+			actual => Err(ProtocolError::UnknownMixtureCommand(actual)),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MixtureCommandResponse {
+	Applied { updated: u32 },
+	Scalar(ScalarValue),
+	Scalars([ScalarValue; 2]),
+	Boolean(bool),
+}
+
+impl MixtureCommandResponse {
+	pub fn encode(self) -> Result<[u8; MIXTURE_COMMAND_RESPONSE_LEN], ProtocolError> {
+		let (kind, value, scalars) = match self {
+			Self::Applied { updated } => (1_u32, updated, [ScalarValue(0.0); 2]),
+			Self::Scalar(scalar) => (2, 0, [scalar, ScalarValue(0.0)]),
+			Self::Scalars(scalars) => (3, 0, scalars),
+			Self::Boolean(value) => (4, u32::from(value), [ScalarValue(0.0); 2]),
+		};
+		let mut output = [0_u8; MIXTURE_COMMAND_RESPONSE_LEN];
+		output[0..4].copy_from_slice(&kind.to_le_bytes());
+		output[4..8].copy_from_slice(&value.to_le_bytes());
+		output[8..16].copy_from_slice(&scalars[0].encode()?);
+		output[16..24].copy_from_slice(&scalars[1].encode()?);
+		Ok(output)
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_COMMAND_RESPONSE_LEN)?;
+		let kind = read_u32(input, 0);
+		let value = read_u32(input, 4);
+		let scalars = [
+			ScalarValue::decode(&input[8..16])?,
+			ScalarValue::decode(&input[16..24])?,
+		];
+		match kind {
+			1 => Ok(Self::Applied { updated: value }),
+			2 => Ok(Self::Scalar(scalars[0])),
+			3 => Ok(Self::Scalars(scalars)),
+			4 => Ok(Self::Boolean(decode_boolean(value)?)),
+			actual => Err(ProtocolError::UnknownMixtureCommandResponse(actual)),
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AdjacencyMutation {
 	pub left: WireHandle,
@@ -981,6 +1943,7 @@ pub enum SimulationStage {
 	ProcessTurfEqualize = 2,
 	ProcessTurfHeat = 3,
 	ProcessTurfs = 4,
+	ProcessReactions = 5,
 }
 
 impl TryFrom<u32> for SimulationStage {
@@ -992,6 +1955,7 @@ impl TryFrom<u32> for SimulationStage {
 			2 => Ok(Self::ProcessTurfEqualize),
 			3 => Ok(Self::ProcessTurfHeat),
 			4 => Ok(Self::ProcessTurfs),
+			5 => Ok(Self::ProcessReactions),
 			actual => Err(ProtocolError::UnknownSimulationStage(actual)),
 		}
 	}
@@ -1091,8 +2055,13 @@ pub enum ProtocolError {
 		actual: u32,
 		maximum: u32,
 	},
+	InvalidContinuationCapacity {
+		actual: u32,
+		maximum: u32,
+	},
 	AuthenticationFailed,
 	BuildIdentityMismatch,
+	CapacityMismatch,
 	InvalidServiceErrorLength {
 		actual: u32,
 	},
@@ -1134,6 +2103,42 @@ pub enum ProtocolError {
 		kind: u16,
 		actual: u32,
 	},
+	MissingContinuationToken,
+	UnexpectedContinuationToken,
+	InvalidBoolean(u32),
+	NonZeroAbsentHandle,
+	UnexpectedUnregisterMixture,
+	FirelockOnDisconnectedEdge,
+	DuplicateTurfAdjacency {
+		left: u32,
+		right: u32,
+	},
+	UnknownTurfHeatFlags(u32),
+	ReservedTurfHeatField(u32),
+	NonZeroAbsentTurfHeatState,
+	UnknownMixtureCommand(u16),
+	UnknownMixtureCommandFlags {
+		kind: u16,
+		flags: u16,
+	},
+	ReservedMixtureCommandField,
+	ReservedMixtureAdjustmentField,
+	ReservedContinuationField(u32),
+	InvalidContinuationId,
+	InvalidContinuationDeadline,
+	UnknownMixtureCommandResponse(u32),
+	UnknownMixtureSnapshotFlags(u32),
+	ReservedMixtureSnapshotField(u32),
+	MetadataStringTooLong {
+		actual: u32,
+		maximum: u32,
+	},
+	InvalidMetadataUtf8,
+	UnknownGasFireRole(u16),
+	UnknownFireProducts(u32),
+	UnknownMetadataFlags(u32),
+	NonZeroMetadataPadding,
+	UnknownReactionExecution(u16),
 }
 
 impl fmt::Display for ProtocolError {
@@ -1168,6 +2173,14 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 		input[offset + 6],
 		input[offset + 7],
 	])
+}
+
+fn decode_boolean(value: u32) -> Result<bool, ProtocolError> {
+	match value {
+		0 => Ok(false),
+		1 => Ok(true),
+		actual => Err(ProtocolError::InvalidBoolean(actual)),
+	}
 }
 
 fn require_exact_len(input: &[u8], expected: usize) -> Result<(), ProtocolError> {

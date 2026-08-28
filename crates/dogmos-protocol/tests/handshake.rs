@@ -1,6 +1,7 @@
 use dogmos_protocol::{
 	BuildIdentity, CapacityLimits, HandshakePayload, ProtocolError, DOGMOS_ABI_VERSION,
 	DOGMOS_PROTOCOL_VERSION, HANDSHAKE_PAYLOAD_LEN, MAX_CALLBACK_EVENTS, MAX_CONTROL_PAYLOAD,
+	MAX_PENDING_CONTINUATIONS,
 };
 
 fn payload() -> HandshakePayload {
@@ -17,7 +18,7 @@ fn payload() -> HandshakePayload {
 			max_control_payload: MAX_CONTROL_PAYLOAD,
 			max_batch_operations: 4096,
 			max_callback_events: 1024,
-			reserved: 0,
+			max_pending_continuations: 1024,
 			max_world_bytes: 8 * 1024 * 1024 * 1024,
 		},
 		process_id: 1234,
@@ -27,7 +28,7 @@ fn payload() -> HandshakePayload {
 }
 
 #[test]
-fn handshake_decoder_requires_exact_length_and_reserved_zero() {
+fn handshake_decoder_requires_exact_length() {
 	let bytes = payload().encode();
 	assert_eq!(
 		HandshakePayload::decode(&bytes[..HANDSHAKE_PAYLOAD_LEN - 1]),
@@ -45,13 +46,6 @@ fn handshake_decoder_requires_exact_length_and_reserved_zero() {
 			expected: HANDSHAKE_PAYLOAD_LEN as u32,
 			actual: (HANDSHAKE_PAYLOAD_LEN + 1) as u32,
 		})
-	);
-
-	let mut reserved = bytes;
-	reserved[132] = 1;
-	assert_eq!(
-		HandshakePayload::decode(&reserved),
-		Err(ProtocolError::ReservedHandshakeField(1))
 	);
 }
 
@@ -101,6 +95,27 @@ fn handshake_rejects_zero_pid_and_invalid_capacity() {
 		Err(ProtocolError::InvalidCallbackCapacity {
 			actual: MAX_CALLBACK_EVENTS + 1,
 			maximum: MAX_CALLBACK_EVENTS,
+		})
+	);
+
+	let mut zero_continuations = payload().encode();
+	zero_continuations[132..136].copy_from_slice(&0_u32.to_le_bytes());
+	assert_eq!(
+		HandshakePayload::decode(&zero_continuations),
+		Err(ProtocolError::InvalidContinuationCapacity {
+			actual: 0,
+			maximum: MAX_PENDING_CONTINUATIONS,
+		})
+	);
+
+	let mut oversized_continuations = payload().encode();
+	oversized_continuations[132..136]
+		.copy_from_slice(&(MAX_PENDING_CONTINUATIONS + 1).to_le_bytes());
+	assert_eq!(
+		HandshakePayload::decode(&oversized_continuations),
+		Err(ProtocolError::InvalidContinuationCapacity {
+			actual: MAX_PENDING_CONTINUATIONS + 1,
+			maximum: MAX_PENDING_CONTINUATIONS,
 		})
 	);
 }
@@ -173,6 +188,13 @@ fn peer_validation_authenticates_token_world_and_build_identity() {
 	assert_eq!(
 		actual.validate_peer(&expected),
 		Err(ProtocolError::BuildIdentityMismatch)
+	);
+
+	actual = expected;
+	actual.capacities.max_pending_continuations -= 1;
+	assert_eq!(
+		actual.validate_peer(&expected),
+		Err(ProtocolError::CapacityMismatch)
 	);
 
 	actual = expected;

@@ -1,8 +1,16 @@
 use dogmos_protocol::{
-	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CallbackEventKind, ProtocolError,
-	ReactionKind, ScalarValue, TurfDestructionReason, WireHandle, CALLBACK_BATCH_HEADER_LEN,
-	CALLBACK_BATCH_REQUEST_LEN, CALLBACK_EVENT_LEN,
+	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CallbackEventKind, ContinuationToken,
+	ProtocolError, ReactionKind, ScalarValue, TurfDestructionReason, WireHandle,
+	CALLBACK_BATCH_HEADER_LEN, CALLBACK_BATCH_REQUEST_LEN, CALLBACK_EVENT_LEN,
 };
+
+fn continuation() -> ContinuationToken {
+	ContinuationToken {
+		world_generation: 7,
+		id: 11,
+		deadline_ticks: 50,
+	}
+}
 
 #[test]
 fn callback_event_has_a_strict_cross_bitness_layout() {
@@ -25,6 +33,7 @@ fn callback_event_has_a_strict_cross_bitness_layout() {
 			ScalarValue(1_000_000.0),
 		],
 		aux: 0,
+		continuation: None,
 	};
 	let encoded = event.encode().unwrap();
 
@@ -39,24 +48,30 @@ fn callback_event_has_a_strict_cross_bitness_layout() {
 	assert_eq!(&encoded[44..52], &0.125_f64.to_le_bytes());
 	assert_eq!(&encoded[52..60], &1_000_000_f64.to_le_bytes());
 	assert_eq!(&encoded[60..64], &event.aux.to_le_bytes());
+	assert_eq!(&encoded[64..88], &[0; 24]);
 	assert_eq!(CallbackEvent::decode(&encoded).unwrap(), event);
 }
 
 #[test]
 fn every_implemented_gameplay_event_kind_round_trips() {
-	for kind in [
+	for (index, kind) in [
 		CallbackEventKind::Diagnostic,
 		CallbackEventKind::ReactionFinished,
 		CallbackEventKind::PressureDifference,
 		CallbackEventKind::DecompressionFloorRip,
 		CallbackEventKind::FirelockConsideration,
 		CallbackEventKind::TurfDestructionRequest,
-	] {
+		CallbackEventKind::RunDmReaction,
+	]
+	.into_iter()
+	.enumerate()
+	{
 		let aux = match kind {
 			CallbackEventKind::ReactionFinished => ReactionKind::Plasma as u32,
 			CallbackEventKind::TurfDestructionRequest => {
 				TurfDestructionReason::SuperconductiveHeat as u32
 			}
+			CallbackEventKind::RunDmReaction => 37,
 			_ => 0,
 		};
 		let event = CallbackEvent {
@@ -73,12 +88,47 @@ fn every_implemented_gameplay_event_kind_round_trips() {
 			},
 			values: [ScalarValue(0.0); 4],
 			aux,
+			continuation: (kind == CallbackEventKind::RunDmReaction).then(continuation),
 		};
-		assert_eq!(
-			CallbackEvent::decode(&event.encode().unwrap()).unwrap(),
-			event
-		);
+		let bytes = event.encode().unwrap();
+		assert_eq!(&bytes[8..10], &(index as u16 + 1).to_le_bytes());
+		assert_eq!(CallbackEvent::decode(&bytes).unwrap(), event);
 	}
+}
+
+#[test]
+fn dm_reaction_request_has_a_fixed_width_golden_layout() {
+	let event = CallbackEvent {
+		sequence: 9,
+		kind: CallbackEventKind::RunDmReaction,
+		flags: 0,
+		subject: WireHandle {
+			slot: 7,
+			generation: 3,
+		},
+		target: WireHandle {
+			slot: 11,
+			generation: 5,
+		},
+		values: [
+			ScalarValue(0.0),
+			ScalarValue(0.0),
+			ScalarValue(0.0),
+			ScalarValue(0.0),
+		],
+		aux: 19,
+		continuation: Some(continuation()),
+	};
+	let encoded = event.encode().unwrap();
+	assert_eq!(encoded.len(), CALLBACK_EVENT_LEN);
+	assert_eq!(&encoded[8..10], &7_u16.to_le_bytes());
+	assert_eq!(&encoded[12..20], &event.subject.encode());
+	assert_eq!(&encoded[20..28], &event.target.encode());
+	assert_eq!(&encoded[60..64], &19_u32.to_le_bytes());
+	assert_eq!(&encoded[64..68], &7_u32.to_le_bytes());
+	assert_eq!(&encoded[72..80], &11_u64.to_le_bytes());
+	assert_eq!(&encoded[80..88], &50_u64.to_le_bytes());
+	assert_eq!(CallbackEvent::decode(&encoded).unwrap(), event);
 }
 
 #[test]
@@ -97,6 +147,7 @@ fn callback_event_rejects_reserved_flags_unknown_kinds_and_nonfinite_values() {
 		},
 		values: [ScalarValue(5.0); 4],
 		aux: 0,
+		continuation: None,
 	}
 	.encode()
 	.unwrap();
@@ -134,6 +185,46 @@ fn callback_event_rejects_reserved_flags_unknown_kinds_and_nonfinite_values() {
 		CallbackEvent::decode(&encoded),
 		Err(ProtocolError::UnknownCallbackAux { kind: 1, actual: 1 })
 	));
+}
+
+#[test]
+fn callback_event_requires_continuations_only_for_dm_reactions() {
+	let dm_reaction = CallbackEvent {
+		sequence: 1,
+		kind: CallbackEventKind::RunDmReaction,
+		flags: 0,
+		subject: WireHandle {
+			slot: 1,
+			generation: 2,
+		},
+		target: WireHandle {
+			slot: 3,
+			generation: 4,
+		},
+		values: [ScalarValue(0.0); 4],
+		aux: 5,
+		continuation: Some(continuation()),
+	};
+	let mut missing = dm_reaction.encode().unwrap();
+	missing[64..88].fill(0);
+	assert_eq!(
+		CallbackEvent::decode(&missing),
+		Err(ProtocolError::MissingContinuationToken)
+	);
+
+	let mut unexpected = CallbackEvent {
+		kind: CallbackEventKind::Diagnostic,
+		aux: 0,
+		continuation: None,
+		..dm_reaction
+	}
+	.encode()
+	.unwrap();
+	unexpected[64..88].copy_from_slice(&continuation().encode().unwrap());
+	assert_eq!(
+		CallbackEvent::decode(&unexpected),
+		Err(ProtocolError::UnexpectedContinuationToken)
+	);
 }
 
 #[test]

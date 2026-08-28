@@ -1,10 +1,14 @@
 mod state;
 
 use dogmos_protocol::{
-	decode_adjacency_batch, decode_lifecycle_batch, decode_mixture_state_batch, read_frame_into,
-	write_frame, CallbackBatchRequest, HandshakePayload, MixtureSnapshotRequest, OperationKind,
-	ProtocolHeader, ServiceErrorCode, SimulationStageRequest, SimulationStageResponse, FLAG_ERROR,
-	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
+	decode_adjacency_batch, decode_adjust_multiple_request,
+	decode_continuation_adjust_multiple_request, decode_gas_metadata_batch, decode_lifecycle_batch,
+	decode_mixture_state_batch, decode_reaction_metadata_batch, decode_turf_adjacency_batch,
+	decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
+	read_frame_into, write_frame, CallbackBatchRequest, ContinuationCommandRequest,
+	ContinuationToken, HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest,
+	OperationKind, ProtocolHeader, ServiceErrorCode, SimulationStageRequest,
+	SimulationStageResponse, FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -27,6 +31,14 @@ struct RequestDeadline {
 	budget: Option<Duration>,
 }
 
+struct AuthenticatedSessionGuard<'a>(&'a AtomicBool);
+
+impl Drop for AuthenticatedSessionGuard<'_> {
+	fn drop(&mut self) {
+		self.0.store(true, Ordering::Release);
+	}
+}
+
 impl RequestDeadline {
 	fn from_budget_ns(budget_ns: u64) -> Self {
 		Self {
@@ -38,6 +50,26 @@ impl RequestDeadline {
 	fn is_expired(self) -> bool {
 		self.budget
 			.is_some_and(|budget| self.received_at.elapsed() >= budget)
+	}
+}
+
+struct RequestSequence {
+	last_request_id: u64,
+}
+
+impl RequestSequence {
+	const fn after_handshake(request_id: u64) -> Self {
+		Self {
+			last_request_id: request_id,
+		}
+	}
+
+	fn accept(&mut self, request_id: u64) -> bool {
+		if request_id <= self.last_request_id {
+			return false;
+		}
+		self.last_request_id = request_id;
+		true
 	}
 }
 
@@ -162,10 +194,14 @@ fn handle_primary(
 	let mut response = request.response();
 	response.payload_len = HANDSHAKE_PAYLOAD_LEN as u32;
 	write_frame(&mut stream, response, &response_payload)?;
+	let _authenticated_session = AuthenticatedSessionGuard(shutdown);
+	let mut request_sequence = RequestSequence::after_handshake(request.request_id);
 	let mut diagnostic_arena: Vec<u8> = Vec::new();
-	let mut service_state = ServiceState::new(
+	let mut service_state = ServiceState::new_for_world(
 		expected.capacities.max_world_bytes,
 		expected.capacities.max_callback_events,
+		expected.capacities.max_pending_continuations,
+		expected.world_generation,
 	);
 
 	loop {
@@ -176,11 +212,25 @@ fn handle_primary(
 		{
 			return Err("request belongs to a different world".into());
 		}
+		if !request_sequence.accept(request.request_id) {
+			service_state.record_protocol_error();
+			write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+			continue;
+		}
 		if deadline.is_expired() {
+			service_state.record_request_timeout();
 			write_error_response(&mut stream, request, ServiceErrorCode::DeadlineExceeded)?;
 			continue;
 		}
-		match request.operation_kind()? {
+		let operation = match request.operation_kind() {
+			Ok(operation) => operation,
+			Err(_) => {
+				service_state.record_protocol_error();
+				write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+				continue;
+			}
+		};
+		match operation {
 			OperationKind::Echo => write_response(&mut stream, request, &payload[..payload_len])?,
 			OperationKind::ScalarGet | OperationKind::Transfer => {
 				payload[..8].fill(0);
@@ -201,10 +251,12 @@ fn handle_primary(
 			OperationKind::CallbackBatch => {
 				let Ok(callback_request) = CallbackBatchRequest::decode(&payload[..payload_len])
 				else {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
 				if callback_request.max_events > expected.capacities.max_callback_events {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				}
@@ -217,6 +269,7 @@ fn handle_primary(
 			OperationKind::DiagnosticCallbackEnqueue => {
 				let Ok(callback_request) = CallbackBatchRequest::decode(&payload[..payload_len])
 				else {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
@@ -235,6 +288,7 @@ fn handle_primary(
 				if requested_bytes > expected.capacities.max_world_bytes
 					|| requested_bytes > usize::MAX as u64
 				{
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				}
@@ -257,6 +311,7 @@ fn handle_primary(
 			OperationKind::MixtureSnapshot => {
 				let Ok(snapshot_request) = MixtureSnapshotRequest::decode(&payload[..payload_len])
 				else {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
@@ -270,11 +325,140 @@ fn handle_primary(
 				let response = snapshot.encode()?;
 				write_response(&mut stream, request, &response)?;
 			}
+			OperationKind::MixtureCommand => {
+				let Ok(command) = MixtureCommandRequest::decode(&payload[..payload_len]) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let response = match service_state.apply_mixture_command(command) {
+					Ok(response) => response,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &response.encode()?)?;
+			}
+			OperationKind::MixtureAdjustMultiple => {
+				let Ok((handle, adjustments)) =
+					decode_adjust_multiple_request(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let response = match service_state.apply_adjust_multiple(handle, &adjustments) {
+					Ok(response) => response,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &response.encode()?)?;
+			}
+			OperationKind::ContinuationCommand => {
+				let Ok(command) = ContinuationCommandRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let response = match service_state
+					.apply_continuation_command(command.token, command.command)
+				{
+					Ok(response) => response,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &response.encode()?)?;
+			}
+			OperationKind::ContinuationAdjustMultiple => {
+				let Ok((token, handle, adjustments)) =
+					decode_continuation_adjust_multiple_request(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let response = match service_state.apply_continuation_adjust_multiple(
+					token,
+					handle,
+					&adjustments,
+				) {
+					Ok(response) => response,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &response.encode()?)?;
+			}
+			OperationKind::ContinuationResume => {
+				let Ok(token) = ContinuationToken::decode(&payload[..payload_len]) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let response = match service_state.resume_continuation(token) {
+					Ok(response) => response,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &response.encode()?)?;
+			}
+			OperationKind::ContinuationCancel => {
+				let Ok(token) = ContinuationToken::decode(&payload[..payload_len]) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				if let Err(error) = service_state.cancel_continuation(token) {
+					write_error_response(&mut stream, request, service_error_code(&error))?;
+					continue;
+				}
+				write_response(&mut stream, request, &[])?;
+			}
+			OperationKind::GasMetadataInstall => {
+				let Ok(entries) = decode_gas_metadata_batch(&payload[..payload_len]) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let count = match service_state.install_gases(entries) {
+					Ok(count) => count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &count.to_le_bytes())?;
+			}
+			OperationKind::ReactionMetadataInstall => {
+				let Ok(entries) = decode_reaction_metadata_batch(&payload[..payload_len]) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let count = match service_state.install_reactions(entries) {
+					Ok(count) => count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &count.to_le_bytes())?;
+			}
 			OperationKind::MixtureLifecycleBatch => {
 				let Ok(mutations) = decode_lifecycle_batch(
 					&payload[..payload_len],
 					expected.capacities.max_batch_operations,
 				) else {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
@@ -292,6 +476,7 @@ fn handle_primary(
 					&payload[..payload_len],
 					expected.capacities.max_batch_operations,
 				) else {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
@@ -309,6 +494,7 @@ fn handle_primary(
 					&payload[..payload_len],
 					expected.capacities.max_batch_operations,
 				) else {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
@@ -321,9 +507,82 @@ fn handle_primary(
 				};
 				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
 			}
+			OperationKind::TurfLifecycleBatch => {
+				let Ok(mutations) = decode_turf_lifecycle_batch(
+					&payload[..payload_len],
+					expected.capacities.max_batch_operations,
+				) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let operation_count = match service_state.apply_turf_lifecycle(&mutations) {
+					Ok(operation_count) => operation_count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+			}
+			OperationKind::TurfAdjacencyBatch => {
+				let Ok(mutations) = decode_turf_adjacency_batch(
+					&payload[..payload_len],
+					expected.capacities.max_batch_operations,
+				) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let operation_count = match service_state.apply_turf_adjacency(&mutations) {
+					Ok(operation_count) => operation_count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+			}
+			OperationKind::TurfHeatBatch => {
+				let Ok(mutations) = decode_turf_heat_batch(
+					&payload[..payload_len],
+					expected.capacities.max_batch_operations,
+				) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let operation_count = match service_state.apply_turf_heat(&mutations) {
+					Ok(operation_count) => operation_count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+			}
+			OperationKind::TurfHeatAdjacencyBatch => {
+				let Ok(mutations) = decode_turf_heat_adjacency_batch(
+					&payload[..payload_len],
+					expected.capacities.max_batch_operations,
+				) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let operation_count = match service_state.apply_turf_heat_adjacency(&mutations) {
+					Ok(operation_count) => operation_count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+			}
 			OperationKind::SimulationStage => {
 				let Ok(stage_request) = SimulationStageRequest::decode(&payload[..payload_len])
 				else {
+					service_state.record_protocol_error();
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
@@ -344,6 +603,14 @@ fn handle_primary(
 				}
 				.encode();
 				write_response(&mut stream, request, &response)?;
+			}
+			OperationKind::ServiceTelemetry => {
+				if payload_len != 0 {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				}
+				write_response(&mut stream, request, &service_state.telemetry().encode())?;
 			}
 			OperationKind::Shutdown => {
 				write_frame(&mut stream, request.response(), &[])?;
@@ -367,13 +634,29 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		state::StateError::AllocationFailed => ServiceErrorCode::AllocationFailed,
 		state::StateError::Graph(_) => ServiceErrorCode::InvalidGraph,
 		state::StateError::CallbackBackpressure => ServiceErrorCode::CallbackBackpressure,
+		state::StateError::ContinuationCapacityExceeded => {
+			ServiceErrorCode::ContinuationCapacityExceeded
+		}
+		state::StateError::UnknownContinuation(_) => ServiceErrorCode::UnknownContinuation,
+		state::StateError::ContinuationWorldMismatch { .. } => {
+			ServiceErrorCode::ContinuationWorldMismatch
+		}
+		state::StateError::ContinuationTokenMismatch(_) => {
+			ServiceErrorCode::ContinuationTokenMismatch
+		}
+		state::StateError::ContinuationExpired(_) => ServiceErrorCode::ContinuationExpired,
 		state::StateError::Cancelled => ServiceErrorCode::DeadlineExceeded,
 		state::StateError::SelfAdjacency(_)
+		| state::StateError::DuplicateTurfAdjacency { .. }
+		| state::StateError::InvalidMetadata
 		| state::StateError::InvalidConductivity
-		| state::StateError::InvalidSecondsPerTick => ServiceErrorCode::InvalidRequest,
+		| state::StateError::InvalidSecondsPerTick
+		| state::StateError::StageNotImplemented(_) => ServiceErrorCode::InvalidRequest,
 		state::StateError::State(_)
 		| state::StateError::CallbackOutputTooSmall
-		| state::StateError::CallbackSequenceExhausted => ServiceErrorCode::Internal,
+		| state::StateError::CallbackSequenceExhausted
+		| state::StateError::ContinuationIdExhausted
+		| state::StateError::ContinuationDeadlineExhausted => ServiceErrorCode::Internal,
 	}
 }
 
@@ -414,6 +697,30 @@ fn write_error_response(
 	response.payload_len = payload.len() as u32;
 	write_frame(stream, response, &payload)?;
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::RequestSequence;
+
+	#[test]
+	fn request_sequence_rejects_duplicate_and_decreasing_ids() {
+		let mut sequence = RequestSequence::after_handshake(7);
+
+		assert!(sequence.accept(8));
+		assert!(!sequence.accept(8));
+		assert!(!sequence.accept(7));
+		assert!(!sequence.accept(1));
+		assert!(sequence.accept(9));
+	}
+
+	#[test]
+	fn request_sequence_accepts_the_full_strictly_increasing_range() {
+		let mut sequence = RequestSequence::after_handshake(u64::MAX - 1);
+
+		assert!(sequence.accept(u64::MAX));
+		assert!(!sequence.accept(0));
+	}
 }
 
 #[cfg(windows)]

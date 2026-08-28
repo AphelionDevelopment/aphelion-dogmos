@@ -165,47 +165,33 @@ fn scalar_decoder_rejects_non_finite_values() {
 fn service_error_codes_are_fixed_width_and_reject_unknown_values() {
 	use dogmos_protocol::ServiceErrorCode;
 
-	assert_eq!(ServiceErrorCode::Busy.encode(), 1_u32.to_le_bytes());
-	assert_eq!(
-		ServiceErrorCode::decode(&1_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::Busy)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&7_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::UnknownHandle)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&8_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::StaleHandle)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&9_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::RevisionMismatch)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&10_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::RevisionExhausted)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&11_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::DuplicateMixtureState)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&12_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::InvalidMixtureState)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&13_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::StateCapacityExceeded)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&14_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::AllocationFailed)
-	);
-	assert_eq!(
-		ServiceErrorCode::decode(&15_u32.to_le_bytes()),
-		Ok(ServiceErrorCode::InvalidGraph)
-	);
+	let errors = [
+		ServiceErrorCode::Busy,
+		ServiceErrorCode::AuthenticationFailed,
+		ServiceErrorCode::InvalidRequest,
+		ServiceErrorCode::DeadlineExceeded,
+		ServiceErrorCode::Internal,
+		ServiceErrorCode::CallbackBackpressure,
+		ServiceErrorCode::UnknownHandle,
+		ServiceErrorCode::StaleHandle,
+		ServiceErrorCode::RevisionMismatch,
+		ServiceErrorCode::RevisionExhausted,
+		ServiceErrorCode::DuplicateMixtureState,
+		ServiceErrorCode::InvalidMixtureState,
+		ServiceErrorCode::StateCapacityExceeded,
+		ServiceErrorCode::AllocationFailed,
+		ServiceErrorCode::InvalidGraph,
+		ServiceErrorCode::UnknownContinuation,
+		ServiceErrorCode::ContinuationExpired,
+		ServiceErrorCode::ContinuationCapacityExceeded,
+		ServiceErrorCode::ContinuationWorldMismatch,
+		ServiceErrorCode::ContinuationTokenMismatch,
+	];
+	for (index, error) in errors.into_iter().enumerate() {
+		let expected = (index as u32 + 1).to_le_bytes();
+		assert_eq!(error.encode(), expected);
+		assert_eq!(ServiceErrorCode::decode(&expected), Ok(error));
+	}
 	assert_eq!(
 		ServiceErrorCode::decode(&99_u32.to_le_bytes()),
 		Err(ProtocolError::UnknownServiceErrorCode(99))

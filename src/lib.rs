@@ -1145,6 +1145,14 @@ mod reaction_tests {
 	}
 }
 
+#[cfg(all(
+	test,
+	feature = "turf_processing",
+	feature = "katmos",
+	feature = "superconductivity"
+))]
+mod legacy_transcript_tests;
+
 #[cfg(test)]
 fn normalize_generated_bindings(contents: &str) -> String {
 	let mut normalized = contents.trim_end_matches(&['\r', '\n'][..]).to_owned();

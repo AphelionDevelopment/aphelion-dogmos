@@ -313,6 +313,71 @@ fn process_cell(
 	Some((index, end_gas, pressure_diffs, adj_amount))
 }
 
+#[cfg(all(test, feature = "katmos", feature = "superconductivity"))]
+pub(crate) fn capture_two_turf_diffusion_trace() -> super::katmos::LegacyStageTrace {
+	use crate::gas::{
+		types::{destroy_gas_statics, register_gas_manually, set_gas_statics_manually},
+		GAS_TEST_LOCK,
+	};
+
+	struct LegacyGasMetadata;
+
+	impl Drop for LegacyGasMetadata {
+		fn drop(&mut self) {
+			destroy_gas_statics();
+		}
+	}
+
+	let _lock = GAS_TEST_LOCK.lock().unwrap();
+	set_gas_statics_manually();
+	register_gas_manually("o2", 20.0);
+	let _gas_metadata = LegacyGasMetadata;
+
+	let mut left_gas = Mixture::from_vol(crate::constants::CELL_VOLUME);
+	left_gas.set_moles(0, 100.0).unwrap();
+	let mixtures = vec![
+		RwLock::new(left_gas),
+		RwLock::new(Mixture::from_vol(crate::constants::CELL_VOLUME)),
+	];
+	let mut arena = TurfGases {
+		graph: StableDiGraph::with_capacity(0, 0),
+		map: IndexMap::with_hasher(FxBuildHasher),
+	};
+	for (mix, id) in [(0, 10), (1, 11)] {
+		arena.insert_turf(TurfMixture {
+			mix,
+			id,
+			generation: 1,
+			flags: SimulationFlags::SIMULATION_ALL,
+			planetary_atmos: None,
+			vis_hash: AtomicU64::new(0),
+		});
+	}
+	let left = arena.get_id(10).unwrap();
+	let right = arena.get_id(11).unwrap();
+	arena.graph.add_edge(left, right, AdjacentFlags::empty());
+	arena.graph.add_edge(right, left, AdjacentFlags::empty());
+	let staged = [left, right]
+		.into_iter()
+		.map(|index| process_cell(index, &mixtures, &arena).unwrap())
+		.collect::<Vec<_>>();
+	for (index, end_gas, _, adjacent_count) in staged {
+		let mixture = arena.get(index).unwrap();
+		let mut gas = mixtures[mixture.mix].write();
+		gas.multiply(diffusion_self_weight(adjacent_count as u32).unwrap());
+		gas.merge(&end_gas);
+	}
+
+	let left_value = mixtures[0].read().total_moles();
+	let right_value = mixtures[1].read().total_moles();
+	super::katmos::LegacyStageTrace {
+		work_items: 2,
+		left_value,
+		right_value,
+		pressure_events: Vec::new(),
+	}
+}
+
 // Solving the heat equation using a Finite Difference Method, an iterative stencil loop.
 #[cfg_attr(not(target_feature = "avx2"), auxmacros::generate_simd_functions)]
 #[cfg_attr(feature = "tracy", tracing::instrument(skip_all))]

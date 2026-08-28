@@ -12,6 +12,7 @@ pub struct ConductionStats {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConductionError {
+	Cancelled,
 	LengthMismatch,
 	InvalidElapsedTime,
 	InvalidTemperature { index: usize },
@@ -26,6 +27,7 @@ pub enum ConductionError {
 impl fmt::Display for ConductionError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
+			Self::Cancelled => formatter.write_str("conduction was cancelled"),
 			Self::LengthMismatch => formatter.write_str(
 				"temperature, conductivity, and heat-capacity slices must have equal lengths",
 			),
@@ -293,6 +295,24 @@ pub fn conduction_step(
 	edges: &[(u32, u32)],
 	seconds_per_tick: f32,
 ) -> Result<ConductionStats, ConductionError> {
+	conduction_step_cancellable(
+		temperatures,
+		conductivities,
+		heat_capacities,
+		edges,
+		seconds_per_tick,
+		|| false,
+	)
+}
+
+pub fn conduction_step_cancellable(
+	temperatures: &mut [f32],
+	conductivities: &[f32],
+	heat_capacities: &[f32],
+	edges: &[(u32, u32)],
+	seconds_per_tick: f32,
+	mut should_cancel: impl FnMut() -> bool,
+) -> Result<ConductionStats, ConductionError> {
 	validate_values(
 		temperatures,
 		conductivities,
@@ -308,6 +328,9 @@ pub fn conduction_step(
 	)?;
 	let normalized_scale = (seconds_per_tick / BASE_HEAT_STEP_SECONDS) / substeps as f32;
 	for _ in 0..substeps {
+		if should_cancel() {
+			return Err(ConductionError::Cancelled);
+		}
 		apply_conduction_substep(
 			temperatures,
 			conductivities,

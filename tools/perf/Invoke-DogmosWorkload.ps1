@@ -6,7 +6,7 @@ param(
 	[string]$OutputDirectory,
 	[string]$Revision,
 	[string[]]$Features = @(),
-	[string]$ByondVersion = '516.1685'
+	[string]$ByondVersion = '516.1687'
 )
 
 $ErrorActionPreference = 'Stop'

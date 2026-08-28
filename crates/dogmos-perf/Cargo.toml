@@ -7,7 +7,7 @@ edition = "2021"
 dogmos-core = { path = "../dogmos-core" }
 dogmos-protocol = { path = "../dogmos-protocol" }
 
-[target.'cfg(all(windows, target_arch = "x86"))'.dev-dependencies]
+[dev-dependencies]
 dogmos-byond = { path = "../dogmos-byond" }
 dogmos-identity = { path = "../dogmos-identity" }
 

@@ -267,7 +267,7 @@ fn benchmark_handshake(service_digest: [u8; 32]) -> Result<HandshakePayload, Box
 			max_control_payload: MAX_CONTROL_PAYLOAD,
 			max_batch_operations: 4096,
 			max_callback_events: 1024,
-			reserved: 0,
+			max_pending_continuations: 1024,
 			max_world_bytes: 8 * 1024 * 1024 * 1024,
 		},
 		process_id: std::process::id(),

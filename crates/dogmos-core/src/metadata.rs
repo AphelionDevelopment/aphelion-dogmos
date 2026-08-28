@@ -43,6 +43,20 @@ pub struct GasRequirement {
 	pub minimum_moles: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeReactionKind {
+	Plasma,
+	Hydrogen,
+	Tritium,
+	Freon,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReactionExecution {
+	Native(NativeReactionKind),
+	Dm,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FireProductRule {
 	Generic(Box<[GasProduct]>),
@@ -74,6 +88,7 @@ pub struct ReactionMetadata {
 	pub minimum_energy: Option<f32>,
 	pub minimum_fire_reagents: Option<f32>,
 	pub gas_requirements: Box<[GasRequirement]>,
+	pub execution: ReactionExecution,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +237,10 @@ impl GasMetadataRegistry {
 	pub fn specific_heats(&self) -> &[f32] {
 		&self.specific_heats
 	}
+
+	pub fn iter(&self) -> impl Iterator<Item = &GasMetadata> {
+		self.gases.iter()
+	}
 }
 
 impl ReactionMetadataRegistry {
@@ -334,6 +353,19 @@ impl ReactionMetadataRegistry {
 			}
 			output.push(*id);
 		}
+	}
+
+	pub(crate) fn is_reactable(
+		&self,
+		id: ReactionId,
+		temperature: f32,
+		moles: &[f32; MAX_GAS_SLOTS],
+		gases: &GasMetadataRegistry,
+	) -> bool {
+		let Some(reaction) = self.by_id(id) else {
+			return false;
+		};
+		reaction_conditions_met(reaction, temperature, moles, gases, &mut None, &mut None)
 	}
 }
 

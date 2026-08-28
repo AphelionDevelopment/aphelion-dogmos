@@ -1,0 +1,4 @@
+DOGMOS_LEGACY_STAGE_TRANSCRIPT_V1
+process_turfs|2|87.5|12.5|none|0|0|0|0|0
+equalize|2|50|50|pressure_difference|10|1|11|1|50
+turf_heat|2|976.6667|311.66666|none|0|0|0|0|0

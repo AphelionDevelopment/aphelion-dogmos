@@ -13,7 +13,7 @@ reported as a Dogmos regression or improvement.
 | Tracy helper source | `099df3de3dc37eca4712c06b8320fb9c53596edd` |
 | byond-tracy source | `d1ec404737b04b1ea73d6df4a1b477deacdb1900` |
 | SpacemanDMM source | `351ddc0ffb2439876d4565ce5130bb6b027ee605` |
-| BYOND | 516.1685, Windows x86 DreamDaemon |
+| BYOND | 516.1685 for the original findings; 516.1687 for remediation qualification, Windows x86 DreamDaemon |
 
 ## Findings
 
@@ -124,10 +124,11 @@ valid traces from the exact tested MCP binary.
 | MMCP-PROF-014 | Implemented and Rust-fixture-verified. Publication uses reserved atomic trace/sidecar paths under an explicit existing experiment directory, and missing or colliding destinations cannot be reported as successful artifacts. |
 | MMCP-PROF-015 | Implemented and Rust-fixture-verified. Each experiment uses a durable `.meridian-tracy-session.json` journal with pre/post lifecycle checkpoints, exact owned-output exceptions, atomic journal writes, structured integrity failures, and an unfinished-session recovery gate. Repeated clean-worktree live runs remain required before closure. |
 | MMCP-PROF-016 | Implemented and Rust-fixture-verified. Every tool result and profiling artifact includes the MCP source revision, dirty state, build target/profile, executable SHA-256, and derived build ID; comparison rejects different MCP build IDs. CI supplies the authoritative GitHub revision. |
-| MMCP-PROF-017, 018 | Not changed by this remediation. Worktree authorization diagnostics and exact child-override proc lookup remain separate open findings. |
-| MMCP-PROF-019 | Newly observed after remediation. Tracy experiment journaling does not yet cover tracked mutations produced by standard `dm_run` workloads. |
-| MMCP-PROF-020 | Open. Native BYOND profiling and structured runtime artifacts still require manual phase and identity validation. |
-| MMCP-PROF-021 | Newly observed after remediation. Compile failures retain the previous DMB without a launch-time source/artifact freshness gate. |
+| MMCP-PROF-017 | Implemented and Rust-verified. Status and path-policy failures expose effective roots, repository identity, and policy source; explicitly configured sibling worktrees are accepted while unrelated paths remain denied. The portable repository-root gate passed locally and in the hosted Windows and Ubuntu Rust jobs. |
+| MMCP-PROF-018 | Implemented and Rust-verified. Canonical proc ownership now agrees across exact lookup, document symbols, definitions, and search for child overrides, with inherited fallback kept distinct. The portable proc-resolution gate passed locally and in the hosted Windows and Ubuntu Rust jobs. |
+| MMCP-PROF-019 | Implemented and live-Windows-verified. Standard `dm_run` records source-integrity observations against the exact owned runtime and `dm_stop` reports tracked mutations without reverting them. The managed provenance/integrity gate completed with a finalized journal and no remaining owned process. |
+| MMCP-PROF-020 | Implemented and portable-fixture-verified. Bounded readers validate and hash BYOND proc profiles, sendmaps data, performance CSV, structured JSONL, and user-defined events; phase alignment, cumulative/interval classification, redaction, summary, and comparison have dedicated tests. Those tests passed locally and in the hosted Windows and Ubuntu Rust jobs. Real workload interpretation still requires matching run identity and phase evidence. |
+| MMCP-PROF-021 | Implemented and live-Windows-verified. Fixture manifests bind source, generated bindings, native modules, service executable, and compiler artifacts. Changed input and failed compilation classify the retained DMB as `stale_build_artifact`; the managed gate proved rejection survives restart and that restoring inputs permits a fresh compile and launch. |
 
 The updated integration contract performs an immediate capture, waits through the drain interval,
 then requires three valid steady-state captures with positive raw and trace ranges, complete frames,
@@ -147,3 +148,33 @@ journal. The final trace reported 299 complete frames and the known fixture proc
 hotspot and exact-zone queries. This closes the tested Windows scenarios for MMCP-PROF-001, 002,
 004, 005, 013, 014, 015, and 016. Ubuntu native and live Linux BYOND qualification remain CI-owned
 and are not implied by this Windows result.
+
+### Current verification and CI recovery
+
+A later Windows verification used Meridian-MCP build ID
+`302a2fe17bf0e8baee2532a4f78525baf64c0f6f204cb013afe4986d04129a7b`, executable SHA-256
+`864c83d59351f567e01b5704cac97f16c15bcd574fb7acd36dac2fb62deb7af5`, BYOND 516.1687, and the
+patched Tracy helper package. The managed provenance/integrity gate passed fresh compile and launch,
+rejected a changed-input DMB as `stale_build_artifact`, retained that rejection across MCP restart,
+and passed a restored compile and launch with a finalized journal and zero owned processes remaining.
+The focused repository-root, proc-resolution, native-evidence reader/timeline/summary/comparison, and
+process-metrics tests also passed.
+
+The standalone Tracy experiment runner then completed three five-second controls on the default
+game port. Prepare, launch, status, capture, frame analysis, repeated-control statistics, stop,
+independent validation, and integrity-journal finalization all passed. Repeating the same launch with
+the older installed helper package stalled during collector readiness after DreamDaemon emitted
+`MERIDIAN_TRACY_READY`; this was a stale helper-package problem, not a game-port defect. The patched
+helper manifest must therefore be installed together with the matching MCP release before production
+experiments.
+
+The most recent public Actions runs at revision `cdd1b3e4642381273deefd18d43ed11f4da25339` remain red
+until the runner repair is committed and rerun. Both failures share one startup regression: development
+mode now requires `MERIDIAN_MCP_STATE_DIR`, but the compatibility, Tracy, auxtools, experiment, and
+non-Windows boundary runners did not provide private state. The local repair gives every affected
+runner a verified, unique operating-system temporary state directory and removes that exact directory
+afterward. It also updates the duplicated `rift_compile` schema assertion for
+`fixture_manifest_path` and adds a workflow contract covering private-state provisioning. The full
+Windows Meridian compatibility gate and the real headless auxtools and Tracy gates pass with this
+repair. Hosted Ubuntu acceptance remains pending the next Actions run; local Windows success does not
+close that platform boundary.

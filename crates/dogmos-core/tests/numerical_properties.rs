@@ -1,7 +1,7 @@
 use dogmos_core::numerics::{
 	conduction::{
-		conduction_step, heat_row_weight, ConductionError, BASE_HEAT_STEP_SECONDS,
-		BYOND_INFINITY_THRESHOLD,
+		conduction_step, conduction_step_cancellable, heat_row_weight, ConductionError,
+		BASE_HEAT_STEP_SECONDS, BYOND_INFINITY_THRESHOLD,
 	},
 	diffusion::{
 		diffusion_self_weight, diffusion_step, diffusion_step_into,
@@ -434,4 +434,25 @@ fn conduction_is_deterministic_and_elapsed_time_is_explicit() {
 			.sum::<f64>();
 		assert!((energy - 160_000.0).abs() / 160_000.0 < 1.0e-4);
 	}
+}
+
+#[test]
+fn conduction_cancellation_interrupts_substeps() {
+	let mut temperatures = [1000.0, 300.0];
+	let mut checks = 0;
+	assert_eq!(
+		conduction_step_cancellable(
+			&mut temperatures,
+			&[10.0, 10.0],
+			&[1.0, 1.0],
+			&[(0, 1)],
+			0.5,
+			|| {
+				checks += 1;
+				checks > 1
+			},
+		),
+		Err(ConductionError::Cancelled)
+	);
+	assert_eq!(checks, 2);
 }

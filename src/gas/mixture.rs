@@ -896,10 +896,10 @@ impl Mul<f32> for &Mixture {
 mod tests {
 
 	use super::*;
-	use crate::gas::types::{destroy_gas_statics, register_gas_manually, set_gas_statics_manually};
-	use std::sync::Mutex;
-
-	static GAS_TEST_LOCK: Mutex<()> = Mutex::new(());
+	use crate::gas::{
+		types::{destroy_gas_statics, register_gas_manually, set_gas_statics_manually},
+		GAS_TEST_LOCK,
+	};
 
 	fn initialize_gases() {
 		set_gas_statics_manually();

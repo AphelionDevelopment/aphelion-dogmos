@@ -1,7 +1,7 @@
 use dogmos_core::{
 	metadata::{
-		GasFireRole, GasId, GasMetadata, GasRequirement, ReactionId, ReactionMetadata,
-		ReactionMetadataError, ReactionMetadataRegistry,
+		GasFireRole, GasId, GasMetadata, GasRequirement, ReactionExecution, ReactionId,
+		ReactionMetadata, ReactionMetadataError, ReactionMetadataRegistry,
 	},
 	world::{DogmosWorld, LifecycleAction, LifecycleMutation, MixtureStateMutation, WorldError},
 	MixtureHandle,
@@ -33,6 +33,7 @@ fn reaction(id: u32, key: &str, priority: f32) -> ReactionMetadata {
 		minimum_energy: None,
 		minimum_fire_reagents: None,
 		gas_requirements: Box::new([]),
+		execution: ReactionExecution::Dm,
 	}
 }
 
