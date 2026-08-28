@@ -1,15 +1,16 @@
 use dogmos_byond::{
+	decode_production_callback_batch, decode_production_continuation_token,
 	decode_production_mixture_snapshot, decode_production_simulation_stage,
-	encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
-	encode_production_mixture_command, encode_production_mixture_lifecycle_batch,
-	encode_production_mixture_state_batch, encode_production_reaction_metadata,
-	encode_production_simulation_stage, encode_production_turf_adjacency_batch,
-	encode_production_turf_lifecycle_batch, ClientError, DogmosClient,
+	encode_production_continuation_adjust_multiple, encode_production_gas_metadata,
+	encode_production_mixture_adjust_multiple, encode_production_mixture_command,
+	encode_production_mixture_lifecycle_batch, encode_production_mixture_state_batch,
+	encode_production_reaction_metadata, encode_production_simulation_stage,
+	encode_production_turf_adjacency_batch, encode_production_turf_lifecycle_batch, ClientError,
+	DogmosClient,
 };
 use dogmos_protocol::{
-	encode_continuation_adjust_multiple_request, encode_lifecycle_batch, BuildIdentity,
-	CallbackBatchRequest, CallbackEvent, CapacityLimits, HandshakePayload, LifecycleAction,
-	LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse,
+	encode_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CapacityLimits, HandshakePayload,
+	LifecycleAction, LifecycleMutation, MixtureCommandRequest, MixtureCommandResponse,
 	MixtureSnapshot, MixtureSnapshotRequest, OperationKind, ScalarValue, ServiceTelemetry,
 	SimulationStageResponse, WireHandle, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN,
 	DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS,
@@ -338,18 +339,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 		&CallbackBatchRequest { max_events: 1 }.encode(),
 		&mut callback_response,
 	)?;
-	let continuation = CallbackEvent::decode(&callback_response[CALLBACK_BATCH_HEADER_LEN..])?
-		.continuation
-		.ok_or("cross-bitness DM reaction omitted its continuation")?;
-	encode_continuation_adjust_multiple_request(
-		continuation,
-		first_mixture,
-		&[MixtureAdjustment {
-			gas_id: 0,
-			delta: ScalarValue(-0.125),
-		}],
-		&mut adjust_multiple_request,
-	)?;
+	let callback_fields = decode_production_callback_batch(&callback_response, 1)?;
+	let continuation_fields = &callback_fields[33..43];
+	let continuation = decode_production_continuation_token(continuation_fields)?;
+	let mut continuation_adjust_fields = continuation_fields.to_vec();
+	continuation_adjust_fields.extend([0.0, 1.0, 0.0, -0.125]);
+	adjust_multiple_request =
+		encode_production_continuation_adjust_multiple(&continuation_adjust_fields)?;
 	client.round_trip_into(
 		OperationKind::ContinuationAdjustMultiple,
 		&adjust_multiple_request,
@@ -371,9 +367,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 		&CallbackBatchRequest { max_events: 1 }.encode(),
 		&mut callback_response,
 	)?;
-	let cancelled = CallbackEvent::decode(&callback_response[CALLBACK_BATCH_HEADER_LEN..])?
-		.continuation
-		.ok_or("cross-bitness DM reaction omitted its cancellation token")?;
+	let cancelled_fields = decode_production_callback_batch(&callback_response, 1)?;
+	let cancelled = decode_production_continuation_token(&cancelled_fields[33..43])?;
 	assert_eq!(
 		client.round_trip_into(
 			OperationKind::ContinuationCancel,

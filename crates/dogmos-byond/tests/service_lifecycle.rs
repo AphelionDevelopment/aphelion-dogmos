@@ -25,3 +25,10 @@ fn production_service_lifecycle_exports_are_distinct_from_benchmarks() {
 		);
 	}
 }
+
+#[test]
+fn production_bindings_exclude_opt_in_diagnostics() {
+	let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let bindings = fs::read_to_string(crate_root.join("bindings.dm")).unwrap();
+	assert!(!bindings.contains("/proc/dogmos_ipc_benchmark_"));
+}

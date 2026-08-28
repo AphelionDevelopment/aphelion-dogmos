@@ -1,47 +1,50 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod client;
 mod ffi;
+mod session;
+
+pub use client::{BoundedDogmosClient, ClientError, DogmosClient};
+use session::{start_service_session, ServiceSession};
 
 use byondapi::prelude::ByondValue;
 use dogmos_protocol::{
-	decode_adjust_multiple_request, encode_adjacency_batch, encode_adjust_multiple_request,
+	decode_adjust_multiple_request, encode_adjust_multiple_request,
 	encode_continuation_adjust_multiple_request, encode_gas_metadata_batch, encode_lifecycle_batch,
 	encode_mixture_state_batch, encode_reaction_metadata_batch, encode_turf_adjacency_batch,
 	encode_turf_heat_adjacency_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
-	read_frame_into, write_frame, AdjacencyMutation, BuildIdentity, CallbackBatchHeader,
-	CallbackBatchRequest, CallbackEvent, CapacityLimits, ContinuationCommandRequest,
-	ContinuationToken, GasMetadataRegistration, HandshakePayload, LifecycleAction,
-	LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse,
-	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolError,
-	ProtocolHeader, ReactionMetadataRegistration, ScalarValue, ServiceErrorCode, ServiceTelemetry,
-	SimulationStage, SimulationStageRequest, SimulationStageResponse, TransportError,
-	TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatState,
-	TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct, WireGasRequirement,
-	WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN,
-	DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, FLAG_ERROR, GAS_METADATA_RECORD_LEN,
-	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_ADJUSTMENT_LEN,
-	MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN,
-	MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, REACTION_METADATA_RECORD_LEN,
-	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN,
-	TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN, TURF_LIFECYCLE_MUTATION_LEN,
+	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, ContinuationCommandRequest,
+	ContinuationToken, GasMetadataRegistration, LifecycleAction, LifecycleMutation,
+	MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot,
+	MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ReactionMetadataRegistration,
+	ScalarValue, ServiceTelemetry, SimulationStage, SimulationStageRequest,
+	SimulationStageResponse, TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation,
+	TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
+	WireGasRequirement, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
+	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, GAS_METADATA_RECORD_LEN,
+	MAX_GAS_SLOTS, MIXTURE_ADJUSTMENT_LEN, MIXTURE_ADJUST_MULTIPLE_HEADER_LEN,
+	MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN,
+	MIXTURE_STATE_MUTATION_LEN, REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN,
+	SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN,
+	TURF_HEAT_MUTATION_LEN, TURF_LIFECYCLE_MUTATION_LEN,
 };
-use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, Stream};
-use std::{
-	fmt, fs,
-	io::{self, Write},
-	path::Path,
-	process::{Child, Command, Stdio},
-	sync::mpsc::{self, SyncSender},
-	sync::{Mutex, OnceLock},
-	thread,
-	time::{Duration, Instant},
-};
+use std::{fs, path::Path, sync::Mutex, time::Duration};
 
+#[cfg(feature = "diagnostic-bindings")]
+use dogmos_protocol::{encode_adjacency_batch, AdjacencyMutation, ServiceErrorCode};
+#[cfg(feature = "diagnostic-bindings")]
+use std::{sync::OnceLock, time::Instant};
+
+#[cfg(feature = "diagnostic-bindings")]
 static BENCHMARK_SESSION: Mutex<Option<ServiceSession>> = Mutex::new(None);
 static SERVICE_SESSION: Mutex<Option<ServiceSession>> = Mutex::new(None);
+#[cfg(feature = "diagnostic-bindings")]
 static BENCHMARK_CLOCK: OnceLock<Instant> = OnceLock::new();
+#[cfg(feature = "diagnostic-bindings")]
 static BENCHMARK_LIFECYCLE_BATCH: OnceLock<Vec<u8>> = OnceLock::new();
+#[cfg(feature = "diagnostic-bindings")]
 static BENCHMARK_STATE_BATCH: OnceLock<Vec<u8>> = OnceLock::new();
+#[cfg(feature = "diagnostic-bindings")]
 static BENCHMARK_ADJACENCY_BATCH: OnceLock<Vec<u8>> = OnceLock::new();
 const BENCHMARK_CALLBACK_CAPACITY: u32 = 65_536;
 const BENCHMARK_CONTROL_PAYLOAD: usize = 64 * 1024;
@@ -123,485 +126,6 @@ fn binding_sort_key(block: &str) -> &str {
 		.lines()
 		.find(|line| line.starts_with('/') || line.starts_with("#define "))
 		.unwrap_or(block)
-}
-
-struct ServiceSession {
-	client: BoundedDogmosClient,
-	service: Child,
-	reaped: bool,
-	#[cfg(windows)]
-	service_job: Option<std::os::windows::io::OwnedHandle>,
-}
-
-impl ServiceSession {
-	fn request(
-		&mut self,
-		operation: OperationKind,
-		payload: &[u8],
-		response_capacity: usize,
-	) -> Result<Vec<u8>, ClientError> {
-		let result = self.client.round_trip(
-			operation,
-			payload,
-			response_capacity,
-			BENCHMARK_REQUEST_TIMEOUT,
-		);
-		if matches!(
-			result,
-			Err(ClientError::RequestTimeout | ClientError::WorkerStopped)
-		) {
-			self.terminate_service();
-		}
-		result
-	}
-
-	fn terminate_service(&mut self) {
-		#[cfg(windows)]
-		self.service_job.take();
-		let _ = self.service.kill();
-		let _ = self.service.wait();
-		self.reaped = true;
-	}
-
-	fn is_healthy(&mut self) -> io::Result<bool> {
-		if self.client.is_worker_finished() {
-			return Ok(false);
-		}
-		match self.service.try_wait()? {
-			Some(_) => {
-				self.reaped = true;
-				Ok(false)
-			}
-			None => Ok(true),
-		}
-	}
-
-	fn shutdown(&mut self) -> eyre::Result<()> {
-		self.request(OperationKind::Shutdown, &[], 0)?;
-		if !self.service.wait()?.success() {
-			self.reaped = true;
-			return Err(eyre::eyre!("dogmosd did not shut down cleanly"));
-		}
-		self.reaped = true;
-		Ok(())
-	}
-}
-
-impl Drop for ServiceSession {
-	fn drop(&mut self) {
-		if !self.reaped {
-			self.terminate_service();
-		}
-	}
-}
-
-#[derive(Debug)]
-pub enum ClientError {
-	Io(io::Error),
-	Protocol(ProtocolError),
-	Transport(TransportError),
-	ServerBusy,
-	Server(ServiceErrorCode),
-	ConnectTimeout,
-	RequestTimeout,
-	WorkerStopped,
-}
-
-impl fmt::Display for ClientError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{self:?}")
-	}
-}
-
-impl std::error::Error for ClientError {}
-
-impl From<io::Error> for ClientError {
-	fn from(error: io::Error) -> Self {
-		Self::Io(error)
-	}
-}
-
-impl From<ProtocolError> for ClientError {
-	fn from(error: ProtocolError) -> Self {
-		Self::Protocol(error)
-	}
-}
-
-impl From<TransportError> for ClientError {
-	fn from(error: TransportError) -> Self {
-		Self::Transport(error)
-	}
-}
-
-pub struct DogmosClient {
-	stream: Stream,
-	local: HandshakePayload,
-	peer: HandshakePayload,
-	next_request_id: u64,
-}
-
-impl DogmosClient {
-	pub fn connect(
-		endpoint: &str,
-		local: HandshakePayload,
-		timeout: Duration,
-	) -> Result<Self, ClientError> {
-		let name = endpoint.to_ns_name::<GenericNamespaced>()?;
-		let deadline = Instant::now() + timeout;
-		let mut stream = loop {
-			match ConnectOptions::new().name(name.clone()).connect_sync() {
-				Ok(stream) => break stream,
-				Err(error) if Instant::now() < deadline => {
-					if !matches!(
-						error.kind(),
-						io::ErrorKind::NotFound
-							| io::ErrorKind::ConnectionRefused
-							| io::ErrorKind::WouldBlock
-					) {
-						return Err(ClientError::Io(error));
-					}
-					thread::sleep(Duration::from_millis(5));
-				}
-				Err(_) => return Err(ClientError::ConnectTimeout),
-			}
-		};
-		let request = ProtocolHeader::request(
-			OperationKind::Handshake,
-			1,
-			local.world_generation,
-			local.world_nonce,
-			HANDSHAKE_PAYLOAD_LEN as u32,
-			0,
-		);
-		write_frame(&mut stream, request, &local.encode())?;
-		let mut handshake_buffer = [0_u8; HANDSHAKE_PAYLOAD_LEN];
-		let (response, response_len) = read_frame_into(&mut stream, &mut handshake_buffer)?;
-		if response.flags & FLAG_ERROR != 0 {
-			let code = ServiceErrorCode::decode(&handshake_buffer[..response_len])?;
-			return match code {
-				ServiceErrorCode::Busy => Err(ClientError::ServerBusy),
-				other => Err(ClientError::Server(other)),
-			};
-		}
-		response.validate_response_to(&request)?;
-		let peer = HandshakePayload::decode(&handshake_buffer[..response_len])?;
-		peer.validate_peer(&local)?;
-
-		Ok(Self {
-			stream,
-			local,
-			peer,
-			next_request_id: 2,
-		})
-	}
-
-	pub const fn peer(&self) -> &HandshakePayload {
-		&self.peer
-	}
-
-	pub fn echo(&mut self, payload: &[u8]) -> Result<Vec<u8>, ClientError> {
-		let mut response = vec![0_u8; payload.len()];
-		let response_len = self.round_trip_into(OperationKind::Echo, payload, &mut response)?;
-		response.truncate(response_len);
-		Ok(response)
-	}
-
-	pub fn round_trip_into(
-		&mut self,
-		operation: OperationKind,
-		payload: &[u8],
-		response_buffer: &mut [u8],
-	) -> Result<usize, ClientError> {
-		self.round_trip_into_with_deadline(operation, payload, response_buffer, 0)
-	}
-
-	pub fn round_trip_into_with_deadline(
-		&mut self,
-		operation: OperationKind,
-		payload: &[u8],
-		response_buffer: &mut [u8],
-		deadline_ns: u64,
-	) -> Result<usize, ClientError> {
-		let payload_len = u32::try_from(payload.len()).map_err(|_| {
-			ClientError::Protocol(ProtocolError::PayloadTooLarge {
-				actual: u32::MAX,
-				maximum: MAX_CONTROL_PAYLOAD,
-			})
-		})?;
-		let request = ProtocolHeader::request(
-			operation,
-			self.take_request_id(),
-			self.local.world_generation,
-			self.local.world_nonce,
-			payload_len,
-			deadline_ns,
-		);
-		write_frame(&mut self.stream, request, payload)?;
-		let (response, response_len) = read_frame_into(&mut self.stream, response_buffer)?;
-		if response.flags & FLAG_ERROR != 0 {
-			let code = ServiceErrorCode::decode(&response_buffer[..response_len])?;
-			return Err(ClientError::Server(code));
-		}
-		response.validate_response_to(&request)?;
-		Ok(response_len)
-	}
-
-	pub fn shutdown(&mut self) -> Result<(), ClientError> {
-		let request = ProtocolHeader::request(
-			OperationKind::Shutdown,
-			self.take_request_id(),
-			self.local.world_generation,
-			self.local.world_nonce,
-			0,
-			0,
-		);
-		write_frame(&mut self.stream, request, &[])?;
-		let mut response_buffer = [];
-		let (response, response_len) = read_frame_into(&mut self.stream, &mut response_buffer)?;
-		response.validate_response_to(&request)?;
-		if response_len != 0 {
-			return Err(ClientError::Protocol(ProtocolError::TrailingBytes {
-				expected_frame_len: dogmos_protocol::PROTOCOL_HEADER_LEN as u32,
-				actual_frame_len: dogmos_protocol::PROTOCOL_HEADER_LEN as u32 + response_len as u32,
-			}));
-		}
-		Ok(())
-	}
-
-	pub fn allocate_diagnostic(&mut self, bytes: u64) -> Result<u64, ClientError> {
-		let mut response = [0_u8; 8];
-		let response_len = self.round_trip_into(
-			OperationKind::AllocateDiagnostic,
-			&bytes.to_le_bytes(),
-			&mut response,
-		)?;
-		if response_len != response.len() {
-			return Err(ClientError::Protocol(ProtocolError::TruncatedPayload {
-				expected_frame_len: dogmos_protocol::PROTOCOL_HEADER_LEN as u32 + 8,
-				actual_frame_len: dogmos_protocol::PROTOCOL_HEADER_LEN as u32 + response_len as u32,
-			}));
-		}
-		Ok(u64::from_le_bytes(response))
-	}
-
-	fn take_request_id(&mut self) -> u64 {
-		let request_id = self.next_request_id;
-		self.next_request_id = self.next_request_id.wrapping_add(1);
-		request_id
-	}
-}
-
-struct IoWorkerRequest {
-	operation: OperationKind,
-	payload: Vec<u8>,
-	response_capacity: usize,
-	deadline_ns: u64,
-	reply: SyncSender<Result<Vec<u8>, ClientError>>,
-}
-
-pub struct BoundedDogmosClient {
-	sender: Option<SyncSender<IoWorkerRequest>>,
-	worker: Option<thread::JoinHandle<()>>,
-	peer: HandshakePayload,
-	canceller: IoCanceller,
-}
-
-impl BoundedDogmosClient {
-	pub fn new(mut client: DogmosClient) -> Result<Self, ClientError> {
-		let peer = *client.peer();
-		let io_handle_token = current_io_handle_token(&client)?;
-		let (sender, receiver) = mpsc::sync_channel::<IoWorkerRequest>(1);
-		let (thread_sender, thread_receiver) = mpsc::sync_channel(1);
-		let worker = thread::spawn(move || {
-			if thread_sender.send(current_thread_token()).is_err() {
-				return;
-			}
-			while let Ok(request) = receiver.recv() {
-				let mut response = vec![0_u8; request.response_capacity];
-				let result = client
-					.round_trip_into_with_deadline(
-						request.operation,
-						&request.payload,
-						&mut response,
-						request.deadline_ns,
-					)
-					.map(|response_len| {
-						response.truncate(response_len);
-						response
-					});
-				if request.reply.send(result).is_err() {
-					return;
-				}
-			}
-		});
-		let thread_token = thread_receiver
-			.recv()
-			.map_err(|_| ClientError::WorkerStopped)?;
-		let canceller = IoCanceller::new(thread_token, io_handle_token)?;
-		Ok(Self {
-			sender: Some(sender),
-			worker: Some(worker),
-			peer,
-			canceller,
-		})
-	}
-
-	pub const fn peer(&self) -> &HandshakePayload {
-		&self.peer
-	}
-
-	pub fn echo(&mut self, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, ClientError> {
-		self.round_trip(OperationKind::Echo, payload, payload.len(), timeout)
-	}
-
-	pub fn round_trip(
-		&mut self,
-		operation: OperationKind,
-		payload: &[u8],
-		response_capacity: usize,
-		timeout: Duration,
-	) -> Result<Vec<u8>, ClientError> {
-		let Some(sender) = self.sender.as_ref() else {
-			return Err(ClientError::WorkerStopped);
-		};
-		let (reply, response) = mpsc::sync_channel(1);
-		let deadline_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
-		sender
-			.send(IoWorkerRequest {
-				operation,
-				payload: payload.to_vec(),
-				response_capacity,
-				deadline_ns,
-				reply,
-			})
-			.map_err(|_| ClientError::WorkerStopped)?;
-		match response.recv_timeout(timeout) {
-			Ok(result) => result,
-			Err(mpsc::RecvTimeoutError::Timeout) => {
-				self.sender.take();
-				let _ = self.canceller.cancel();
-				Err(ClientError::RequestTimeout)
-			}
-			Err(mpsc::RecvTimeoutError::Disconnected) => {
-				self.sender.take();
-				Err(ClientError::WorkerStopped)
-			}
-		}
-	}
-
-	pub fn is_worker_finished(&self) -> bool {
-		self.worker
-			.as_ref()
-			.is_none_or(thread::JoinHandle::is_finished)
-	}
-}
-
-impl Drop for BoundedDogmosClient {
-	fn drop(&mut self) {
-		self.sender.take();
-		if !self.is_worker_finished() {
-			let _ = self.canceller.cancel();
-		}
-		if self.is_worker_finished() {
-			if let Some(worker) = self.worker.take() {
-				let _ = worker.join();
-			}
-		}
-	}
-}
-
-#[cfg(windows)]
-struct IoCanceller {
-	thread: std::os::windows::io::OwnedHandle,
-	pipe: std::os::windows::io::OwnedHandle,
-}
-
-#[cfg(windows)]
-impl IoCanceller {
-	fn new(thread_id: u32, pipe: std::os::windows::io::OwnedHandle) -> Result<Self, ClientError> {
-		use std::os::windows::io::FromRawHandle;
-		use windows_sys::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
-
-		// SAFETY: the thread ID came from the live worker; a successful call returns an owned handle.
-		let handle = unsafe { OpenThread(THREAD_TERMINATE, 0, thread_id) };
-		if handle.is_null() {
-			return Err(ClientError::Io(io::Error::last_os_error()));
-		}
-		// SAFETY: OpenThread returned a new handle owned by this caller.
-		Ok(Self {
-			// SAFETY: OpenThread returned a new handle owned by this caller.
-			thread: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
-			pipe,
-		})
-	}
-
-	fn cancel(&self) -> io::Result<()> {
-		use std::os::windows::io::AsRawHandle;
-		use windows_sys::Win32::System::IO::{CancelIoEx, CancelSynchronousIo};
-
-		// SAFETY: the pipe is still owned by the worker while its request is outstanding.
-		if unsafe { CancelIoEx(self.pipe.as_raw_handle(), std::ptr::null()) } == 0 {
-			let error = io::Error::last_os_error();
-			if error.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32)
-			{
-				return Err(error);
-			}
-		}
-
-		// SAFETY: the handle remains live and identifies only the dedicated I/O worker thread.
-		if unsafe { CancelSynchronousIo(self.thread.as_raw_handle()) } == 0 {
-			let error = io::Error::last_os_error();
-			if error.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32)
-			{
-				return Err(error);
-			}
-		}
-		Ok(())
-	}
-}
-
-#[cfg(windows)]
-fn current_thread_token() -> u32 {
-	// SAFETY: GetCurrentThreadId has no preconditions.
-	unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
-}
-
-#[cfg(windows)]
-fn current_io_handle_token(
-	client: &DogmosClient,
-) -> Result<std::os::windows::io::OwnedHandle, ClientError> {
-	use interprocess::TryClone;
-
-	match client.stream.try_clone()? {
-		Stream::NamedPipe(stream) => Ok(stream.into()),
-	}
-}
-
-#[cfg(not(windows))]
-struct IoCanceller;
-
-#[cfg(not(windows))]
-struct IoHandleToken;
-
-#[cfg(not(windows))]
-impl IoCanceller {
-	fn new(_thread_id: u32, _pipe: IoHandleToken) -> Result<Self, ClientError> {
-		Ok(Self)
-	}
-
-	fn cancel(&self) -> io::Result<()> {
-		Ok(())
-	}
-}
-
-#[cfg(not(windows))]
-fn current_thread_token() -> u32 {
-	0
-}
-
-#[cfg(not(windows))]
-fn current_io_handle_token(_client: &DogmosClient) -> Result<IoHandleToken, ClientError> {
-	Ok(IoHandleToken)
 }
 
 #[auxmacros::bind("/proc/dogmos_abi_version")]
@@ -782,17 +306,22 @@ pub fn decode_production_callback_batch(
 		append_u32_words(&mut fields, value);
 	}
 	append_u64_words(&mut fields, header.rejected);
-	let mut last_sequence = None;
+	let mut last_sequence: Option<u64> = None;
 	for event_bytes in response[CALLBACK_BATCH_HEADER_LEN..]
 		.as_chunks::<CALLBACK_EVENT_LEN>()
 		.0
 	{
 		let event = CallbackEvent::decode(event_bytes)?;
-		if last_sequence.is_some_and(|sequence| event.sequence != sequence + 1) {
-			return Err(eyre::eyre!(
-				"Dogmos callback sequence is not contiguous at {}",
-				event.sequence
-			));
+		if let Some(sequence) = last_sequence {
+			let expected = sequence.checked_add(1).ok_or_else(|| {
+				eyre::eyre!("Dogmos callback sequence overflowed after {sequence}")
+			})?;
+			if event.sequence != expected {
+				return Err(eyre::eyre!(
+					"Dogmos callback sequence is not contiguous at {}",
+					event.sequence
+				));
+			}
 		}
 		last_sequence = Some(event.sequence);
 		append_u64_words(&mut fields, event.sequence);
@@ -1822,6 +1351,7 @@ fn production_request(
 	Ok(session.request(operation, payload, response_capacity)?)
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_start")]
 fn dogmos_ipc_benchmark_start(service_path: ByondValue) -> eyre::Result<ByondValue> {
 	let service_path = service_path.get_string()?;
@@ -1837,6 +1367,7 @@ fn dogmos_ipc_benchmark_start(service_path: ByondValue) -> eyre::Result<ByondVal
 	Ok(true.into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_scalar_get")]
 fn dogmos_ipc_benchmark_scalar_get() -> eyre::Result<ByondValue> {
 	let mut session = BENCHMARK_SESSION
@@ -1849,6 +1380,7 @@ fn dogmos_ipc_benchmark_scalar_get() -> eyre::Result<ByondValue> {
 	Ok(scalar_response_value(&response, response.len())?.into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_snapshot")]
 fn dogmos_ipc_benchmark_snapshot() -> eyre::Result<ByondValue> {
 	let mut session = BENCHMARK_SESSION
@@ -1878,24 +1410,28 @@ fn dogmos_ipc_benchmark_snapshot() -> eyre::Result<ByondValue> {
 	Ok((MixtureSnapshot::decode(&response)?.gas_count as f32).into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_lifecycle_batch")]
 fn dogmos_ipc_benchmark_lifecycle_batch() -> eyre::Result<ByondValue> {
 	let request = BENCHMARK_LIFECYCLE_BATCH.get_or_init(make_benchmark_lifecycle_batch);
 	benchmark_counted_command(OperationKind::MixtureLifecycleBatch, request)
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_state_batch")]
 fn dogmos_ipc_benchmark_state_batch() -> eyre::Result<ByondValue> {
 	let request = BENCHMARK_STATE_BATCH.get_or_init(make_benchmark_state_batch);
 	benchmark_counted_command(OperationKind::MixtureStateBatch, request)
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_adjacency_batch")]
 fn dogmos_ipc_benchmark_adjacency_batch() -> eyre::Result<ByondValue> {
 	let request = BENCHMARK_ADJACENCY_BATCH.get_or_init(make_benchmark_adjacency_batch);
 	benchmark_counted_command(OperationKind::AdjacencyBatch, request)
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_simulation_stage")]
 fn dogmos_ipc_benchmark_simulation_stage() -> eyre::Result<ByondValue> {
 	let request = SimulationStageRequest {
@@ -1923,6 +1459,7 @@ fn dogmos_ipc_benchmark_simulation_stage() -> eyre::Result<ByondValue> {
 	Ok((SimulationStageResponse::decode(&response)?.work_items as f32).into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_callback_enqueue")]
 fn dogmos_ipc_benchmark_callback_enqueue(count: ByondValue) -> eyre::Result<ByondValue> {
 	let request = CallbackBatchRequest {
@@ -1948,6 +1485,7 @@ fn dogmos_ipc_benchmark_callback_enqueue(count: ByondValue) -> eyre::Result<Byon
 	}
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_callback_drain")]
 fn dogmos_ipc_benchmark_callback_drain(max_events: ByondValue) -> eyre::Result<ByondValue> {
 	let request = CallbackBatchRequest {
@@ -1982,7 +1520,7 @@ fn dogmos_ipc_benchmark_callback_drain(max_events: ByondValue) -> eyre::Result<B
 		));
 	}
 	let mut first_sequence = 0;
-	let mut last_sequence = 0;
+	let mut last_sequence: u64 = 0;
 	for (index, event_bytes) in response[CALLBACK_BATCH_HEADER_LEN..response_len]
 		.as_chunks::<CALLBACK_EVENT_LEN>()
 		.0
@@ -1992,11 +1530,16 @@ fn dogmos_ipc_benchmark_callback_drain(max_events: ByondValue) -> eyre::Result<B
 		let event = CallbackEvent::decode(event_bytes)?;
 		if index == 0 {
 			first_sequence = event.sequence;
-		} else if event.sequence != last_sequence + 1 {
-			return Err(eyre::eyre!(
-				"Dogmos callback sequence skipped from {last_sequence} to {}",
-				event.sequence
-			));
+		} else {
+			let expected = last_sequence.checked_add(1).ok_or_else(|| {
+				eyre::eyre!("Dogmos callback sequence overflowed after {last_sequence}")
+			})?;
+			if event.sequence != expected {
+				return Err(eyre::eyre!(
+					"Dogmos callback sequence skipped from {last_sequence} to {}",
+					event.sequence
+				));
+			}
 		}
 		last_sequence = event.sequence;
 	}
@@ -2014,6 +1557,7 @@ fn dogmos_ipc_benchmark_callback_drain(max_events: ByondValue) -> eyre::Result<B
 	Ok(summary)
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 fn benchmark_counted_command(operation: OperationKind, request: &[u8]) -> eyre::Result<ByondValue> {
 	let mut session = BENCHMARK_SESSION
 		.lock()
@@ -2031,6 +1575,7 @@ fn benchmark_counted_command(operation: OperationKind, request: &[u8]) -> eyre::
 	Ok((u32::from_le_bytes(response.try_into().unwrap()) as f32).into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 fn make_benchmark_lifecycle_batch() -> Vec<u8> {
 	let entries = (0..64)
 		.map(|slot| LifecycleMutation {
@@ -2047,6 +1592,7 @@ fn make_benchmark_lifecycle_batch() -> Vec<u8> {
 	output
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 fn make_benchmark_state_batch() -> Vec<u8> {
 	let entries = (0..64)
 		.map(|slot| {
@@ -2070,6 +1616,7 @@ fn make_benchmark_state_batch() -> Vec<u8> {
 	output
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 fn make_benchmark_adjacency_batch() -> Vec<u8> {
 	let entries = (0..64)
 		.map(|slot| AdjacencyMutation {
@@ -2090,6 +1637,7 @@ fn make_benchmark_adjacency_batch() -> Vec<u8> {
 	output
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_service_pid")]
 fn dogmos_ipc_benchmark_service_pid() -> eyre::Result<ByondValue> {
 	let session = BENCHMARK_SESSION
@@ -2101,12 +1649,14 @@ fn dogmos_ipc_benchmark_service_pid() -> eyre::Result<ByondValue> {
 	Ok((session.client.peer().process_id as f32).into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_clock_microseconds")]
 fn dogmos_ipc_benchmark_clock_microseconds() -> eyre::Result<ByondValue> {
 	let origin = BENCHMARK_CLOCK.get_or_init(Instant::now);
 	Ok((origin.elapsed().as_secs_f32() * 1_000_000.0).into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_allocate")]
 fn dogmos_ipc_benchmark_allocate(bytes: ByondValue) -> eyre::Result<ByondValue> {
 	let bytes = diagnostic_bytes_from_number(bytes.get_number()?)?;
@@ -2126,6 +1676,7 @@ fn dogmos_ipc_benchmark_allocate(bytes: ByondValue) -> eyre::Result<ByondValue> 
 	Ok((u64::from_le_bytes(response) as f32).into())
 }
 
+#[cfg(feature = "diagnostic-bindings")]
 #[auxmacros::bind("/proc/dogmos_ipc_benchmark_stop")]
 fn dogmos_ipc_benchmark_stop() -> eyre::Result<ByondValue> {
 	let mut session = BENCHMARK_SESSION
@@ -2139,136 +1690,7 @@ fn dogmos_ipc_benchmark_stop() -> eyre::Result<ByondValue> {
 	Ok(true.into())
 }
 
-fn start_service_session(service_path: &str) -> eyre::Result<ServiceSession> {
-	let auth_token = system_auth_token()?;
-	let service_digest = dogmos_identity::sha256_file(Path::new(service_path))?;
-	let build_metadata = dogmos_identity::BuildMetadata::from_compile_environment()?;
-	let endpoint = format!(
-		"dogmos-byond-bench-{}-{}",
-		std::process::id(),
-		u64::from_le_bytes(auth_token[..8].try_into().unwrap()),
-	);
-	let handshake = HandshakePayload {
-		auth_token,
-		identity: BuildIdentity {
-			abi_version: DOGMOS_ABI_VERSION,
-			protocol_version: DOGMOS_PROTOCOL_VERSION,
-			source_revision: build_metadata.source_revision,
-			feature_fingerprint: build_metadata.feature_fingerprint,
-			executable_digest: service_digest,
-		},
-		capacities: CapacityLimits {
-			max_control_payload: BENCHMARK_CONTROL_PAYLOAD as u32,
-			max_batch_operations: 4096,
-			max_callback_events: BENCHMARK_CALLBACK_CAPACITY,
-			max_pending_continuations: BENCHMARK_CALLBACK_CAPACITY,
-			max_world_bytes: 8 * 1024 * 1024 * 1024,
-		},
-		process_id: std::process::id(),
-		world_generation: 1,
-		world_nonce: u64::from_le_bytes(auth_token[8..16].try_into().unwrap()),
-	};
-	let mut command = Command::new(service_path);
-	command
-		.arg("--echo-server")
-		.arg(&endpoint)
-		.stdin(Stdio::piped())
-		.stdout(Stdio::null())
-		.stderr(Stdio::null());
-	configure_service_command(&mut command);
-	let mut service = command.spawn()?;
-	#[cfg(windows)]
-	let service_job = match attach_kill_on_close_job(&service) {
-		Ok(job) => job,
-		Err(error) => {
-			let _ = service.kill();
-			let _ = service.wait();
-			return Err(error.into());
-		}
-	};
-	if let Err(error) = service
-		.stdin
-		.take()
-		.ok_or_else(|| eyre::eyre!("dogmosd stdin was not piped"))?
-		.write_all(&handshake.encode())
-	{
-		let _ = service.kill();
-		let _ = service.wait();
-		return Err(error.into());
-	}
-	let client = match DogmosClient::connect(&endpoint, handshake, Duration::from_secs(5)) {
-		Ok(client) => client,
-		Err(error) => {
-			let _ = service.kill();
-			let _ = service.wait();
-			return Err(error.into());
-		}
-	};
-	let client = BoundedDogmosClient::new(client)?;
-	Ok(ServiceSession {
-		client,
-		service,
-		reaped: false,
-		#[cfg(windows)]
-		service_job: Some(service_job),
-	})
-}
-
-#[cfg(windows)]
-fn configure_service_command(command: &mut Command) {
-	use std::os::windows::process::CommandExt;
-	use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-
-	command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn configure_service_command(_command: &mut Command) {}
-
-#[cfg(windows)]
-fn attach_kill_on_close_job(service: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
-	use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-	use windows_sys::Win32::System::JobObjects::{
-		AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-		SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-		JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-	};
-
-	// SAFETY: null security attributes and name request an unnamed job with the caller's default
-	// security descriptor. The returned handle is checked before ownership is transferred.
-	let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-	if raw_job.is_null() {
-		return Err(io::Error::last_os_error());
-	}
-	// SAFETY: `raw_job` is a newly-created, non-null owned handle and is transferred exactly once.
-	let job = unsafe { OwnedHandle::from_raw_handle(raw_job) };
-	// SAFETY: this Windows structure is plain integer/pointer data whose documented default is all
-	// zero before selecting the one limit flag used below.
-	let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-	limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-	// SAFETY: `job` remains live for the call and `limits` points to a correctly-sized initialized
-	// JOBOBJECT_EXTENDED_LIMIT_INFORMATION value.
-	let configured = unsafe {
-		SetInformationJobObject(
-			job.as_raw_handle(),
-			JobObjectExtendedLimitInformation,
-			std::ptr::from_ref(&limits).cast(),
-			std::mem::size_of_val(&limits) as u32,
-		)
-	};
-	if configured == 0 {
-		return Err(io::Error::last_os_error());
-	}
-	// SAFETY: both handles are live for the call; the child handle belongs to `service`, while the
-	// job handle remains owned by the returned `OwnedHandle`.
-	let assigned =
-		unsafe { AssignProcessToJobObject(job.as_raw_handle(), service.as_raw_handle()) };
-	if assigned == 0 {
-		return Err(io::Error::last_os_error());
-	}
-	Ok(job)
-}
-
+#[cfg(any(feature = "diagnostic-bindings", test))]
 fn diagnostic_bytes_from_number(bytes: f32) -> eyre::Result<u64> {
 	if !bytes.is_finite() || bytes < 0.0 || bytes > 8.0 * 1024.0 * 1024.0 * 1024.0 {
 		return Err(eyre::eyre!(
@@ -2278,6 +1700,7 @@ fn diagnostic_bytes_from_number(bytes: f32) -> eyre::Result<u64> {
 	Ok(bytes as u64)
 }
 
+#[cfg(any(feature = "diagnostic-bindings", test))]
 fn callback_count_from_number(count: f32) -> eyre::Result<u32> {
 	if !count.is_finite()
 		|| count < 0.0
@@ -2522,6 +1945,7 @@ fn mixture_command_response_value(response: MixtureCommandResponse) -> eyre::Res
 	Ok(output)
 }
 
+#[cfg(any(feature = "diagnostic-bindings", test))]
 fn scalar_response_value(response: &[u8], response_len: usize) -> eyre::Result<f32> {
 	if response_len != response.len() {
 		return Err(eyre::eyre!(
@@ -2540,40 +1964,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 		output.push(HEX[usize::from(byte & 0x0f)] as char);
 	}
 	output
-}
-
-#[cfg(windows)]
-fn system_auth_token() -> eyre::Result<[u8; 32]> {
-	use windows_sys::Win32::Security::Cryptography::{
-		BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-	};
-
-	let mut token = [0_u8; 32];
-	// SAFETY: the null algorithm handle selects the system RNG, and `token` is a live writable
-	// 32-byte buffer for the exact length passed to BCryptGenRandom.
-	let status = unsafe {
-		BCryptGenRandom(
-			std::ptr::null_mut(),
-			token.as_mut_ptr(),
-			token.len() as u32,
-			BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-		)
-	};
-	if status < 0 {
-		return Err(eyre::eyre!(
-			"BCryptGenRandom failed with NTSTATUS {status:#x}"
-		));
-	}
-	Ok(token)
-}
-
-#[cfg(not(windows))]
-fn system_auth_token() -> eyre::Result<[u8; 32]> {
-	use std::io::Read;
-
-	let mut token = [0_u8; 32];
-	fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
-	Ok(token)
 }
 
 #[cfg(test)]
@@ -3038,6 +2428,33 @@ mod tests {
 		assert!(decode_production_callback_batch(&response, 0).is_err());
 		response.pop();
 		assert!(decode_production_callback_batch(&response, 1).is_err());
+
+		let mut wrapped = CallbackBatchHeader {
+			returned: 2,
+			remaining: 0,
+			capacity: 256,
+			high_water: 2,
+			rejected: 0,
+		}
+		.encode()
+		.to_vec();
+		wrapped.extend(
+			CallbackEvent {
+				sequence: u64::MAX,
+				..event
+			}
+			.encode()
+			.unwrap(),
+		);
+		wrapped.extend(
+			CallbackEvent {
+				sequence: 0,
+				..event
+			}
+			.encode()
+			.unwrap(),
+		);
+		assert!(decode_production_callback_batch(&wrapped, 2).is_err());
 	}
 
 	#[test]
@@ -3128,8 +2545,8 @@ mod tests {
 	#[cfg(not(windows))]
 	#[test]
 	fn system_auth_tokens_are_nonempty_and_fresh() {
-		let first = super::system_auth_token().unwrap();
-		let second = super::system_auth_token().unwrap();
+		let first = super::session::system_auth_token().unwrap();
+		let second = super::session::system_auth_token().unwrap();
 		assert_ne!(first, [0; 32]);
 		assert_ne!(second, [0; 32]);
 		assert_ne!(first, second);

@@ -43,58 +43,6 @@
 	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_gas_metadata_install_ffi")
 	return call_ext(loaded)(numeric_records, keys, names, product_records)
 
-/proc/dogmos_ipc_benchmark_adjacency_batch()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_adjacency_batch_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_allocate(bytes)
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_allocate_ffi")
-	return call_ext(loaded)(bytes)
-
-/proc/dogmos_ipc_benchmark_callback_drain(max_events)
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_callback_drain_ffi")
-	return call_ext(loaded)(max_events)
-
-/proc/dogmos_ipc_benchmark_callback_enqueue(count)
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_callback_enqueue_ffi")
-	return call_ext(loaded)(count)
-
-/proc/dogmos_ipc_benchmark_clock_microseconds()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_clock_microseconds_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_lifecycle_batch()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_lifecycle_batch_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_scalar_get()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_scalar_get_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_service_pid()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_service_pid_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_simulation_stage()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_simulation_stage_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_snapshot()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_snapshot_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_start(service_path)
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_start_ffi")
-	return call_ext(loaded)(service_path)
-
-/proc/dogmos_ipc_benchmark_state_batch()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_state_batch_ffi")
-	return call_ext(loaded)()
-
-/proc/dogmos_ipc_benchmark_stop()
-	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_ipc_benchmark_stop_ffi")
-	return call_ext(loaded)()
-
 /proc/dogmos_mixture_adjust_multiple(fields)
 	var/static/loaded = load_ext(DOGMOS_BYOND, "byond:dogmos_mixture_adjust_multiple_ffi")
 	return call_ext(loaded)(fields)

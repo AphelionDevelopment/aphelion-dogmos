@@ -1,14 +1,68 @@
-name: Build Dogmos for Linux
+name: Build Dogmos release contract
 
 on:
   push:
     branches: [dogmos, master]
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
-  linux-build:
+  windows-pair:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: i686-pc-windows-msvc,x86_64-pc-windows-msvc
+
+      - name: Export exact build identity
+        shell: pwsh
+        run: |
+          Import-Module ./tools/DogmosBuildIdentity.psm1 -Force
+          $identity = Get-DogmosBuildIdentity -RepositoryRoot $env:GITHUB_WORKSPACE
+          "DOGMOS_SOURCE_REVISION=$($identity.source_revision)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DOGMOS_FEATURE_FINGERPRINT=$($identity.feature_fingerprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build Windows shim and service
+        shell: pwsh
+        run: |
+          cargo +1.98.0 build -p dogmos-byond --release --locked --target i686-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Windows shim build failed.' }
+          cargo +1.98.0 build -p dogmos-server --bin dogmosd --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Windows service build failed.' }
+
+      - name: Generate production bindings
+        shell: pwsh
+        working-directory: crates/dogmos-byond
+        run: |
+          cargo +1.98.0 run --quiet --locked --target i686-pc-windows-msvc -p dogmos-byond --example generate_bindings
+          if ($LASTEXITCODE -ne 0) { throw 'Dogmos binding generation failed.' }
+
+      - name: Stage Windows contract inputs
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'dogmos-windows'
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
+          Copy-Item target/i686-pc-windows-msvc/release/dogmos_byond.dll (Join-Path $output 'dogmos.dll')
+          Copy-Item target/i686-pc-windows-msvc/release/dogmos_byond.pdb (Join-Path $output 'dogmos.pdb')
+          Copy-Item target/x86_64-pc-windows-msvc/release/dogmosd.exe (Join-Path $output 'dogmosd.exe')
+          Copy-Item target/x86_64-pc-windows-msvc/release/dogmosd.pdb (Join-Path $output 'dogmosd.pdb')
+          Copy-Item crates/dogmos-byond/bindings.dm (Join-Path $output 'dogmos_bindings.dm')
+
+      - name: Upload Windows contract inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: dogmos-windows-contract-input
+          path: ${{ runner.temp }}/dogmos-windows
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-pair:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,16 +71,99 @@ jobs:
       - name: Install Rust 1.98.0
         uses: dtolnay/rust-toolchain@1.98.0
         with:
-          targets: i686-unknown-linux-gnu
+          targets: i686-unknown-linux-gnu,x86_64-unknown-linux-gnu
 
-      - name: Install 32-bit linker support
+      - name: Install Linux linker and symbol tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes g++-multilib
+          sudo apt-get install --yes g++-multilib binutils
 
-      - name: Check supported feature matrix
+      - name: Export exact build identity
+        shell: pwsh
+        run: |
+          Import-Module ./tools/DogmosBuildIdentity.psm1 -Force
+          $identity = Get-DogmosBuildIdentity -RepositoryRoot $env:GITHUB_WORKSPACE
+          "DOGMOS_SOURCE_REVISION=$($identity.source_revision)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DOGMOS_FEATURE_FINGERPRINT=$($identity.feature_fingerprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Check supported Linux shim feature matrix
         shell: pwsh
         run: tools/check_feature_matrix.ps1 -Target i686-unknown-linux-gnu
 
-      - name: Build Dogmos
-        run: cargo build --workspace --locked --target i686-unknown-linux-gnu --release
+      - name: Build Linux shim and service
+        shell: pwsh
+        run: |
+          cargo +1.98.0 build -p dogmos-byond --release --locked --target i686-unknown-linux-gnu
+          if ($LASTEXITCODE -ne 0) { throw 'Linux shim build failed.' }
+          cargo +1.98.0 build -p dogmos-server --bin dogmosd --release --locked --target x86_64-unknown-linux-gnu
+          if ($LASTEXITCODE -ne 0) { throw 'Linux service build failed.' }
+
+      - name: Stage Linux contract inputs and symbols
+        run: |
+          output="${RUNNER_TEMP}/dogmos-linux"
+          mkdir -p "${output}"
+          objcopy --only-keep-debug target/i686-unknown-linux-gnu/release/libdogmos_byond.so "${output}/libdogmos.so.debug"
+          objcopy --strip-debug target/i686-unknown-linux-gnu/release/libdogmos_byond.so "${output}/libdogmos.so"
+          objcopy --only-keep-debug target/x86_64-unknown-linux-gnu/release/dogmosd "${output}/dogmosd.debug"
+          objcopy --strip-debug target/x86_64-unknown-linux-gnu/release/dogmosd "${output}/dogmosd"
+
+      - name: Upload Linux contract inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: dogmos-linux-contract-input
+          path: ${{ runner.temp }}/dogmos-linux
+          if-no-files-found: error
+          retention-days: 7
+
+  contract:
+    runs-on: ubuntu-latest
+    needs: [windows-pair, linux-pair]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Download Windows contract inputs
+        uses: actions/download-artifact@v8
+        with:
+          name: dogmos-windows-contract-input
+          path: ${{ runner.temp }}/dogmos-release-bundle/windows
+
+      - name: Download Linux contract inputs
+        uses: actions/download-artifact@v8
+        with:
+          name: dogmos-linux-contract-input
+          path: ${{ runner.temp }}/dogmos-release-bundle/linux
+
+      - name: Generate and verify paired release contract
+        shell: pwsh
+        run: |
+          $bundle = Join-Path $env:RUNNER_TEMP 'dogmos-release-bundle'
+          Move-Item (Join-Path $bundle 'windows/dogmos_bindings.dm') (Join-Path $bundle 'dogmos_bindings.dm')
+          $manifest = Join-Path $env:RUNNER_TEMP 'dogmos-release-manifest.json'
+          python tools/dogmos_contract.py generate `
+            --repository-root . `
+            --bindings (Join-Path $bundle 'dogmos_bindings.dm') `
+            --output $manifest `
+            --windows-shim (Join-Path $bundle 'windows/dogmos.dll') `
+            --windows-shim-symbols (Join-Path $bundle 'windows/dogmos.pdb') `
+            --windows-service (Join-Path $bundle 'windows/dogmosd.exe') `
+            --windows-service-symbols (Join-Path $bundle 'windows/dogmosd.pdb') `
+            --linux-shim (Join-Path $bundle 'linux/libdogmos.so') `
+            --linux-shim-symbols (Join-Path $bundle 'linux/libdogmos.so.debug') `
+            --linux-service (Join-Path $bundle 'linux/dogmosd') `
+            --linux-service-symbols (Join-Path $bundle 'linux/dogmosd.debug')
+          if ($LASTEXITCODE -ne 0) { throw 'Dogmos contract generation failed.' }
+          python tools/dogmos_contract.py verify --manifest $manifest --bundle-root $bundle
+          if ($LASTEXITCODE -ne 0) { throw 'Dogmos contract verification failed.' }
+          Copy-Item $manifest (Join-Path $bundle 'dogmos-release-manifest.json')
+
+      - name: Upload verified paired release contract
+        uses: actions/upload-artifact@v7
+        with:
+          name: dogmos-release-contract
+          path: ${{ runner.temp }}/dogmos-release-bundle
+          if-no-files-found: error
+          retention-days: 14

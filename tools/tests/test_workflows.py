@@ -39,18 +39,53 @@ class WorkflowTests(unittest.TestCase):
 		self.assertIn("tools/check_feature_matrix.ps1 -Target i686-unknown-linux-gnu", runs)
 
 	def test_build_workflow_runs_for_the_dogmos_branch(self) -> None:
-		workflow, _ = self.load_workflow("build.yml")
+		workflow, text = self.load_workflow("build.yml")
 		branches = workflow["on"]["push"]["branches"]
 		self.assertIn("dogmos", branches)
+		for target in (
+			"i686-pc-windows-msvc",
+			"x86_64-pc-windows-msvc",
+			"i686-unknown-linux-gnu",
+			"x86_64-unknown-linux-gnu",
+		):
+			self.assertIn(target, text)
+		for artifact in (
+			"dogmos.dll",
+			"dogmos.pdb",
+			"dogmosd.exe",
+			"dogmosd.pdb",
+			"libdogmos.so",
+			"libdogmos.so.debug",
+			"linux/dogmosd",
+			"linux/dogmosd.debug",
+			"dogmos_bindings.dm",
+			"dogmos-release-manifest.json",
+		):
+			self.assertIn(artifact, text)
+		self.assertIn("tools/dogmos_contract.py generate", text)
+		self.assertIn("tools/dogmos_contract.py verify", text)
+		self.assertNotRegex(text, r"(?m)^\s+ref:\s*(dogmos|master)\s*$")
+		for command in ("cargo +1.98.0 build", "cargo +1.98.0 run"):
+			for line in (line.strip() for line in text.splitlines() if command in line):
+				self.assertIn("--locked", line)
+		uses = [step["uses"] for step in self.all_steps(workflow) if "uses" in step]
+		self.assertIn("actions/upload-artifact@v7", uses)
+		self.assertIn("actions/download-artifact@v8", uses)
 
 	def test_release_uses_dogmos_artifact_names_and_official_upload_path(self) -> None:
 		workflow, text = self.load_workflow("release.yml")
 		uses = [step["uses"] for step in self.all_steps(workflow) if "uses" in step]
 		self.assertIn("actions/attest-build-provenance@v4", uses)
+		self.assertIn("actions/download-artifact@v8", uses)
 		self.assertIn("dogmos.dll", text)
 		self.assertIn("dogmos.pdb", text)
+		self.assertIn("dogmosd.exe", text)
+		self.assertIn("dogmosd.pdb", text)
 		self.assertIn("libdogmos.so", text)
+		self.assertIn("dogmosd.debug", text)
 		self.assertIn("dogmos_bindings.dm", text)
+		self.assertIn("dogmos-release-manifest.json", text)
+		self.assertIn("tools/dogmos_contract.py verify", text)
 		self.assertIn("gh release upload", text)
 		self.assertNotIn("auxmos", text.lower())
 		self.assertFalse(any("svenstaro" in action for action in uses))

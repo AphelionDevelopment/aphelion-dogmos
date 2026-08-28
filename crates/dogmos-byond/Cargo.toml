@@ -3,6 +3,9 @@ name = "dogmos-byond"
 version = "2.3.0"
 edition = "2021"
 
+[features]
+diagnostic-bindings = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

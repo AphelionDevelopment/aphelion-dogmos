@@ -23,6 +23,7 @@ class BuildIdentityTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertEqual(build_manifest["schema_version"], 1)
+        self.assertEqual(build_manifest["toolchain"]["byond"], "516.1687")
         self.assertEqual(
             build_manifest["capabilities"]["features"],
             sorted(cargo_manifest["features"]["default"]),

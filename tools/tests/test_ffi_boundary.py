@@ -21,6 +21,20 @@ class FfiBoundaryTests(unittest.TestCase):
 		self.assertEqual(direct, [])
 		self.assertGreater(guarded_count, 0)
 
+	def test_transport_client_is_separate_from_byond_value_conversion(self) -> None:
+		client_source = ROOT / "crates" / "dogmos-byond" / "src" / "client.rs"
+		self.assertTrue(client_source.is_file())
+		text = client_source.read_text(encoding="utf-8")
+		self.assertIn("pub struct DogmosClient", text)
+		self.assertIn("pub struct BoundedDogmosClient", text)
+		self.assertNotIn("ByondValue", text)
+
+		session_source = ROOT / "crates" / "dogmos-byond" / "src" / "session.rs"
+		self.assertTrue(session_source.is_file())
+		session_text = session_source.read_text(encoding="utf-8")
+		self.assertIn("pub(crate) struct ServiceSession", session_text)
+		self.assertNotIn("ByondValue", session_text)
+
 
 if __name__ == "__main__":
 	unittest.main()
