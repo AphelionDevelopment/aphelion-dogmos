@@ -29,6 +29,12 @@ class GeneratedBindingsTests(unittest.TestCase):
         self.assertEqual(proc_paths, sorted(proc_paths))
         self.assertTrue(first.endswith(b"\n"))
         self.assertFalse(first.endswith(b"\n\n"))
+        self.assertIn(
+            b'#define DOGMOS (world.system_type == UNIX ? "libdogmos" : "dogmos")',
+            first,
+        )
+        self.assertNotIn(b"DOGMOS_BYOND", first)
+        self.assertNotIn(b"load_ext(", first)
 
     def _generate(self):
         completed = subprocess.run(
