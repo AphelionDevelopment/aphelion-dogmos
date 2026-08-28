@@ -4,18 +4,20 @@ use dogmos_byond::{
 	encode_production_continuation_adjust_multiple, encode_production_continuation_resume,
 	encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
 	encode_production_mixture_command, encode_production_mixture_lifecycle_batch,
-	encode_production_mixture_state_batch, encode_production_reaction_metadata,
-	encode_production_simulation_stage, encode_production_turf_adjacency_batch,
-	encode_production_turf_lifecycle_batch, ClientError, DogmosClient,
+	encode_production_mixture_state_batch, encode_production_process_metrics,
+	encode_production_reaction_metadata, encode_production_simulation_stage,
+	encode_production_turf_adjacency_batch, encode_production_turf_lifecycle_batch, ClientError,
+	DogmosClient,
 };
+use dogmos_process_metrics::sample_current_process;
 use dogmos_protocol::{
 	encode_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CapacityLimits, HandshakePayload,
 	LifecycleAction, LifecycleMutation, MixtureCommandRequest, MixtureCommandResponse,
 	MixtureSnapshot, MixtureSnapshotRequest, OperationKind, ScalarValue, ServiceTelemetry,
 	SimulationStageResponse, WireHandle, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN,
 	DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS,
-	MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN, SERVICE_TELEMETRY_LEN,
-	SIMULATION_STAGE_RESPONSE_LEN,
+	MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN, SERVICE_PROCESS_ALL_AVAILABLE,
+	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 use std::{
 	error::Error,
@@ -106,6 +108,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 	let mut client = DogmosClient::connect(&endpoint, handshake, Duration::from_secs(5))?;
 	let service_pid = client.peer().process_id;
+	verify_process_metrics(&mut client)?;
 	if diagnostic_bytes != 0 {
 		println!(
 			"isolation_baseline,shim_pid={},service_pid={service_pid}",
@@ -396,6 +399,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 		"cross-bitness IPC passed: shim_pid={} service_pid={service_pid}",
 		std::process::id()
 	);
+	Ok(())
+}
+
+fn verify_process_metrics(client: &mut DogmosClient) -> Result<(), Box<dyn Error>> {
+	let mut response = [0_u8; SERVICE_TELEMETRY_LEN];
+	let response_len =
+		client.round_trip_into(OperationKind::ServiceTelemetry, &[], &mut response)?;
+	if response_len != SERVICE_TELEMETRY_LEN {
+		return Err("cross-bitness service telemetry response width changed".into());
+	}
+	let telemetry = ServiceTelemetry::decode(&response)?;
+	if telemetry.service_process_available_flags & !SERVICE_PROCESS_ALL_AVAILABLE != 0 {
+		return Err("cross-bitness service process flag mask changed".into());
+	}
+	let fields = encode_production_process_metrics(sample_current_process(), &response)?;
+	if fields.len() != 28 {
+		return Err("cross-bitness process metrics field count changed".into());
+	}
+	let service_flags = fields[4] as u32 | (fields[5] as u32) << 16;
+	if service_flags != telemetry.service_process_available_flags {
+		return Err("cross-bitness process metrics service flags changed".into());
+	}
 	Ok(())
 }
 

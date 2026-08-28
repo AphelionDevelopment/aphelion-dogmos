@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import struct
 import tempfile
 import unittest
@@ -90,7 +91,7 @@ class DogmosContractTests(unittest.TestCase):
         self.assertEqual(manifest["build_profile"], "release")
         self.assertEqual(manifest["versions"]["workspace"], "2.3.0")
         self.assertEqual(manifest["versions"]["abi"], 1)
-        self.assertEqual(manifest["versions"]["protocol"], 7)
+        self.assertEqual(manifest["versions"]["protocol"], 8)
         self.assertEqual(manifest["toolchain"]["rust"], "1.98.0")
         self.assertEqual(manifest["toolchain"]["byond"], "516.1687")
         self.assertEqual(
@@ -116,13 +117,47 @@ class DogmosContractTests(unittest.TestCase):
             hashlib.sha256(self.bindings.read_bytes()).hexdigest(),
         )
 
+    def test_protocol_7_capability_manifest_is_rejected_for_protocol_8_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            for relative_path in (
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                "dogmos-build-manifest.toml",
+                "crates/dogmos-protocol/src/lib.rs",
+                "crates/dogmos-byond/Cargo.toml",
+                "crates/dogmos-server/Cargo.toml",
+            ):
+                destination = repository / relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPOSITORY_ROOT / relative_path, destination)
+            capability = repository / "dogmos-build-manifest.toml"
+            capability.write_text(
+                capability.read_text(encoding="utf-8").replace(
+                    "protocol_version = 8", "protocol_version = 7"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ContractError, "capability protocol versions do not match source"
+            ):
+                build_manifest(
+                    repository_root=repository,
+                    bindings_path=self.bindings,
+                    bindings_name="dogmos_bindings.dm",
+                    artifacts=self.artifacts,
+                    source_revision="0123456789abcdef0123456789abcdef01234567",
+                    dirty=False,
+                )
+
     def test_canonical_json_is_deterministic_sorted_and_has_one_lf(self) -> None:
         first = canonical_manifest_bytes(self.manifest())
         second = canonical_manifest_bytes(self.manifest())
         self.assertEqual(first, second)
         self.assertEqual(
             hashlib.sha256(first).hexdigest(),
-            "3bc82c39436488707b3bd9de74c37215c8378eddf5cc5d3aac24494eb7d3eba9",
+            "be7ad56a5203fdc93c8551d1113faa0e078c1c6f360641fa0d9419f838277e0a",
         )
         self.assertTrue(first.endswith(b"\n"))
         self.assertFalse(first.endswith(b"\n\n"))

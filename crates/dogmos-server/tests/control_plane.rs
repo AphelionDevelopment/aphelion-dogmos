@@ -519,6 +519,7 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 	));
 	assert_eq!(client.echo(b"still connected").unwrap(), b"still connected");
 	let mut telemetry_bytes = [0_u8; SERVICE_TELEMETRY_LEN];
+	assert_eq!(telemetry_bytes.len(), 272);
 	assert_eq!(
 		client
 			.round_trip_into(OperationKind::ServiceTelemetry, &[], &mut telemetry_bytes)

@@ -12,6 +12,7 @@ fn generated_bindings_include_the_production_mixture_command_family() {
 		"/proc/dogmos_mixture_lifecycle_batch",
 		"/proc/dogmos_mixture_snapshot",
 		"/proc/dogmos_mixture_state_batch",
+		"/proc/dogmos_process_metrics",
 		"/proc/dogmos_reaction_metadata_install",
 		"/proc/dogmos_service_telemetry",
 		"/proc/dogmos_simulation_stage",

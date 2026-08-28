@@ -272,6 +272,7 @@ dependencies = [
  "auxmacros",
  "byondapi",
  "dogmos-identity",
+ "dogmos-process-metrics",
  "dogmos-protocol",
  "eyre",
  "interprocess",
@@ -303,6 +304,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dogmos-process-metrics"
+version = "2.3.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "dogmos-protocol"
 version = "2.3.0"
 
@@ -313,6 +322,7 @@ dependencies = [
  "dogmos-byond",
  "dogmos-core",
  "dogmos-identity",
+ "dogmos-process-metrics",
  "dogmos-protocol",
  "interprocess",
  "windows-sys 0.61.2",

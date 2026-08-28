@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 auxmacros = { path = "../auxmacros" }
 byondapi = { workspace = true }
 dogmos-identity = { path = "../dogmos-identity" }
+dogmos-process-metrics = { path = "../dogmos-process-metrics" }
 dogmos-protocol = { path = "../dogmos-protocol" }
 eyre = { workspace = true }
 interprocess = { workspace = true }

@@ -8,6 +8,11 @@ pub use client::{BoundedDogmosClient, ClientError, DogmosClient};
 use session::{start_service_session, ServiceSession};
 
 use byondapi::prelude::ByondValue;
+use dogmos_process_metrics::{
+	sample_current_process, CurrentProcessMetrics, PROCESS_ALL_AVAILABLE, PROCESS_CPU_AVAILABLE,
+	PROCESS_PRIVATE_BYTES_AVAILABLE, PROCESS_VIRTUAL_BYTES_AVAILABLE,
+	PROCESS_WORKING_SET_AVAILABLE,
+};
 use dogmos_protocol::{
 	decode_adjust_multiple_request, encode_adjust_multiple_request,
 	encode_continuation_adjust_multiple_request, encode_gas_metadata_batch, encode_lifecycle_batch,
@@ -79,6 +84,11 @@ const PRODUCTION_CONTINUATION_TOKEN_FIELDS: usize = 10;
 const PRODUCTION_CALLBACK_HEADER_FIELDS: usize = 12;
 const PRODUCTION_CALLBACK_EVENT_FIELDS: usize = 31;
 const PRODUCTION_MAX_CALLBACK_EVENTS: u32 = 256;
+const PROCESS_METRICS_LAYOUT_VERSION: u32 = 1;
+const PROCESS_METRICS_FIELDS: usize = 28;
+const DREAMDAEMON_PROCESS_FLAGS: u32 = PROCESS_PRIVATE_BYTES_AVAILABLE
+	| PROCESS_VIRTUAL_BYTES_AVAILABLE
+	| PROCESS_WORKING_SET_AVAILABLE;
 
 #[doc(hidden)]
 pub fn generate_bindings_file() {
@@ -270,10 +280,21 @@ fn dogmos_service_telemetry() -> eyre::Result<ByondValue> {
 	Ok(output)
 }
 
+#[auxmacros::bind("/proc/dogmos_process_metrics")]
+fn dogmos_process_metrics() -> eyre::Result<ByondValue> {
+	let response = production_request(OperationKind::ServiceTelemetry, &[], SERVICE_TELEMETRY_LEN)?;
+	let fields = encode_production_process_metrics(sample_current_process(), &response)?;
+	let mut output = ByondValue::new_list()?;
+	for field in fields {
+		output.push_list(field.into())?;
+	}
+	Ok(output)
+}
+
 #[doc(hidden)]
 pub fn decode_production_service_telemetry(response: &[u8]) -> eyre::Result<Vec<f32>> {
 	let telemetry = ServiceTelemetry::decode(response)?;
-	let mut fields = Vec::with_capacity(124);
+	let mut fields = Vec::with_capacity(134);
 	for value in [
 		telemetry.callback_depth,
 		telemetry.callback_capacity,
@@ -304,7 +325,72 @@ pub fn decode_production_service_telemetry(response: &[u8]) -> eyre::Result<Vec<
 			append_u64_words(&mut fields, counter);
 		}
 	}
+	append_u32_words(&mut fields, telemetry.service_process_available_flags);
+	append_u64_words(&mut fields, telemetry.service_rss_bytes);
+	append_u64_words(&mut fields, telemetry.service_cpu_total_milliseconds);
 	Ok(fields)
+}
+
+#[doc(hidden)]
+pub fn encode_production_process_metrics(
+	host: CurrentProcessMetrics,
+	service_response: &[u8],
+) -> eyre::Result<Vec<f32>> {
+	validate_current_process_metrics(host)?;
+	let service = ServiceTelemetry::decode(service_response)?;
+	let mut fields = Vec::with_capacity(PROCESS_METRICS_FIELDS);
+	append_u32_words(&mut fields, PROCESS_METRICS_LAYOUT_VERSION);
+	append_u32_words(
+		&mut fields,
+		host.available_flags & DREAMDAEMON_PROCESS_FLAGS,
+	);
+	append_u32_words(&mut fields, service.service_process_available_flags);
+	append_u32_words(&mut fields, 0);
+	append_u64_words(&mut fields, host.private_bytes);
+	append_u64_words(&mut fields, host.virtual_bytes);
+	append_u64_words(&mut fields, host.working_set_bytes);
+	append_u64_words(&mut fields, service.service_rss_bytes);
+	append_u64_words(&mut fields, service.service_cpu_total_milliseconds);
+	debug_assert_eq!(fields.len(), PROCESS_METRICS_FIELDS);
+	Ok(fields)
+}
+
+fn validate_current_process_metrics(metrics: CurrentProcessMetrics) -> eyre::Result<()> {
+	let unknown_flags = metrics.available_flags & !PROCESS_ALL_AVAILABLE;
+	if unknown_flags != 0 {
+		return Err(eyre::eyre!(
+			"DreamDaemon process metrics contained unknown availability flags {unknown_flags:#x}"
+		));
+	}
+	for (flag, value, name) in [
+		(
+			PROCESS_PRIVATE_BYTES_AVAILABLE,
+			metrics.private_bytes,
+			"private bytes",
+		),
+		(
+			PROCESS_VIRTUAL_BYTES_AVAILABLE,
+			metrics.virtual_bytes,
+			"virtual bytes",
+		),
+		(
+			PROCESS_WORKING_SET_AVAILABLE,
+			metrics.working_set_bytes,
+			"working-set bytes",
+		),
+		(
+			PROCESS_CPU_AVAILABLE,
+			metrics.cpu_total_milliseconds,
+			"total CPU milliseconds",
+		),
+	] {
+		if metrics.available_flags & flag == 0 && value != 0 {
+			return Err(eyre::eyre!(
+				"DreamDaemon process metrics reported nonzero {name} without its availability flag"
+			));
+		}
+	}
+	Ok(())
 }
 
 #[auxmacros::bind("/proc/dogmos_callback_drain")]
@@ -2111,11 +2197,14 @@ mod tests {
 		encode_production_continuation_command, encode_production_continuation_resume,
 		encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
 		encode_production_mixture_lifecycle_batch, encode_production_mixture_state_batch,
-		encode_production_reaction_metadata, encode_production_simulation_stage,
-		encode_production_turf_adjacency_batch, encode_production_turf_heat_adjacency_batch,
-		encode_production_turf_heat_batch, encode_production_turf_lifecycle_batch, exact_u16,
-		exact_u32, hex_lower, normalize_generated_bindings, scalar_response_value,
-		DmMixtureCommandFields,
+		encode_production_process_metrics, encode_production_reaction_metadata,
+		encode_production_simulation_stage, encode_production_turf_adjacency_batch,
+		encode_production_turf_heat_adjacency_batch, encode_production_turf_heat_batch,
+		encode_production_turf_lifecycle_batch, exact_u16, exact_u32, hex_lower,
+		normalize_generated_bindings, scalar_response_value, DmMixtureCommandFields,
+	};
+	use dogmos_process_metrics::{
+		CurrentProcessMetrics, PROCESS_ALL_AVAILABLE, PROCESS_PRIVATE_BYTES_AVAILABLE,
 	};
 	use dogmos_protocol::{
 		decode_adjust_multiple_request, decode_continuation_adjust_multiple_request,
@@ -2130,6 +2219,7 @@ mod tests {
 		TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatState,
 		TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
 		WireGasRequirement, WireHandle, WireReactionExecution, MAX_GAS_SLOTS,
+		SERVICE_PROCESS_ALL_AVAILABLE,
 	};
 
 	fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -2566,15 +2656,108 @@ mod tests {
 			callback_enqueued_by_kind: [14, 15, 16, 17, 18, 19, 20],
 			callback_drained_by_kind: [21, 22, 23, 24, 25, 26, 27],
 			callback_rejected_by_kind: [28, 29, 30, 31, 32, 33, u64::MAX],
+			service_process_available_flags: SERVICE_PROCESS_ALL_AVAILABLE,
+			service_rss_bytes: 0x1111_2222_3333_4444,
+			service_cpu_total_milliseconds: 0x5555_6666_7777_8888,
 		};
 		let fields = decode_production_service_telemetry(&telemetry.encode()).unwrap();
-		assert_eq!(fields.len(), 124);
+		assert_eq!(fields.len(), 134);
 		assert_eq!(&fields[..2], &[0xba98 as f32, 0xfedc as f32]);
 		assert_eq!(
 			&fields[12..16],
 			&[0xcdef as f32, 0x89ab as f32, 0x4567 as f32, 0x0123 as f32]
 		);
-		assert_eq!(&fields[120..], &[65_535.0; 4]);
+		assert_eq!(&fields[120..124], &[65_535.0; 4]);
+		assert_eq!(&fields[124..126], &[3.0, 0.0]);
+		assert_eq!(&fields[126..130], &[17_476.0, 13_107.0, 8_738.0, 4_369.0]);
+		assert_eq!(&fields[130..134], &[34_952.0, 30_583.0, 26_214.0, 21_845.0]);
+	}
+
+	#[test]
+	fn production_process_metrics_preserve_roles_width_and_word_order() {
+		let host = CurrentProcessMetrics {
+			available_flags: PROCESS_ALL_AVAILABLE,
+			private_bytes: 0x1111_2222_3333_4444,
+			virtual_bytes: 0x5555_6666_7777_8888,
+			working_set_bytes: 0x9999_aaaa_bbbb_cccc,
+			cpu_total_milliseconds: 99,
+		};
+		let service = ServiceTelemetry {
+			callback_depth: 0,
+			callback_capacity: 0,
+			callback_high_water: 0,
+			continuation_depth: 0,
+			continuation_capacity: 0,
+			continuation_high_water: 0,
+			oldest_callback_age_ticks: 0,
+			callback_enqueued: 0,
+			callback_drained: 0,
+			callback_rejected: 0,
+			continuation_timeouts: 0,
+			request_timeouts: 0,
+			protocol_errors: 0,
+			callback_enqueued_by_kind: [0; 7],
+			callback_drained_by_kind: [0; 7],
+			callback_rejected_by_kind: [0; 7],
+			service_process_available_flags: SERVICE_PROCESS_ALL_AVAILABLE,
+			service_rss_bytes: 0xdddd_eeee_ffff_0001,
+			service_cpu_total_milliseconds: u64::MAX,
+		};
+
+		let fields = encode_production_process_metrics(host, &service.encode()).unwrap();
+
+		assert_eq!(fields.len(), 28);
+		assert_eq!(
+			fields,
+			vec![
+				1.0, 0.0, 7.0, 0.0, 3.0, 0.0, 0.0, 0.0, 17_476.0, 13_107.0, 8_738.0, 4_369.0,
+				34_952.0, 30_583.0, 26_214.0, 21_845.0, 52_428.0, 48_059.0, 43_690.0, 39_321.0,
+				1.0, 65_535.0, 61_166.0, 56_797.0, 65_535.0, 65_535.0, 65_535.0, 65_535.0,
+			]
+		);
+	}
+
+	#[test]
+	fn production_process_metrics_reject_noncanonical_host_samples() {
+		let empty_service = ServiceTelemetry {
+			callback_depth: 0,
+			callback_capacity: 0,
+			callback_high_water: 0,
+			continuation_depth: 0,
+			continuation_capacity: 0,
+			continuation_high_water: 0,
+			oldest_callback_age_ticks: 0,
+			callback_enqueued: 0,
+			callback_drained: 0,
+			callback_rejected: 0,
+			continuation_timeouts: 0,
+			request_timeouts: 0,
+			protocol_errors: 0,
+			callback_enqueued_by_kind: [0; 7],
+			callback_drained_by_kind: [0; 7],
+			callback_rejected_by_kind: [0; 7],
+			service_process_available_flags: 0,
+			service_rss_bytes: 0,
+			service_cpu_total_milliseconds: 0,
+		}
+		.encode();
+		let unknown_flags = CurrentProcessMetrics {
+			available_flags: 16,
+			..Default::default()
+		};
+		let nonzero_unavailable = CurrentProcessMetrics {
+			private_bytes: 1,
+			..Default::default()
+		};
+
+		assert!(encode_production_process_metrics(unknown_flags, &empty_service).is_err());
+		assert!(encode_production_process_metrics(nonzero_unavailable, &empty_service).is_err());
+		let partial = CurrentProcessMetrics {
+			available_flags: PROCESS_PRIVATE_BYTES_AVAILABLE,
+			private_bytes: 1,
+			..Default::default()
+		};
+		assert!(encode_production_process_metrics(partial, &empty_service).is_ok());
 	}
 
 	#[test]

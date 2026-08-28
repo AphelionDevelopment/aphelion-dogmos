@@ -1,12 +1,18 @@
 use dogmos_protocol::{
-	OperationKind, ServiceTelemetry, CALLBACK_EVENT_KIND_COUNT, SERVICE_TELEMETRY_LEN,
+	OperationKind, ProtocolError, ServiceTelemetry, CALLBACK_EVENT_KIND_COUNT,
+	DOGMOS_PROTOCOL_VERSION, SERVICE_PROCESS_ALL_AVAILABLE, SERVICE_PROCESS_CPU_AVAILABLE,
+	SERVICE_PROCESS_RSS_AVAILABLE, SERVICE_TELEMETRY_LEN,
 };
 
 #[test]
 fn service_telemetry_operation_and_layout_are_stable() {
 	assert_eq!(OperationKind::ServiceTelemetry as u16, 36);
 	assert_eq!(CALLBACK_EVENT_KIND_COUNT, 7);
-	assert_eq!(SERVICE_TELEMETRY_LEN, 248);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 8);
+	assert_eq!(SERVICE_TELEMETRY_LEN, 272);
+	assert_eq!(SERVICE_PROCESS_RSS_AVAILABLE, 1);
+	assert_eq!(SERVICE_PROCESS_CPU_AVAILABLE, 2);
+	assert_eq!(SERVICE_PROCESS_ALL_AVAILABLE, 3);
 
 	let telemetry = ServiceTelemetry {
 		callback_depth: 1,
@@ -25,6 +31,9 @@ fn service_telemetry_operation_and_layout_are_stable() {
 		callback_enqueued_by_kind: [14, 15, 16, 17, 18, 19, 20],
 		callback_drained_by_kind: [21, 22, 23, 24, 25, 26, 27],
 		callback_rejected_by_kind: [28, 29, 30, 31, 32, 33, 34],
+		service_process_available_flags: SERVICE_PROCESS_ALL_AVAILABLE,
+		service_rss_bytes: 0x0123_4567_89ab_cdef,
+		service_cpu_total_milliseconds: 0xfedc_ba98_7654_3210,
 	};
 	let encoded = telemetry.encode();
 
@@ -36,6 +45,13 @@ fn service_telemetry_operation_and_layout_are_stable() {
 	assert_eq!(&encoded[136..144], &21_u64.to_le_bytes());
 	assert_eq!(&encoded[192..200], &28_u64.to_le_bytes());
 	assert_eq!(&encoded[240..248], &34_u64.to_le_bytes());
+	assert_eq!(
+		&encoded[248..252],
+		&SERVICE_PROCESS_ALL_AVAILABLE.to_le_bytes()
+	);
+	assert_eq!(&encoded[252..256], &[0_u8; 4]);
+	assert_eq!(&encoded[256..264], &0x0123_4567_89ab_cdef_u64.to_le_bytes());
+	assert_eq!(&encoded[264..272], &0xfedc_ba98_7654_3210_u64.to_le_bytes());
 	assert_eq!(ServiceTelemetry::decode(&encoded).unwrap(), telemetry);
 }
 
@@ -43,4 +59,39 @@ fn service_telemetry_operation_and_layout_are_stable() {
 fn service_telemetry_decoder_requires_the_exact_fixed_width() {
 	assert!(ServiceTelemetry::decode(&[0_u8; SERVICE_TELEMETRY_LEN - 1]).is_err());
 	assert!(ServiceTelemetry::decode(&[0_u8; SERVICE_TELEMETRY_LEN + 1]).is_err());
+}
+
+#[test]
+fn service_telemetry_rejects_unknown_process_flags() {
+	let mut encoded = [0_u8; SERVICE_TELEMETRY_LEN];
+	encoded[248..252].copy_from_slice(&4_u32.to_le_bytes());
+
+	assert_eq!(
+		ServiceTelemetry::decode(&encoded),
+		Err(ProtocolError::UnknownServiceProcessFlags(4))
+	);
+}
+
+#[test]
+fn service_telemetry_rejects_nonzero_reserved_process_field() {
+	let mut encoded = [0_u8; SERVICE_TELEMETRY_LEN];
+	encoded[252..256].copy_from_slice(&1_u32.to_le_bytes());
+
+	assert_eq!(
+		ServiceTelemetry::decode(&encoded),
+		Err(ProtocolError::ReservedServiceTelemetryField(1))
+	);
+}
+
+#[test]
+fn service_telemetry_rejects_nonzero_unavailable_process_metrics() {
+	for offset in [256, 264] {
+		let mut encoded = [0_u8; SERVICE_TELEMETRY_LEN];
+		encoded[offset..offset + 8].copy_from_slice(&1_u64.to_le_bytes());
+
+		assert_eq!(
+			ServiceTelemetry::decode(&encoded),
+			Err(ProtocolError::NonZeroUnavailableServiceProcessMetric)
+		);
+	}
 }

@@ -1,7 +1,11 @@
 use crate::ProtocolError;
 
 pub const CALLBACK_EVENT_KIND_COUNT: usize = 7;
-pub const SERVICE_TELEMETRY_LEN: usize = 248;
+pub const SERVICE_PROCESS_RSS_AVAILABLE: u32 = 1 << 0;
+pub const SERVICE_PROCESS_CPU_AVAILABLE: u32 = 1 << 1;
+pub const SERVICE_PROCESS_ALL_AVAILABLE: u32 =
+	SERVICE_PROCESS_RSS_AVAILABLE | SERVICE_PROCESS_CPU_AVAILABLE;
+pub const SERVICE_TELEMETRY_LEN: usize = 272;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceTelemetry {
@@ -21,6 +25,9 @@ pub struct ServiceTelemetry {
 	pub callback_enqueued_by_kind: [u64; CALLBACK_EVENT_KIND_COUNT],
 	pub callback_drained_by_kind: [u64; CALLBACK_EVENT_KIND_COUNT],
 	pub callback_rejected_by_kind: [u64; CALLBACK_EVENT_KIND_COUNT],
+	pub service_process_available_flags: u32,
+	pub service_rss_bytes: u64,
+	pub service_cpu_total_milliseconds: u64,
 }
 
 impl ServiceTelemetry {
@@ -42,6 +49,9 @@ impl ServiceTelemetry {
 		encode_counters(&mut output[80..136], self.callback_enqueued_by_kind);
 		encode_counters(&mut output[136..192], self.callback_drained_by_kind);
 		encode_counters(&mut output[192..248], self.callback_rejected_by_kind);
+		output[248..252].copy_from_slice(&self.service_process_available_flags.to_le_bytes());
+		output[256..264].copy_from_slice(&self.service_rss_bytes.to_le_bytes());
+		output[264..272].copy_from_slice(&self.service_cpu_total_milliseconds.to_le_bytes());
 		output
 	}
 
@@ -51,6 +61,25 @@ impl ServiceTelemetry {
 				expected: SERVICE_TELEMETRY_LEN as u32,
 				actual: input.len() as u32,
 			});
+		}
+		let service_process_available_flags = read_u32(input, 248);
+		if service_process_available_flags & !SERVICE_PROCESS_ALL_AVAILABLE != 0 {
+			return Err(ProtocolError::UnknownServiceProcessFlags(
+				service_process_available_flags,
+			));
+		}
+		let reserved = read_u32(input, 252);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedServiceTelemetryField(reserved));
+		}
+		let service_rss_bytes = read_u64(input, 256);
+		let service_cpu_total_milliseconds = read_u64(input, 264);
+		if service_process_available_flags & SERVICE_PROCESS_RSS_AVAILABLE == 0
+			&& service_rss_bytes != 0
+			|| service_process_available_flags & SERVICE_PROCESS_CPU_AVAILABLE == 0
+				&& service_cpu_total_milliseconds != 0
+		{
+			return Err(ProtocolError::NonZeroUnavailableServiceProcessMetric);
 		}
 		Ok(Self {
 			callback_depth: read_u32(input, 0),
@@ -69,6 +98,9 @@ impl ServiceTelemetry {
 			callback_enqueued_by_kind: decode_counters(&input[80..136]),
 			callback_drained_by_kind: decode_counters(&input[136..192]),
 			callback_rejected_by_kind: decode_counters(&input[192..248]),
+			service_process_available_flags,
+			service_rss_bytes,
+			service_cpu_total_milliseconds,
 		})
 	}
 }

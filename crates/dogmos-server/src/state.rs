@@ -18,6 +18,10 @@ use dogmos_core::{
 	},
 	MixtureHandle,
 };
+use dogmos_process_metrics::{
+	sample_current_process, CurrentProcessMetrics, PROCESS_CPU_AVAILABLE,
+	PROCESS_WORKING_SET_AVAILABLE,
+};
 use dogmos_protocol::{
 	AdjacencyMutation, CallbackBatchHeader, CallbackEvent, CallbackEventKind, ContinuationToken,
 	GasMetadataRegistration, LifecycleAction, LifecycleMutation, MixtureAdjustment,
@@ -27,7 +31,7 @@ use dogmos_protocol::{
 	TurfHeatSnapshot, TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole,
 	WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_KIND_COUNT,
 	CALLBACK_EVENT_LEN, CONTINUATION_TICK_MILLIS, DEFAULT_CONTINUATION_TIMEOUT_TICKS,
-	MAX_GAS_SLOTS,
+	MAX_GAS_SLOTS, SERVICE_PROCESS_CPU_AVAILABLE, SERVICE_PROCESS_RSS_AVAILABLE,
 };
 use std::{
 	collections::{BTreeMap, BTreeSet, VecDeque},
@@ -208,10 +212,28 @@ impl ServiceState {
 	}
 
 	pub fn telemetry(&self) -> ServiceTelemetry {
-		self.telemetry_at(self.current_ticks())
+		self.telemetry_at_with_process_metrics(self.current_ticks(), sample_current_process())
 	}
 
-	fn telemetry_at(&self, now_ticks: u64) -> ServiceTelemetry {
+	fn telemetry_at_with_process_metrics(
+		&self,
+		now_ticks: u64,
+		process: CurrentProcessMetrics,
+	) -> ServiceTelemetry {
+		let mut service_process_available_flags = 0;
+		let service_rss_bytes = if process.available_flags & PROCESS_WORKING_SET_AVAILABLE != 0 {
+			service_process_available_flags |= SERVICE_PROCESS_RSS_AVAILABLE;
+			process.working_set_bytes
+		} else {
+			0
+		};
+		let service_cpu_total_milliseconds = if process.available_flags & PROCESS_CPU_AVAILABLE != 0
+		{
+			service_process_available_flags |= SERVICE_PROCESS_CPU_AVAILABLE;
+			process.cpu_total_milliseconds
+		} else {
+			0
+		};
 		ServiceTelemetry {
 			callback_depth: self.callback_events.len().try_into().unwrap_or(u32::MAX),
 			callback_capacity: self.max_callback_events,
@@ -231,6 +253,9 @@ impl ServiceState {
 			callback_enqueued_by_kind: self.callback_enqueued_by_kind,
 			callback_drained_by_kind: self.callback_drained_by_kind,
 			callback_rejected_by_kind: self.callback_rejected_by_kind,
+			service_process_available_flags,
+			service_rss_bytes,
+			service_cpu_total_milliseconds,
 		}
 	}
 
@@ -1660,6 +1685,9 @@ mod tests {
 	use super::*;
 	use dogmos_core::metadata::{GasId, GasMetadataError, ReactionId, ReactionMetadataError};
 	use dogmos_core::world::{Command, TurfAdjacencyMutation, TurfLifecycleMutation, WorldEvent};
+	use dogmos_process_metrics::{
+		CurrentProcessMetrics, PROCESS_CPU_AVAILABLE, PROCESS_WORKING_SET_AVAILABLE,
+	};
 	use dogmos_protocol::{
 		AdjacencyMutation, CallbackBatchHeader, CallbackEvent, LifecycleAction, LifecycleMutation,
 		MixtureStateMutation, ScalarValue, SimulationStage,
@@ -1991,8 +2019,15 @@ mod tests {
 	fn callback_telemetry_is_fixed_cost_and_tracks_age_and_kind() {
 		let mut state = ServiceState::new_for_world(1024 * 1024, 2, 1, 1);
 		state.enqueue_diagnostic_callbacks_at(2, 10).unwrap();
+		let process = CurrentProcessMetrics {
+			available_flags: PROCESS_WORKING_SET_AVAILABLE | PROCESS_CPU_AVAILABLE,
+			private_bytes: 101,
+			virtual_bytes: 202,
+			working_set_bytes: 0x0123_4567_89ab_cdef,
+			cpu_total_milliseconds: 0xfedc_ba98_7654_3210,
+		};
 
-		let telemetry = state.telemetry_at(15);
+		let telemetry = state.telemetry_at_with_process_metrics(15, process);
 		assert_eq!(telemetry.callback_depth, 2);
 		assert_eq!(telemetry.callback_capacity, 2);
 		assert_eq!(telemetry.callback_high_water, 2);
@@ -2000,6 +2035,12 @@ mod tests {
 		assert_eq!(telemetry.callback_enqueued, 2);
 		assert_eq!(telemetry.callback_enqueued_by_kind[0], 2);
 		assert_eq!(telemetry.continuation_capacity, 1);
+		assert_eq!(telemetry.service_process_available_flags, 3);
+		assert_eq!(telemetry.service_rss_bytes, 0x0123_4567_89ab_cdef);
+		assert_eq!(
+			telemetry.service_cpu_total_milliseconds,
+			0xfedc_ba98_7654_3210
+		);
 
 		assert_eq!(
 			state.enqueue_diagnostic_callbacks_at(1, 16),
@@ -2008,7 +2049,7 @@ mod tests {
 		state.record_protocol_error();
 		state.record_protocol_error();
 		state.record_request_timeout();
-		let telemetry = state.telemetry_at(16);
+		let telemetry = state.telemetry_at_with_process_metrics(16, process);
 		assert_eq!(telemetry.callback_rejected, 1);
 		assert_eq!(telemetry.callback_rejected_by_kind[0], 1);
 		assert_eq!(telemetry.protocol_errors, 2);
@@ -2016,11 +2057,18 @@ mod tests {
 
 		let mut output = [0_u8; CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN];
 		state.drain_callbacks_at(1, &mut output, 18).unwrap();
-		let telemetry = state.telemetry_at(18);
+		let telemetry = state.telemetry_at_with_process_metrics(18, process);
 		assert_eq!(telemetry.callback_depth, 1);
 		assert_eq!(telemetry.callback_drained, 1);
 		assert_eq!(telemetry.callback_drained_by_kind[0], 1);
 		assert_eq!(telemetry.oldest_callback_age_ticks, 8);
+
+		let unavailable =
+			state.telemetry_at_with_process_metrics(18, CurrentProcessMetrics::default());
+		assert_eq!(unavailable.service_process_available_flags, 0);
+		assert_eq!(unavailable.service_rss_bytes, 0);
+		assert_eq!(unavailable.service_cpu_total_milliseconds, 0);
+		assert_eq!(unavailable.callback_depth, telemetry.callback_depth);
 	}
 
 	#[test]
@@ -2601,7 +2649,12 @@ mod tests {
 			.process_stage_cancellable_at(SimulationStage::ProcessReactions, 0.5, 10, || false)
 			.unwrap();
 		assert_eq!(state.pending_continuation_count(), 1);
-		assert_eq!(state.telemetry_at(10).continuation_high_water, 1);
+		assert_eq!(
+			state
+				.telemetry_at_with_process_metrics(10, CurrentProcessMetrics::default())
+				.continuation_high_water,
+			1
+		);
 		state
 			.apply_mixture_command(MixtureCommandRequest::SetMoles {
 				handle: second_mixture,
@@ -2641,7 +2694,12 @@ mod tests {
 			Err(StateError::ContinuationExpired(token))
 		);
 		assert_eq!(state.pending_continuation_count(), 0);
-		assert_eq!(state.telemetry_at(60).continuation_timeouts, 1);
+		assert_eq!(
+			state
+				.telemetry_at_with_process_metrics(60, CurrentProcessMetrics::default())
+				.continuation_timeouts,
+			1
+		);
 		assert_eq!(
 			state.resume_continuation_at(token, 60),
 			Err(StateError::UnknownContinuation(token))
@@ -2691,7 +2749,12 @@ mod tests {
 			0
 		);
 		assert_eq!(state.pending_continuation_count(), 0);
-		assert_eq!(state.telemetry_at(115).continuation_timeouts, 2);
+		assert_eq!(
+			state
+				.telemetry_at_with_process_metrics(115, CurrentProcessMetrics::default())
+				.continuation_timeouts,
+			2
+		);
 
 		state
 			.process_stage_cancellable_at(SimulationStage::ProcessReactions, 0.5, 116, || false)

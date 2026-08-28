@@ -8,6 +8,7 @@ fn production_service_lifecycle_exports_are_distinct_from_benchmarks() {
 	for binding in [
 		"/proc/dogmos_abi_version",
 		"/proc/dogmos_protocol_version",
+		"/proc/dogmos_process_metrics",
 		"/proc/dogmos_service_start",
 		"/proc/dogmos_service_health",
 		"/proc/dogmos_service_pid",
@@ -23,6 +24,11 @@ fn production_service_lifecycle_exports_are_distinct_from_benchmarks() {
 		assert!(
 			bindings.contains(&format!("{binding}(")),
 			"generated bindings omit production lifecycle export {binding}"
+		);
+		assert_eq!(
+			bindings.matches(&format!("{binding}(")).count(),
+			1,
+			"generated bindings duplicate production lifecycle export {binding}"
 		);
 	}
 }

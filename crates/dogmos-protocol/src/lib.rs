@@ -14,7 +14,7 @@ pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 1;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 7;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 8;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 160;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
@@ -2308,6 +2308,9 @@ pub enum ProtocolError {
 	UnknownMetadataFlags(u32),
 	NonZeroMetadataPadding,
 	UnknownReactionExecution(u16),
+	UnknownServiceProcessFlags(u32),
+	ReservedServiceTelemetryField(u32),
+	NonZeroUnavailableServiceProcessMetric,
 }
 
 impl fmt::Display for ProtocolError {
