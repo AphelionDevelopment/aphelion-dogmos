@@ -63,6 +63,9 @@
 /proc/dogmos_service_telemetry()
 	return call_ext(DOGMOS, "byond:dogmos_service_telemetry_ffi")()
 
+/proc/dogmos_service_world_generation()
+	return call_ext(DOGMOS, "byond:dogmos_service_world_generation_ffi")()
+
 /proc/dogmos_simulation_stage(fields)
 	return call_ext(DOGMOS, "byond:dogmos_simulation_stage_ffi")(fields)
 

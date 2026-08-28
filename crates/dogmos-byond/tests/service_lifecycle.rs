@@ -11,6 +11,7 @@ fn production_service_lifecycle_exports_are_distinct_from_benchmarks() {
 		"/proc/dogmos_service_start",
 		"/proc/dogmos_service_health",
 		"/proc/dogmos_service_pid",
+		"/proc/dogmos_service_world_generation",
 		"/proc/dogmos_service_shutdown",
 		"/proc/dogmos_source_revision",
 		"/proc/dogmos_feature_fingerprint",

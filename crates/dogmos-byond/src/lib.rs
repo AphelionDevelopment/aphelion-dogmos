@@ -232,6 +232,21 @@ fn dogmos_service_pid() -> eyre::Result<ByondValue> {
 	Ok((session.client.peer().process_id as f32).into())
 }
 
+#[auxmacros::bind("/proc/dogmos_service_world_generation")]
+fn dogmos_service_world_generation() -> eyre::Result<ByondValue> {
+	let session = SERVICE_SESSION
+		.lock()
+		.map_err(|_| eyre::eyre!("Dogmos production service session lock is poisoned"))?;
+	let session = session
+		.as_ref()
+		.ok_or_else(|| eyre::eyre!("Dogmos production service session is not running"))?;
+	let mut output = ByondValue::new_list()?;
+	for word in split_u32_words(session.client.peer().world_generation) {
+		output.push_list(f32::from(word).into())?;
+	}
+	Ok(output)
+}
+
 #[auxmacros::bind("/proc/dogmos_service_shutdown")]
 fn dogmos_service_shutdown() -> eyre::Result<ByondValue> {
 	let mut session = SERVICE_SESSION
