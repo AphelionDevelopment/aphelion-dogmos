@@ -2183,6 +2183,26 @@ mod tests {
 			Ok(MixtureCommandRequest::React {
 				handle: handle(7, 2),
 				target: handle(41, 9),
+				reaction_profile_threshold_ms: None,
+			})
+		);
+
+		let profiled_reaction = encode_dm_mixture_command(DmMixtureCommandFields {
+			kind: 36,
+			flags: 1,
+			primary: handle(7, 2),
+			secondary: handle(41, 9),
+			scalars: [0.5, 0.0, 0.0],
+			gas_id: 0,
+			aux: 0,
+		})
+		.unwrap();
+		assert_eq!(
+			MixtureCommandRequest::decode(&profiled_reaction),
+			Ok(MixtureCommandRequest::React {
+				handle: handle(7, 2),
+				target: handle(41, 9),
+				reaction_profile_threshold_ms: Some(ScalarValue(0.5)),
 			})
 		);
 	}

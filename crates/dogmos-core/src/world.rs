@@ -13,6 +13,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	error::Error,
 	fmt,
+	time::Instant,
 };
 
 #[derive(Clone)]
@@ -403,6 +404,12 @@ pub enum WorldEvent {
 		kind: crate::metadata::NativeReactionKind,
 		values: [f32; 4],
 	},
+	ReactionProfiled {
+		mixture: MixtureHandle,
+		target: crate::metadata::GameplayHandle,
+		reaction: crate::metadata::ReactionId,
+		cost_ms: f32,
+	},
 	TurfDestructionRequest {
 		turf: TurfHandle,
 	},
@@ -483,6 +490,7 @@ pub enum WorldError {
 	},
 	ReactionContinuationCapacityExceeded,
 	InvalidReactionResult(u32),
+	InvalidReactionProfileThreshold,
 	InvalidConductivity,
 	InvalidEqualizeHardTurfLimit,
 	InvalidSecondsPerTick,
@@ -531,6 +539,7 @@ struct ReactionContinuation {
 	mixture: MixtureHandle,
 	target: crate::metadata::GameplayHandle,
 	next_reaction_index: u32,
+	reaction_profile_threshold_ms: Option<f32>,
 }
 
 #[derive(Clone, Default)]
@@ -551,6 +560,13 @@ struct ReactionSequence {
 	flags: u32,
 	work_items: u32,
 	native_updates: u32,
+}
+
+fn validate_reaction_profile_threshold(threshold_ms: Option<f32>) -> Result<(), WorldError> {
+	if threshold_ms.is_some_and(|threshold| !threshold.is_finite() || threshold < 0.0) {
+		return Err(WorldError::InvalidReactionProfileThreshold);
+	}
+	Ok(())
 }
 
 impl DogmosWorld {
@@ -1963,7 +1979,7 @@ impl DogmosWorld {
 			if should_cancel() {
 				return Err(WorldError::Cancelled);
 			}
-			let sequence = self.evaluate_reaction_sequence(turf.into(), mixture, 0, 0)?;
+			let sequence = self.evaluate_reaction_sequence(turf.into(), mixture, 0, 0, None)?;
 			work_items = work_items
 				.checked_add(sequence.work_items)
 				.ok_or_else(|| WorldError::State("reaction work count exceeds u32".into()))?;
@@ -1996,6 +2012,7 @@ impl DogmosWorld {
 				mixture,
 				target: turf.into(),
 				next_reaction_index: pending.next_reaction_index,
+				reaction_profile_threshold_ms: None,
 			})?;
 			Some(WorldEvent::RunDmReaction {
 				turf: Some(turf),
@@ -2025,6 +2042,7 @@ impl DogmosWorld {
 		mixture_handle: MixtureHandle,
 		start_index: u32,
 		initial_flags: u32,
+		reaction_profile_threshold_ms: Option<f32>,
 	) -> Result<ReactionSequence, WorldError> {
 		let gases = self
 			.gas_registry
@@ -2063,6 +2081,7 @@ impl DogmosWorld {
 				.expect("reaction priority order contains registered ids");
 			match reaction.execution {
 				crate::metadata::ReactionExecution::Native(kind) => {
+					let started = reaction_profile_threshold_ms.map(|_| Instant::now());
 					let Some(result) = crate::reactions::execute_native(
 						kind,
 						&mut mixture.gases,
@@ -2089,6 +2108,19 @@ impl DogmosWorld {
 						kind,
 						values: result.values,
 					});
+					if let (Some(started), Some(threshold_ms)) =
+						(started, reaction_profile_threshold_ms)
+					{
+						let cost_ms = started.elapsed().as_secs_f32() * 1000.0;
+						if cost_ms >= threshold_ms {
+							events.push(WorldEvent::ReactionProfiled {
+								mixture: mixture_handle,
+								target,
+								reaction: *reaction_id,
+								cost_ms,
+							});
+						}
+					}
 				}
 				crate::metadata::ReactionExecution::Dm => {
 					work_items = work_items.checked_add(1).ok_or_else(|| {
@@ -2130,9 +2162,12 @@ impl DogmosWorld {
 		&mut self,
 		mixture: MixtureHandle,
 		target: crate::metadata::GameplayHandle,
+		reaction_profile_threshold_ms: Option<f32>,
 		event_limit: u32,
 	) -> Result<ReactionProgress, WorldError> {
-		let sequence = self.evaluate_reaction_sequence(target, mixture, 0, 0)?;
+		validate_reaction_profile_threshold(reaction_profile_threshold_ms)?;
+		let sequence =
+			self.evaluate_reaction_sequence(target, mixture, 0, 0, reaction_profile_threshold_ms)?;
 		let requested_events = self
 			.events
 			.len()
@@ -2151,6 +2186,7 @@ impl DogmosWorld {
 				mixture,
 				target,
 				next_reaction_index: pending.next_reaction_index,
+				reaction_profile_threshold_ms,
 			})?;
 			Some(WorldEvent::RunDmReaction {
 				turf: None,
@@ -2232,6 +2268,7 @@ impl DogmosWorld {
 			continuation.mixture,
 			continuation.next_reaction_index,
 			reaction_result,
+			continuation.reaction_profile_threshold_ms,
 		)?;
 		let requested_events = self
 			.events
@@ -2253,6 +2290,7 @@ impl DogmosWorld {
 					mixture: continuation.mixture,
 					target: continuation.target,
 					next_reaction_index: pending.next_reaction_index,
+					reaction_profile_threshold_ms: continuation.reaction_profile_threshold_ms,
 				},
 			)?;
 			Some(WorldEvent::RunDmReaction {

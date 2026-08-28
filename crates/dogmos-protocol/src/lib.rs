@@ -14,7 +14,7 @@ pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 1;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 6;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 7;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 160;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
@@ -592,6 +592,7 @@ pub enum CallbackEventKind {
 	FirelockConsideration = 5,
 	TurfDestructionRequest = 6,
 	RunDmReaction = 7,
+	ReactionProfiled = 8,
 }
 
 impl TryFrom<u16> for CallbackEventKind {
@@ -606,6 +607,7 @@ impl TryFrom<u16> for CallbackEventKind {
 			5 => Ok(Self::FirelockConsideration),
 			6 => Ok(Self::TurfDestructionRequest),
 			7 => Ok(Self::RunDmReaction),
+			8 => Ok(Self::ReactionProfiled),
 			actual => Err(ProtocolError::UnknownCallbackEventKind(actual)),
 		}
 	}
@@ -747,7 +749,7 @@ fn validate_callback_aux(kind: CallbackEventKind, aux: u32) -> Result<(), Protoc
 		CallbackEventKind::TurfDestructionRequest => {
 			TurfDestructionReason::try_from(aux)?;
 		}
-		CallbackEventKind::RunDmReaction => {}
+		CallbackEventKind::RunDmReaction | CallbackEventKind::ReactionProfiled => {}
 		CallbackEventKind::Diagnostic
 		| CallbackEventKind::PressureDifference
 		| CallbackEventKind::DecompressionFloorRip
@@ -1607,6 +1609,7 @@ pub enum MixtureCommandRequest {
 	React {
 		handle: WireHandle,
 		target: WireHandle,
+		reaction_profile_threshold_ms: Option<ScalarValue>,
 	},
 }
 
@@ -1744,7 +1747,25 @@ impl MixtureCommandRequest {
 				ratio,
 				one_way,
 			} => (35, u16::from(one_way), first, second, [ratio, z, z], 0, 0),
-			Self::React { handle, target } => (36, 0, handle, target, [z, z, z], 0, 0),
+			Self::React {
+				handle,
+				target,
+				reaction_profile_threshold_ms,
+			} => {
+				let threshold = reaction_profile_threshold_ms.unwrap_or(z);
+				if threshold.0 < 0.0 {
+					return Err(ProtocolError::InvalidReactionProfileThreshold);
+				}
+				(
+					36,
+					u16::from(reaction_profile_threshold_ms.is_some()),
+					handle,
+					target,
+					[threshold, z, z],
+					0,
+					0,
+				)
+			}
 		};
 		let mut output = [0_u8; MIXTURE_COMMAND_REQUEST_LEN];
 		output[0..2].copy_from_slice(&kind.to_le_bytes());
@@ -1770,7 +1791,11 @@ impl MixtureCommandRequest {
 		if read_u16(input, 46) != 0 || read_u32(input, 52) != 0 {
 			return Err(ProtocolError::ReservedMixtureCommandField);
 		}
-		let allowed_flags = if kind == 13 || kind == 35 { 1 } else { 0 };
+		let allowed_flags = if kind == 13 || kind == 35 || kind == 36 {
+			1
+		} else {
+			0
+		};
 		if flags & !allowed_flags != 0 {
 			return Err(ProtocolError::UnknownMixtureCommandFlags { kind, flags });
 		}
@@ -1783,7 +1808,7 @@ impl MixtureCommandRequest {
 		let aux = read_u32(input, 48);
 		let uses_secondary = matches!(kind, 20 | 22..=24 | 28..=36);
 		let uses_s1 = matches!(kind, 1..=3 | 14..=16 | 18..=19 | 21 | 24..=25 | 29..=35)
-			|| kind == 13 && flags & 1 != 0;
+			|| matches!(kind, 13 | 36) && flags & 1 != 0;
 		let uses_s2 = matches!(kind, 3 | 25);
 		let uses_s3 = kind == 25;
 		let uses_gas_id = matches!(kind, 1..=4 | 8);
@@ -1928,10 +1953,16 @@ impl MixtureCommandRequest {
 				ratio: s1,
 				one_way: flags & 1 != 0,
 			}),
-			36 => Ok(Self::React {
-				handle: primary,
-				target: secondary,
-			}),
+			36 => {
+				if flags & 1 != 0 && s1.0 < 0.0 {
+					return Err(ProtocolError::InvalidReactionProfileThreshold);
+				}
+				Ok(Self::React {
+					handle: primary,
+					target: secondary,
+					reaction_profile_threshold_ms: (flags & 1 != 0).then_some(s1),
+				})
+			}
 			actual => Err(ProtocolError::UnknownMixtureCommand(actual)),
 		}
 	}
@@ -2263,6 +2294,7 @@ pub enum ProtocolError {
 	InvalidContinuationId,
 	InvalidContinuationDeadline,
 	InvalidReactionFlags(u32),
+	InvalidReactionProfileThreshold,
 	UnknownMixtureCommandResponse(u32),
 	UnknownMixtureSnapshotFlags(u32),
 	ReservedMixtureSnapshotField(u32),

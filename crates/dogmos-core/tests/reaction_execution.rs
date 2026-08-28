@@ -101,7 +101,7 @@ fn direct_reaction_preserves_arbitrary_holder_across_dm_continuation_without_a_t
 		.unwrap();
 
 	assert_eq!(
-		world.react_mixture_with_event_limit(mixture, holder, 8),
+		world.react_mixture_with_event_limit(mixture, holder, Some(0.0), 8),
 		Ok(ReactionProgress {
 			flags: 0,
 			work_items: 1,
@@ -129,7 +129,7 @@ fn direct_reaction_preserves_arbitrary_holder_across_dm_continuation_without_a_t
 			pending: false,
 		})
 	);
-	assert_eq!(world.drain_events_into(8, &mut events), 1);
+	assert_eq!(world.drain_events_into(8, &mut events), 2);
 	assert!(matches!(
 		events.as_slice(),
 		[WorldEvent::ReactionFinished {
@@ -138,7 +138,16 @@ fn direct_reaction_preserves_arbitrary_holder_across_dm_continuation_without_a_t
 			reaction: ReactionId(1),
 			kind: NativeReactionKind::Hydrogen,
 			..
-		}] if *event_mixture == mixture && *event_target == holder
+		}, WorldEvent::ReactionProfiled {
+			mixture: profiled_mixture,
+			target: profiled_target,
+			reaction: ReactionId(1),
+			cost_ms,
+		}] if *event_mixture == mixture
+			&& *event_target == holder
+			&& *profiled_mixture == mixture
+			&& *profiled_target == holder
+			&& *cost_ms >= 0.0
 	));
 }
 

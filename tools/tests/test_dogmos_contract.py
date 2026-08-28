@@ -90,7 +90,7 @@ class DogmosContractTests(unittest.TestCase):
         self.assertEqual(manifest["build_profile"], "release")
         self.assertEqual(manifest["versions"]["workspace"], "2.3.0")
         self.assertEqual(manifest["versions"]["abi"], 1)
-        self.assertEqual(manifest["versions"]["protocol"], 5)
+        self.assertEqual(manifest["versions"]["protocol"], 7)
         self.assertEqual(manifest["toolchain"]["rust"], "1.98.0")
         self.assertEqual(manifest["toolchain"]["byond"], "516.1687")
         self.assertEqual(
@@ -122,7 +122,7 @@ class DogmosContractTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(
             hashlib.sha256(first).hexdigest(),
-            "b450a054625acbf267b4591d1b4d4919d3cd2e073ae1f241c8a22000621190ac",
+            "3bc82c39436488707b3bd9de74c37215c8378eddf5cc5d3aac24494eb7d3eba9",
         )
         self.assertTrue(first.endswith(b"\n"))
         self.assertFalse(first.endswith(b"\n\n"))

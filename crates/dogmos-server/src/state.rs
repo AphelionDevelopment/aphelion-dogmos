@@ -790,7 +790,12 @@ impl ServiceState {
 		&mut self,
 		request: MixtureCommandRequest,
 	) -> Result<MixtureCommandResponse, StateError> {
-		if let MixtureCommandRequest::React { handle, target } = request {
+		if let MixtureCommandRequest::React {
+			handle,
+			target,
+			reaction_profile_threshold_ms,
+		} = request
+		{
 			let queue_depth = u32::try_from(self.callback_events.len())
 				.map_err(|_| StateError::CallbackBackpressure)?;
 			let event_limit = self
@@ -802,6 +807,7 @@ impl ServiceState {
 				.react_mixture_with_event_limit(
 					core_handle(handle),
 					core_gameplay_handle(target),
+					reaction_profile_threshold_ms.map(|threshold| threshold.0 as f32),
 					event_limit,
 				)
 				.map_err(map_world_error)?;
@@ -1454,7 +1460,10 @@ fn wire_handle_from_gameplay(handle: GameplayHandle) -> WireHandle {
 }
 
 fn callback_kind_index(kind: CallbackEventKind) -> usize {
-	kind as usize - 1
+	match kind {
+		CallbackEventKind::ReactionProfiled => CallbackEventKind::ReactionFinished as usize - 1,
+		_ => kind as usize - 1,
+	}
 }
 
 fn world_event_kind(event: WorldEvent) -> CallbackEventKind {
@@ -1464,6 +1473,7 @@ fn world_event_kind(event: WorldEvent) -> CallbackEventKind {
 		WorldEvent::FirelockConsideration { .. } => CallbackEventKind::FirelockConsideration,
 		WorldEvent::RunDmReaction { .. } => CallbackEventKind::RunDmReaction,
 		WorldEvent::ReactionFinished { .. } => CallbackEventKind::ReactionFinished,
+		WorldEvent::ReactionProfiled { .. } => CallbackEventKind::ReactionProfiled,
 		WorldEvent::TurfDestructionRequest { .. } => CallbackEventKind::TurfDestructionRequest,
 	}
 }
@@ -1537,6 +1547,18 @@ fn pending_callback_from_world_event(
 				NativeReactionKind::Tritium => dogmos_protocol::ReactionKind::Tritium as u32,
 				NativeReactionKind::Freon => dogmos_protocol::ReactionKind::Freon as u32,
 			};
+		}
+		WorldEvent::ReactionProfiled {
+			mixture,
+			target,
+			reaction,
+			cost_ms,
+		} => {
+			callback.kind = CallbackEventKind::ReactionProfiled;
+			callback.subject = wire_handle(mixture);
+			callback.target = wire_handle_from_gameplay(target);
+			callback.values[0] = ScalarValue(f64::from(cost_ms));
+			callback.aux = reaction.0;
 		}
 		WorldEvent::TurfDestructionRequest { turf } => {
 			callback.kind = CallbackEventKind::TurfDestructionRequest;
@@ -1625,6 +1647,9 @@ fn map_world_error(error: WorldError) -> StateError {
 		WorldError::AllocationFailed => StateError::AllocationFailed,
 		WorldError::InvalidReactionResult(result) => {
 			StateError::State(format!("invalid reaction result flags: {result}"))
+		}
+		WorldError::InvalidReactionProfileThreshold => {
+			StateError::State("invalid reaction profiling threshold".into())
 		}
 		WorldError::Cancelled => StateError::Cancelled,
 	}
@@ -2358,6 +2383,7 @@ mod tests {
 				.apply_mixture_command(MixtureCommandRequest::React {
 					handle: mixture,
 					target: holder,
+					reaction_profile_threshold_ms: None,
 				})
 				.unwrap(),
 			MixtureCommandResponse::ReactionProgress {
@@ -2381,6 +2407,32 @@ mod tests {
 				pending: false,
 			})
 		);
+	}
+
+	#[test]
+	fn reaction_profile_event_preserves_identity_holder_and_cost() {
+		let mixture = MixtureHandle {
+			slot: 7,
+			generation: 2,
+		};
+		let holder = GameplayHandle {
+			slot: 41,
+			generation: 9,
+		};
+		let callback = pending_callback_from_world_event(
+			WorldEvent::ReactionProfiled {
+				mixture,
+				target: holder,
+				reaction: ReactionId(37),
+				cost_ms: 0.25,
+			},
+			None,
+		);
+		assert_eq!(callback.kind, CallbackEventKind::ReactionProfiled);
+		assert_eq!(callback.subject, wire_handle(mixture));
+		assert_eq!(callback.target, wire_handle_from_gameplay(holder));
+		assert_eq!(callback.values[0], ScalarValue(0.25));
+		assert_eq!(callback.aux, 37);
 	}
 
 	#[test]

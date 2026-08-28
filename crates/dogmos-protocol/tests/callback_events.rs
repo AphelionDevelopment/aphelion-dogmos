@@ -62,6 +62,7 @@ fn every_implemented_gameplay_event_kind_round_trips() {
 		CallbackEventKind::FirelockConsideration,
 		CallbackEventKind::TurfDestructionRequest,
 		CallbackEventKind::RunDmReaction,
+		CallbackEventKind::ReactionProfiled,
 	]
 	.into_iter()
 	.enumerate()
@@ -72,6 +73,7 @@ fn every_implemented_gameplay_event_kind_round_trips() {
 				TurfDestructionReason::SuperconductiveHeat as u32
 			}
 			CallbackEventKind::RunDmReaction => 37,
+			CallbackEventKind::ReactionProfiled => 37,
 			_ => 0,
 		};
 		let event = CallbackEvent {

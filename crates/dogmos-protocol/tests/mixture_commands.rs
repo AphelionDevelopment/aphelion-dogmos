@@ -196,6 +196,7 @@ fn every_fixed_mixture_command_round_trips() {
 		MixtureCommandRequest::React {
 			handle: first,
 			target: second,
+			reaction_profile_threshold_ms: None,
 		},
 	];
 	for (index, command) in commands.into_iter().enumerate() {
@@ -203,6 +204,18 @@ fn every_fixed_mixture_command_round_trips() {
 		assert_eq!(&bytes[0..2], &(index as u16 + 1).to_le_bytes());
 		assert_eq!(MixtureCommandRequest::decode(&bytes), Ok(command));
 	}
+}
+
+#[test]
+fn reaction_profiling_threshold_round_trips_without_expanding_the_command() {
+	let request = MixtureCommandRequest::React {
+		handle: handle(7, 2),
+		target: handle(41, 9),
+		reaction_profile_threshold_ms: Some(ScalarValue(0.5)),
+	};
+	let encoded = request.encode().unwrap();
+	assert_eq!(encoded.len(), MIXTURE_COMMAND_REQUEST_LEN);
+	assert_eq!(MixtureCommandRequest::decode(&encoded), Ok(request));
 }
 
 #[test]
