@@ -389,7 +389,7 @@ fn validate_gas(gas: &GasMetadata, gas_count: u32) -> Result<(), GasMetadataErro
 	if !gas.specific_heat.is_finite() || gas.specific_heat <= 0.0 {
 		return Err(GasMetadataError::InvalidSpecificHeat(gas.id));
 	}
-	if !gas.fusion_power.is_finite() || gas.fusion_power < 0.0 {
+	if !gas.fusion_power.is_finite() {
 		return Err(GasMetadataError::InvalidFusionPower(gas.id));
 	}
 	if gas

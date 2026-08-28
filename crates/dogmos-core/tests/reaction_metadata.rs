@@ -43,6 +43,13 @@ fn gas_registry() -> dogmos_core::metadata::GasMetadataRegistry {
 }
 
 #[test]
+fn registry_accepts_signed_finite_fusion_power() {
+	let mut negative_fusion_gas = gas(0, "bz");
+	negative_fusion_gas.fusion_power = -10.0;
+	assert!(dogmos_core::metadata::GasMetadataRegistry::try_new(vec![negative_fusion_gas]).is_ok());
+}
+
+#[test]
 fn registry_freezes_dense_ids_and_descending_priority_order() {
 	let registry = ReactionMetadataRegistry::try_new(
 		vec![reaction(1, "low", 1.0), reaction(0, "high", 2.0)],

@@ -105,13 +105,6 @@ fn registry_rejects_invalid_physical_metadata() {
 		GasMetadataRegistry::try_new(vec![invalid_fusion]).unwrap_err(),
 		GasMetadataError::InvalidFusionPower(GasId(0))
 	);
-	let mut negative_fusion = gas(0, "o2", 20.0);
-	negative_fusion.fusion_power = -0.1;
-	assert_eq!(
-		GasMetadataRegistry::try_new(vec![negative_fusion]).unwrap_err(),
-		GasMetadataError::InvalidFusionPower(GasId(0))
-	);
-
 	let mut invalid_enthalpy = gas(0, "o2", 20.0);
 	invalid_enthalpy.enthalpy = f32::NAN;
 	assert_eq!(
