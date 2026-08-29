@@ -320,6 +320,62 @@ fn chunked_turf_heat_is_confined_to_the_committed_frontier() {
 }
 
 #[test]
+fn chunked_turf_heat_includes_conductive_neighbors_of_the_committed_frontier() {
+	let hot = turf(0, 1);
+	let cold = turf(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &[hot, cold]);
+	let states = [700.0, 293.15].map(|temperature| TurfHeatState {
+		temperature,
+		thermal_conductivity: 0.05,
+		heat_capacity: 20_000.0,
+		adjacent_to_space: false,
+	});
+	world
+		.apply_turf_heat(&[
+			TurfHeatMutation {
+				handle: hot,
+				state: Some(states[0]),
+			},
+			TurfHeatMutation {
+				handle: cold,
+				state: Some(states[1]),
+			},
+		])
+		.unwrap();
+	world
+		.apply_turf_heat_adjacency(&[TurfHeatAdjacencyMutation {
+			left: hot,
+			right: cold,
+			connected: true,
+		}])
+		.unwrap();
+	world.begin_frontier(1, 1).unwrap();
+	world.append_frontier(1, 0, &[hot]).unwrap();
+	world.commit_frontier(1).unwrap();
+	let request = StageChunkRequest {
+		stage: WorldStage::TurfHeat,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 1,
+		seconds_per_tick: 0.5,
+	};
+
+	for _ in 0..16 {
+		if !world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap()
+			.pending
+		{
+			break;
+		}
+	}
+
+	assert!(world.turf_heat(hot).unwrap().unwrap().temperature < states[0].temperature);
+	assert!(world.turf_heat(cold).unwrap().unwrap().temperature > states[1].temperature);
+}
+
+#[test]
 fn frontier_inspection_cannot_hide_process_turfs_kernel_work() {
 	let turf = turf(0, 1);
 	let mixture = mixture(0);

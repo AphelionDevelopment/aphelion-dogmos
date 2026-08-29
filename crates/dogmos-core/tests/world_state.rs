@@ -629,6 +629,67 @@ fn turf_topology_is_generation_checked_reciprocal_bounded_and_atomic() {
 }
 
 #[test]
+fn heat_only_turf_reregistration_preserves_conduction_edges() {
+	let hot = turf_handle(0, 1);
+	let cold = turf_handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world
+		.apply_turf_lifecycle(&[
+			TurfLifecycleMutation::Register {
+				handle: hot,
+				mixture: None,
+			},
+			TurfLifecycleMutation::Register {
+				handle: cold,
+				mixture: None,
+			},
+		])
+		.unwrap();
+	world
+		.apply_turf_heat(&[
+			TurfHeatMutation {
+				handle: hot,
+				state: Some(TurfHeatState {
+					temperature: 700.0,
+					thermal_conductivity: 0.05,
+					heat_capacity: 20_000.0,
+					adjacent_to_space: false,
+				}),
+			},
+			TurfHeatMutation {
+				handle: cold,
+				state: Some(TurfHeatState {
+					temperature: 293.15,
+					thermal_conductivity: 0.05,
+					heat_capacity: 20_000.0,
+					adjacent_to_space: false,
+				}),
+			},
+		])
+		.unwrap();
+	world
+		.apply_turf_heat_adjacency(&[TurfHeatAdjacencyMutation {
+			left: hot,
+			right: cold,
+			connected: true,
+		}])
+		.unwrap();
+	world
+		.apply_turf_lifecycle(&[TurfLifecycleMutation::Register {
+			handle: hot,
+			mixture: None,
+		}])
+		.unwrap();
+
+	world
+		.process_stage_cancellable(WorldStage::TurfHeat, 0.5, || false)
+		.unwrap();
+
+	assert!(world.turf_heat(hot).unwrap().unwrap().temperature < 700.0);
+	assert!(world.turf_heat(cold).unwrap().unwrap().temperature > 293.15);
+}
+
+#[test]
 fn process_turfs_uses_turf_topology_and_linked_mixtures() {
 	let left_mixture = handle(0, 1);
 	let right_mixture = handle(1, 1);

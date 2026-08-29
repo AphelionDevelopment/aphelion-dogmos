@@ -847,6 +847,7 @@ impl ServiceState {
 			.collect::<Vec<_>>();
 		let firelocks = mutations
 			.iter()
+			.filter(|mutation| mutation.connected)
 			.map(|mutation| CoreTurfFirelockMutation {
 				left: core_turf_handle(mutation.left),
 				right: core_turf_handle(mutation.right),
@@ -933,7 +934,10 @@ impl ServiceState {
 		}
 		Ok(MixtureSnapshot {
 			revision: mixture.revision,
-			gas_count: MAX_GAS_SLOTS as u32,
+			gas_count: self
+				.world
+				.gas_registry()
+				.map_or(0, |registry| registry.len()),
 			temperature: ScalarValue(f64::from(mixture.temperature)),
 			volume: ScalarValue(f64::from(mixture.volume)),
 			minimum_heat_capacity: ScalarValue(f64::from(mixture.minimum_heat_capacity)),
@@ -1596,9 +1600,6 @@ impl ServiceState {
 			.get_mut(&transaction_id)
 			.ok_or(StateError::UnknownReactionTransaction(transaction_id))?;
 		queue.complete |= complete;
-		if queue.complete && queue.callbacks.is_empty() {
-			self.reaction_callbacks.remove(&transaction_id);
-		}
 		Ok(())
 	}
 
@@ -2203,7 +2204,7 @@ mod tests {
 				.unwrap(),
 			2
 		);
-		assert_eq!(state.snapshot(handle(0, 1)).unwrap().gas_count, 32);
+		assert_eq!(state.snapshot(handle(0, 1)).unwrap().gas_count, 0);
 		assert_eq!(
 			state
 				.apply_adjacency(&[AdjacencyMutation {
@@ -2744,6 +2745,18 @@ mod tests {
 				.unwrap(),
 			1
 		);
+		assert_eq!(
+			state
+				.apply_turf_adjacency(&[WireTurfAdjacencyMutation {
+					left: first,
+					right: second,
+					connected: false,
+					firelock: false,
+				}])
+				.unwrap(),
+			1
+		);
+		assert_eq!(state.turf_edge_count(), 0);
 		state
 			.apply_turf_heat(&[
 				WireTurfHeatMutation {
@@ -2905,6 +2918,16 @@ mod tests {
 				transaction_id,
 			})
 		);
+		let empty_len = state
+			.drain_callbacks_at(CallbackScope::Reaction, transaction_id, 1, &mut output, 12)
+			.unwrap();
+		assert_eq!(empty_len, CALLBACK_BATCH_HEADER_LEN);
+		assert_eq!(
+			CallbackBatchHeader::decode(&output[..empty_len])
+				.unwrap()
+				.returned,
+			0
+		);
 	}
 
 	#[test]
@@ -2990,6 +3013,7 @@ mod tests {
 				.unwrap(),
 			MixtureCommandResponse::Applied { updated: 1 }
 		);
+		assert_eq!(state.snapshot(mixture).unwrap().gas_count, 1);
 		assert_eq!(
 			state
 				.apply_adjust_multiple(

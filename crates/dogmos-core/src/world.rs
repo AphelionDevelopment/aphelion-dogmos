@@ -1142,7 +1142,7 @@ impl DogmosWorld {
 						heat,
 					});
 					if remove_edges {
-						self.remove_incident_turf_edges(handle.slot);
+						self.remove_incident_gas_edges(handle.slot);
 					}
 					if heat.is_none() {
 						self.remove_incident_heat_edges(handle.slot);
@@ -2482,6 +2482,19 @@ impl DogmosWorld {
 	}
 
 	fn prepare_stage_heat_turf(&mut self, turf_handle: TurfHandle) -> Result<(), WorldError> {
+		let neighbors = self
+			.topology
+			.heat_neighbors(turf_handle)
+			.map(|neighbor| neighbor.handle)
+			.collect::<Vec<_>>();
+		self.append_stage_heat_turf(turf_handle)?;
+		for neighbor in neighbors {
+			self.append_stage_heat_turf(neighbor)?;
+		}
+		Ok(())
+	}
+
+	fn append_stage_heat_turf(&mut self, turf_handle: TurfHandle) -> Result<(), WorldError> {
 		let Ok(turf) = self.require_turf_handle(turf_handle) else {
 			return Ok(());
 		};
@@ -2493,6 +2506,9 @@ impl DogmosWorld {
 			.stage_heat
 			.as_mut()
 			.expect("turf-heat stage owns heat state");
+		if state.index_by_slot.contains_key(&turf_handle.slot) {
+			return Ok(());
+		}
 		let index = u32::try_from(state.nodes.len())
 			.map_err(|_| WorldError::State("turf heat count exceeds u32".into()))?;
 		state.nodes.push((turf_handle, heat, mixture));
@@ -4903,6 +4919,23 @@ impl DogmosWorld {
 
 	fn remove_incident_turf_edges(&mut self, slot: u32) {
 		self.topology.remove_slot(slot);
+		self.turf_graph = None;
+	}
+
+	fn remove_incident_gas_edges(&mut self, slot: u32) {
+		let heat_edges = self
+			.topology
+			.heat_slot_edges()
+			.filter(|(left, right)| *left == slot || *right == slot)
+			.collect::<Vec<_>>();
+		self.topology.remove_slot(slot);
+		for (left, right) in heat_edges {
+			let left = self.current_turf_handle(left).ok();
+			let right = self.current_turf_handle(right).ok();
+			if let (Some(left), Some(right)) = (left, right) {
+				let _ = self.topology.connect_heat(left, right);
+			}
+		}
 		self.turf_graph = None;
 	}
 
