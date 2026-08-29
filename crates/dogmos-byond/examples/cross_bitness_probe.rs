@@ -2,6 +2,7 @@ use dogmos_byond::{
 	decode_production_callback_batch, decode_production_continuation_token,
 	decode_production_mixture_snapshot, decode_production_simulation_stage,
 	encode_production_continuation_adjust_multiple, encode_production_continuation_resume,
+	encode_production_frontier_append, encode_production_frontier_begin,
 	encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
 	encode_production_mixture_command, encode_production_mixture_lifecycle_batch,
 	encode_production_mixture_state_batch, encode_production_process_metrics,
@@ -11,13 +12,13 @@ use dogmos_byond::{
 };
 use dogmos_process_metrics::sample_current_process;
 use dogmos_protocol::{
-	encode_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CapacityLimits, HandshakePayload,
-	LifecycleAction, LifecycleMutation, MixtureCommandRequest, MixtureCommandResponse,
-	MixtureSnapshot, MixtureSnapshotRequest, OperationKind, ScalarValue, ServiceTelemetry,
-	SimulationStageResponse, WireHandle, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN,
-	DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS,
-	MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN, SERVICE_PROCESS_ALL_AVAILABLE,
-	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	encode_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CallbackScope, CapacityLimits,
+	FrontierCommitRequest, HandshakePayload, LifecycleAction, LifecycleMutation,
+	MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot, MixtureSnapshotRequest,
+	OperationKind, ScalarValue, ServiceTelemetry, SimulationStageResponse, WireHandle,
+	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
+	MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN,
+	SERVICE_PROCESS_ALL_AVAILABLE, SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 use std::{
 	error::Error,
@@ -208,7 +209,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let production_snapshot = decode_production_mixture_snapshot(&snapshot)?;
 	if production_snapshot[0] != 1.0
 		|| production_snapshot[1] != 0.0
-		|| production_snapshot[7] != 21.0
+		|| production_snapshot[10] != 21.0
 	{
 		return Err("cross-bitness production snapshot ABI changed".into());
 	}
@@ -232,7 +233,38 @@ fn main() -> Result<(), Box<dyn Error>> {
 		&turf_adjacency_request,
 		&mut processed,
 	)?;
-	let stage_request = encode_production_simulation_stage([4.0, 0.5])?;
+	let mut frontier_response = [0_u8; 16];
+	client.round_trip_into(
+		OperationKind::FrontierBegin,
+		&encode_production_frontier_begin(&[1.0, 0.0, 0.0, 0.0, 2.0, 0.0])?,
+		&mut frontier_response[..8],
+	)?;
+	client.round_trip_into(
+		OperationKind::FrontierAppend,
+		&encode_production_frontier_append(&[
+			1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, 0.0, 11.0, 0.0, 1.0, 0.0,
+		])?,
+		&mut frontier_response[..4],
+	)?;
+	client.round_trip_into(
+		OperationKind::FrontierCommit,
+		&FrontierCommitRequest { epoch: 1 }.encode(),
+		&mut frontier_response,
+	)?;
+	let stage_request = encode_production_simulation_stage([
+		4.0,
+		1.0,
+		0.0,
+		0.0,
+		0.0,
+		1.0,
+		0.0,
+		0.0,
+		0.0,
+		0x1000 as f32,
+		0.0,
+		0.5,
+	])?;
 	let mut stage_response = [0_u8; SIMULATION_STAGE_RESPONSE_LEN];
 	client.round_trip_into(
 		OperationKind::SimulationStage,
@@ -240,7 +272,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 		&mut stage_response,
 	)?;
 	let diffusion_stage_response = SimulationStageResponse::decode(&stage_response)?;
-	if decode_production_simulation_stage(&stage_response)? != [2.0, 0.0, 0.0, 0.0] {
+	if decode_production_simulation_stage(&stage_response)?
+		!= [
+			2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+		] {
 		return Err("cross-bitness production stage response ABI changed".into());
 	}
 	if diffusion_stage_response.work_items != 2 || diffusion_stage_response.callback_events != 0 {
@@ -327,7 +362,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 	{
 		return Err("cross-bitness adjust-multiple transcript changed".into());
 	}
-	let reaction_stage_request = encode_production_simulation_stage([5.0, 0.5])?;
+	let reaction_stage_request = encode_production_simulation_stage([
+		5.0,
+		1.0,
+		0.0,
+		0.0,
+		0.0,
+		2.0,
+		0.0,
+		0.0,
+		0.0,
+		0x1000 as f32,
+		0.0,
+		0.5,
+	])?;
 	client.round_trip_into(
 		OperationKind::SimulationStage,
 		&reaction_stage_request,
@@ -339,11 +387,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let mut callback_response = [0_u8; CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN];
 	client.round_trip_into(
 		OperationKind::CallbackBatch,
-		&CallbackBatchRequest { max_events: 1 }.encode(),
+		&CallbackBatchRequest {
+			max_events: 1,
+			scope: CallbackScope::General,
+			transaction_id: 0,
+		}
+		.encode()?,
 		&mut callback_response,
 	)?;
-	let callback_fields = decode_production_callback_batch(&callback_response, 1)?;
-	let continuation_fields = &callback_fields[33..43];
+	let callback_fields =
+		decode_production_callback_batch(&callback_response, 1, CallbackScope::General, 0)?;
+	let continuation_fields = &callback_fields[38..48];
 	let mut continuation_adjust_fields = continuation_fields.to_vec();
 	continuation_adjust_fields.extend([0.0, 1.0, 0.0, -0.125]);
 	adjust_multiple_request =
@@ -372,11 +426,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 	)?;
 	client.round_trip_into(
 		OperationKind::CallbackBatch,
-		&CallbackBatchRequest { max_events: 1 }.encode(),
+		&CallbackBatchRequest {
+			max_events: 1,
+			scope: CallbackScope::General,
+			transaction_id: 0,
+		}
+		.encode()?,
 		&mut callback_response,
 	)?;
-	let cancelled_fields = decode_production_callback_batch(&callback_response, 1)?;
-	let cancelled = decode_production_continuation_token(&cancelled_fields[33..43])?;
+	let cancelled_fields =
+		decode_production_callback_batch(&callback_response, 1, CallbackScope::General, 0)?;
+	let cancelled = decode_production_continuation_token(&cancelled_fields[38..48])?;
 	assert_eq!(
 		client.round_trip_into(
 			OperationKind::ContinuationCancel,
@@ -789,8 +849,13 @@ fn run_callback_pressure(
 	if cycles < 100 {
 		return Err("callback pressure requires at least 100 cycles".into());
 	}
-	let enqueue_request = CallbackBatchRequest { max_events: 1024 }.encode();
-	let drain_request = CallbackBatchRequest { max_events: 1024 }.encode();
+	let enqueue_request = CallbackBatchRequest {
+		max_events: 1024,
+		scope: CallbackScope::General,
+		transaction_id: 0,
+	}
+	.encode()?;
+	let drain_request = enqueue_request;
 	let mut accepted = [0_u8; 4];
 	let mut drained = vec![0_u8; CALLBACK_BATCH_HEADER_LEN + 1024 * CALLBACK_EVENT_LEN];
 	let mut telemetry_bytes = [0_u8; SERVICE_TELEMETRY_LEN];
@@ -863,6 +928,10 @@ fn test_handshake(service_digest: [u8; 32]) -> Result<HandshakePayload, Box<dyn 
 			max_batch_operations: 4096,
 			max_callback_events: 1024,
 			max_pending_continuations: 1024,
+			max_frontier_handles: 4096,
+			max_stage_work_items: 4096,
+			max_reaction_transactions: 1024,
+			reserved: 0,
 			max_world_bytes: 8 * 1024 * 1024 * 1024,
 		},
 		process_id: std::process::id(),

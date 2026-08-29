@@ -1,9 +1,10 @@
 use dogmos_byond::DogmosClient;
 use dogmos_protocol::{
 	encode_adjacency_batch, encode_lifecycle_batch, AdjacencyMutation, BuildIdentity,
-	CapacityLimits, HandshakePayload, LifecycleAction, LifecycleMutation, MixtureSnapshotRequest,
-	OperationKind, ScalarValue, SimulationStage, SimulationStageRequest, WireHandle,
-	DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MIXTURE_SNAPSHOT_LEN,
+	CallbackBatchRequest, CallbackScope, CapacityLimits, HandshakePayload, LifecycleAction,
+	LifecycleMutation, MixtureSnapshotRequest, OperationKind, ScalarValue, SimulationStage,
+	SimulationStageRequest, WireHandle, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
+	MAX_CONTROL_PAYLOAD, MIXTURE_SNAPSHOT_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 use std::{
 	error::Error,
@@ -223,12 +224,15 @@ fn cases() -> Vec<Case> {
 		operation: OperationKind::SimulationStage,
 		request: SimulationStageRequest {
 			stage: SimulationStage::ProcessTurfs,
+			frontier_epoch: 1,
+			stage_epoch: 1,
+			work_limit: 1024,
 			seconds_per_tick: ScalarValue(0.5),
 		}
 		.encode()
 		.expect("the benchmark stage request is finite")
 		.to_vec(),
-		response_len: 8,
+		response_len: SIMULATION_STAGE_RESPONSE_LEN,
 	});
 	for count in [1_usize, 8, 64, 1024] {
 		let mut request = Vec::with_capacity(4 + count * 16);
@@ -244,9 +248,14 @@ fn cases() -> Vec<Case> {
 	cases.push(Case {
 		name: "callback_drain_empty".into(),
 		operation: OperationKind::CallbackBatch,
-		request: dogmos_protocol::CallbackBatchRequest { max_events: 1024 }
-			.encode()
-			.to_vec(),
+		request: CallbackBatchRequest {
+			max_events: 1024,
+			scope: CallbackScope::General,
+			transaction_id: 0,
+		}
+		.encode()
+		.expect("the benchmark callback request uses the general scope")
+		.to_vec(),
 		response_len: dogmos_protocol::CALLBACK_BATCH_HEADER_LEN,
 	});
 	cases
@@ -268,6 +277,10 @@ fn benchmark_handshake(service_digest: [u8; 32]) -> Result<HandshakePayload, Box
 			max_batch_operations: 4096,
 			max_callback_events: 1024,
 			max_pending_continuations: 1024,
+			max_frontier_handles: 1_048_576,
+			max_stage_work_items: 4096,
+			max_reaction_transactions: 1024,
+			reserved: 0,
 			max_world_bytes: 8 * 1024 * 1024 * 1024,
 		},
 		process_id: std::process::id(),

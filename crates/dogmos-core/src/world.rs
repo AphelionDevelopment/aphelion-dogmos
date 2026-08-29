@@ -1,12 +1,19 @@
+pub use crate::frontier::FrontierError;
+#[cfg(debug_assertions)]
+use crate::numerics::diffusion::{diffusion_step_into_cancellable, DiffusionError};
+pub use crate::stage_cursor::{StageChunkRequest, StageChunkResult};
 use crate::{
+	frontier::FrontierState,
 	metadata::{
 		GasMetadata, GasMetadataError, GasMetadataRegistry, ReactionMetadata,
 		ReactionMetadataError, ReactionMetadataRegistry, TurfHandle,
 	},
 	numerics::diffusion::{
-		diffusion_step_into_cancellable, validate_graph, DiffusionError, DiffusionGraph,
-		DirectedEdge, GraphNode, NodeHandle,
+		diffusion_self_weight, validate_graph, DiffusionGraph, DirectedEdge, GraphNode, NodeHandle,
+		GAS_DIFFUSION_CONSTANT,
 	},
+	stage_cursor::{StageCursor, MAX_STAGE_WORK_LIMIT},
+	topology::{PackedTopology, TopologyError},
 	MixtureHandle, MAX_GAS_SLOTS,
 };
 use std::{
@@ -426,12 +433,16 @@ pub struct MixtureSnapshot {
 	pub temperature: f32,
 	pub volume: f32,
 	pub minimum_heat_capacity: f32,
+	pub total_moles: f32,
+	pub pressure: f32,
+	pub heat_capacity: f32,
 	pub gases: [f32; MAX_GAS_SLOTS],
 	pub immutable: bool,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum WorldError {
+	Frontier(FrontierError),
 	GasMetadata(GasMetadataError),
 	GasRegistryAlreadyInstalled,
 	GasRegistryInstallationTooLate,
@@ -494,6 +505,8 @@ pub enum WorldError {
 	InvalidConductivity,
 	InvalidEqualizeHardTurfLimit,
 	InvalidSecondsPerTick,
+	InvalidStageWorkLimit(u32),
+	StageConflict,
 	StageNotImplemented(WorldStage),
 	Graph(String),
 	State(String),
@@ -511,14 +524,20 @@ impl fmt::Display for WorldError {
 impl Error for WorldError {}
 
 pub struct DogmosWorld {
+	frontier: FrontierState,
+	stage_cursor: Option<StageCursor>,
+	stage_diffusion: Option<StageDiffusionState>,
+	stage_heat: Option<StageHeatState>,
+	stage_reactions: Option<StageReactionState>,
+	stage_components: Option<StageComponentState>,
+	stage_component_turfs: Option<Vec<TurfHandle>>,
+	use_committed_frontier: bool,
 	gas_registry: Option<GasMetadataRegistry>,
 	reaction_registry: Option<ReactionMetadataRegistry>,
 	mixtures: Vec<MixtureSlot>,
 	turfs: Vec<TurfSlot>,
 	edges: BTreeMap<EdgeKey, f32>,
-	turf_edges: BTreeSet<EdgeKey>,
-	turf_firelock_edges: BTreeSet<EdgeKey>,
-	heat_edges: BTreeSet<EdgeKey>,
+	topology: PackedTopology,
 	graph: Option<DiffusionGraph>,
 	turf_graph: Option<DiffusionGraph>,
 	input: Vec<f32>,
@@ -562,11 +581,147 @@ struct ReactionSequence {
 	native_updates: u32,
 }
 
+struct StageDiffusionState {
+	turfs: Vec<TurfHandle>,
+	mixtures: Vec<MixtureHandle>,
+	index_by_turf: BTreeMap<TurfHandle, usize>,
+	seen_mixtures: BTreeSet<MixtureHandle>,
+	input: Vec<[f32; MAX_GAS_SLOTS]>,
+	output: Vec<[f32; MAX_GAS_SLOTS]>,
+	next_node: usize,
+}
+
+struct StageHeatState {
+	nodes: Vec<(TurfHandle, TurfHeatState, Option<MixtureHandle>)>,
+	index_by_slot: BTreeMap<u32, u32>,
+	temperatures: Vec<f32>,
+	conductivities: Vec<f32>,
+	heat_capacities: Vec<f32>,
+	staged_mixtures: BTreeMap<MixtureHandle, MixtureRecord>,
+	linked_mixtures: BTreeSet<MixtureHandle>,
+	staged_events: Vec<WorldEvent>,
+	next_node: usize,
+	next_topology_node: usize,
+	next_topology_neighbor: usize,
+	edges: Vec<(u32, u32)>,
+	row_sums: Vec<f32>,
+	conduction_substeps: Option<u32>,
+	conduction_substep: u32,
+	conduction_edge: usize,
+	conduction_scale: f32,
+}
+
+struct StageReactionState {
+	targets: Vec<(TurfHandle, MixtureHandle)>,
+	active_continuations: BTreeSet<MixtureHandle>,
+	seen_mixtures: BTreeSet<MixtureHandle>,
+	staged: BTreeMap<MixtureHandle, MixtureRecord>,
+	staged_events: Vec<WorldEvent>,
+	pending: Option<(TurfHandle, MixtureHandle, PendingDmReaction)>,
+	next_target: usize,
+}
+
+struct StageComponentState {
+	targets: Vec<TurfHandle>,
+	active_by_slot: BTreeMap<u32, TurfHandle>,
+	visited: BTreeSet<u32>,
+	next_seed: usize,
+	queue: Vec<TurfHandle>,
+	queue_index: usize,
+	next_neighbor: usize,
+	component_ready: bool,
+	staged_records: BTreeMap<MixtureHandle, MixtureRecord>,
+	staged_events: Vec<WorldEvent>,
+}
+
+impl StageComponentState {
+	fn new() -> Self {
+		Self {
+			targets: Vec::new(),
+			active_by_slot: BTreeMap::new(),
+			visited: BTreeSet::new(),
+			next_seed: 0,
+			queue: Vec::new(),
+			queue_index: 0,
+			next_neighbor: 0,
+			component_ready: false,
+			staged_records: BTreeMap::new(),
+			staged_events: Vec::new(),
+		}
+	}
+}
+
+impl StageHeatState {
+	fn new() -> Self {
+		Self {
+			nodes: Vec::new(),
+			index_by_slot: BTreeMap::new(),
+			temperatures: Vec::new(),
+			conductivities: Vec::new(),
+			heat_capacities: Vec::new(),
+			staged_mixtures: BTreeMap::new(),
+			linked_mixtures: BTreeSet::new(),
+			staged_events: Vec::new(),
+			next_node: 0,
+			next_topology_node: 0,
+			next_topology_neighbor: 0,
+			edges: Vec::new(),
+			row_sums: Vec::new(),
+			conduction_substeps: None,
+			conduction_substep: 0,
+			conduction_edge: 0,
+			conduction_scale: 0.0,
+		}
+	}
+}
+
+impl StageDiffusionState {
+	fn new() -> Self {
+		Self {
+			turfs: Vec::new(),
+			mixtures: Vec::new(),
+			index_by_turf: BTreeMap::new(),
+			seen_mixtures: BTreeSet::new(),
+			input: Vec::new(),
+			output: Vec::new(),
+			next_node: 0,
+		}
+	}
+}
+
 fn validate_reaction_profile_threshold(threshold_ms: Option<f32>) -> Result<(), WorldError> {
 	if threshold_ms.is_some_and(|threshold| !threshold.is_finite() || threshold < 0.0) {
 		return Err(WorldError::InvalidReactionProfileThreshold);
 	}
 	Ok(())
+}
+
+fn map_topology_error(error: TopologyError) -> WorldError {
+	match error {
+		TopologyError::AllocationFailed => WorldError::AllocationFailed,
+		other => WorldError::Graph(format!("{other:?}")),
+	}
+}
+
+fn require_turf_handle_in(
+	turfs: &[TurfSlot],
+	handle: TurfHandle,
+) -> Result<&TurfRecord, WorldError> {
+	let Some(slot) = turfs.get(handle.slot as usize) else {
+		return Err(WorldError::UnknownTurfHandle(handle));
+	};
+	let Some(generation) = slot.generation else {
+		return Err(WorldError::UnknownTurfHandle(handle));
+	};
+	if generation != handle.generation {
+		return Err(WorldError::StaleTurfHandle {
+			requested: handle,
+			current: generation,
+		});
+	}
+	slot.turf
+		.as_ref()
+		.ok_or(WorldError::UnknownTurfHandle(handle))
 }
 
 impl DogmosWorld {
@@ -584,14 +739,20 @@ impl DogmosWorld {
 		max_continuations: u32,
 	) -> Self {
 		Self {
+			frontier: FrontierState::default(),
+			stage_cursor: None,
+			stage_diffusion: None,
+			stage_heat: None,
+			stage_reactions: None,
+			stage_components: None,
+			stage_component_turfs: None,
+			use_committed_frontier: false,
 			gas_registry: None,
 			reaction_registry: None,
 			mixtures: Vec::new(),
 			turfs: Vec::new(),
 			edges: BTreeMap::new(),
-			turf_edges: BTreeSet::new(),
-			turf_firelock_edges: BTreeSet::new(),
-			heat_edges: BTreeSet::new(),
+			topology: PackedTopology::default(),
 			graph: None,
 			turf_graph: None,
 			input: Vec::new(),
@@ -617,6 +778,100 @@ impl DogmosWorld {
 		}
 		self.equalize_hard_turf_limit = limit;
 		Ok(())
+	}
+
+	pub fn begin_frontier(&mut self, epoch: u64, expected: u32) -> Result<(), WorldError> {
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
+		let maximum = u32::try_from(self.turfs.len()).unwrap_or(u32::MAX);
+		self.frontier
+			.begin(epoch, expected, maximum)
+			.map_err(WorldError::Frontier)
+	}
+
+	pub fn append_frontier(
+		&mut self,
+		epoch: u64,
+		offset: u32,
+		handles: &[TurfHandle],
+	) -> Result<u32, WorldError> {
+		self.frontier
+			.append(epoch, offset, handles)
+			.map_err(WorldError::Frontier)
+	}
+
+	pub fn commit_frontier(&mut self, epoch: u64) -> Result<u32, WorldError> {
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
+		for handle in self.frontier.pending(epoch).map_err(WorldError::Frontier)? {
+			require_turf_handle_in(&self.turfs, *handle)?;
+		}
+		self.frontier.commit(epoch).map_err(WorldError::Frontier)
+	}
+
+	pub fn committed_frontier_epoch(&self) -> Option<u64> {
+		self.frontier.committed_epoch()
+	}
+
+	pub fn committed_frontier(&self) -> &[TurfHandle] {
+		self.frontier.committed()
+	}
+
+	pub fn frontier_upload_bytes(&self) -> u64 {
+		self.frontier.upload_bytes()
+	}
+
+	pub fn topology_revision(&self) -> u64 {
+		self.topology.revision()
+	}
+
+	pub fn packed_topology_bytes(&self) -> u64 {
+		self.topology.allocated_bytes()
+	}
+
+	pub fn stage_telemetry(&self) -> Option<(WorldStage, u64, u32, u32)> {
+		self.stage_cursor.as_ref().map(|cursor| {
+			let frontier_count = u32::try_from(self.frontier.committed().len()).unwrap_or(u32::MAX);
+			(
+				cursor.stage,
+				cursor.stage_epoch,
+				cursor.next_frontier_index,
+				frontier_count.saturating_sub(cursor.next_frontier_index),
+			)
+		})
+	}
+
+	pub fn reusable_workset_bytes(&self) -> u64 {
+		let mut bytes = self.input.capacity() * std::mem::size_of::<f32>()
+			+ self.output.capacity() * std::mem::size_of::<f32>()
+			+ self.events.capacity() * std::mem::size_of::<WorldEvent>();
+		if let Some(state) = &self.stage_diffusion {
+			bytes += state.turfs.capacity() * std::mem::size_of::<TurfHandle>();
+			bytes += state.mixtures.capacity() * std::mem::size_of::<MixtureHandle>();
+			bytes += state.input.capacity() * std::mem::size_of::<[f32; MAX_GAS_SLOTS]>();
+			bytes += state.output.capacity() * std::mem::size_of::<[f32; MAX_GAS_SLOTS]>();
+		}
+		if let Some(state) = &self.stage_heat {
+			bytes += state.nodes.capacity()
+				* std::mem::size_of::<(TurfHandle, TurfHeatState, Option<MixtureHandle>)>();
+			bytes += state.temperatures.capacity() * std::mem::size_of::<f32>();
+			bytes += state.conductivities.capacity() * std::mem::size_of::<f32>();
+			bytes += state.heat_capacities.capacity() * std::mem::size_of::<f32>();
+			bytes += state.edges.capacity() * std::mem::size_of::<(u32, u32)>();
+			bytes += state.row_sums.capacity() * std::mem::size_of::<f32>();
+		}
+		if let Some(state) = &self.stage_reactions {
+			bytes += state.targets.capacity() * std::mem::size_of::<(TurfHandle, MixtureHandle)>();
+			bytes += state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
+		}
+		if let Some(state) = &self.stage_components {
+			bytes += state.targets.capacity() * std::mem::size_of::<TurfHandle>();
+			bytes += state.queue.capacity() * std::mem::size_of::<TurfHandle>();
+			bytes += state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
+		}
+		bytes as u64
 	}
 
 	pub fn install_gases(&mut self, gases: Vec<GasMetadata>) -> Result<u32, WorldError> {
@@ -782,6 +1037,9 @@ impl DogmosWorld {
 		&mut self,
 		mutations: &[TurfLifecycleMutation],
 	) -> Result<u32, WorldError> {
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
 		let mut projected = BTreeMap::<u32, ProjectedSlot>::new();
 		let mut required_slots = self.turfs.len();
 		for mutation in mutations {
@@ -860,14 +1118,18 @@ impl DogmosWorld {
 		for mutation in mutations {
 			match mutation {
 				TurfLifecycleMutation::Register { handle, mixture } => {
-					let invalidates_continuation = self.turfs[handle.slot as usize].generation
-						!= Some(handle.generation)
+					let replaces_generation =
+						self.turfs[handle.slot as usize].generation != Some(handle.generation);
+					let invalidates_continuation = replaces_generation
 						|| self.turfs[handle.slot as usize]
 							.turf
 							.as_ref()
 							.is_none_or(|turf| turf.mixture != *mixture);
 					if invalidates_continuation {
 						self.invalidate_continuations_for_turf_slot(handle.slot);
+					}
+					if replaces_generation {
+						self.remove_incident_turf_edges(handle.slot);
 					}
 					let slot = &mut self.turfs[handle.slot as usize];
 					let remove_edges = mixture.is_none();
@@ -901,6 +1163,9 @@ impl DogmosWorld {
 	}
 
 	pub fn apply_turf_heat(&mut self, mutations: &[TurfHeatMutation]) -> Result<u32, WorldError> {
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
 		for mutation in mutations {
 			self.require_turf_handle(mutation.handle)?;
 			if let Some(state) = mutation.state {
@@ -926,7 +1191,10 @@ impl DogmosWorld {
 		&mut self,
 		mutations: &[TurfHeatAdjacencyMutation],
 	) -> Result<u32, WorldError> {
-		let mut candidate = self.heat_edges.clone();
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
+		let mut candidate_topology = self.topology.clone();
 		for mutation in mutations {
 			let left = self.require_turf_handle(mutation.left)?;
 			let right = self.require_turf_handle(mutation.right)?;
@@ -939,17 +1207,15 @@ impl DogmosWorld {
 			if mutation.left.slot == mutation.right.slot {
 				return Err(WorldError::SelfTurfHeatAdjacency(mutation.left));
 			}
-			let key = EdgeKey {
-				left: mutation.left.slot.min(mutation.right.slot),
-				right: mutation.left.slot.max(mutation.right.slot),
-			};
 			if mutation.connected {
-				candidate.insert(key);
+				candidate_topology
+					.connect_heat(mutation.left, mutation.right)
+					.map_err(map_topology_error)?;
 			} else {
-				candidate.remove(&key);
+				candidate_topology.disconnect_heat(mutation.left, mutation.right);
 			}
 		}
-		self.heat_edges = candidate;
+		self.topology = candidate_topology;
 		Ok(mutations.len() as u32)
 	}
 
@@ -957,8 +1223,10 @@ impl DogmosWorld {
 		&mut self,
 		mutations: &[TurfAdjacencyMutation],
 	) -> Result<u32, WorldError> {
-		let mut candidate = self.turf_edges.clone();
-		let mut candidate_firelocks = self.turf_firelock_edges.clone();
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
+		let mut candidate_topology = self.topology.clone();
 		for mutation in mutations {
 			let left = self.require_turf_handle(mutation.left)?;
 			let right = self.require_turf_handle(mutation.right)?;
@@ -971,23 +1239,19 @@ impl DogmosWorld {
 			if mutation.left.slot == mutation.right.slot {
 				return Err(WorldError::SelfTurfAdjacency(mutation.left));
 			}
-			let key = EdgeKey {
-				left: mutation.left.slot.min(mutation.right.slot),
-				right: mutation.left.slot.max(mutation.right.slot),
-			};
 			if mutation.connected {
-				candidate.insert(key);
+				candidate_topology
+					.connect_gas(mutation.left, mutation.right)
+					.map_err(map_topology_error)?;
 			} else {
-				candidate.remove(&key);
-				candidate_firelocks.remove(&key);
+				candidate_topology.disconnect_gas(mutation.left, mutation.right);
 			}
 		}
-		if candidate == self.turf_edges {
+		if candidate_topology.revision() == self.topology.revision() {
 			return Ok(mutations.len() as u32);
 		}
-		let graph = self.build_turf_graph(&candidate)?;
-		self.turf_edges = candidate;
-		self.turf_firelock_edges = candidate_firelocks;
+		let graph = self.build_turf_graph(&candidate_topology)?;
+		self.topology = candidate_topology;
 		self.turf_graph = Some(graph);
 		Ok(mutations.len() as u32)
 	}
@@ -996,29 +1260,21 @@ impl DogmosWorld {
 		&mut self,
 		mutations: &[TurfFirelockMutation],
 	) -> Result<u32, WorldError> {
-		let mut candidate = self.turf_firelock_edges.clone();
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
+		let mut candidate_topology = self.topology.clone();
 		for mutation in mutations {
 			self.require_turf_handle(mutation.left)?;
 			self.require_turf_handle(mutation.right)?;
 			if mutation.left.slot == mutation.right.slot {
 				return Err(WorldError::SelfTurfAdjacency(mutation.left));
 			}
-			let key = EdgeKey {
-				left: mutation.left.slot.min(mutation.right.slot),
-				right: mutation.left.slot.max(mutation.right.slot),
-			};
-			if mutation.firelock {
-				if !self.turf_edges.contains(&key) {
-					return Err(WorldError::Graph(
-						"firelock metadata references a disconnected turf edge".into(),
-					));
-				}
-				candidate.insert(key);
-			} else {
-				candidate.remove(&key);
-			}
+			candidate_topology
+				.set_firelock(mutation.left, mutation.right, mutation.firelock)
+				.map_err(map_topology_error)?;
 		}
-		self.turf_firelock_edges = candidate;
+		self.topology = candidate_topology;
 		Ok(mutations.len() as u32)
 	}
 
@@ -1751,11 +2007,20 @@ impl DogmosWorld {
 
 	pub fn snapshot(&self, handle: MixtureHandle) -> Result<MixtureSnapshot, WorldError> {
 		let mixture = self.require_handle(handle)?;
+		let heat_capacity = self
+			.gas_registry
+			.as_ref()
+			.map_or(mixture.minimum_heat_capacity, |registry| {
+				record_heat_capacity(mixture, registry.specific_heats())
+			});
 		Ok(MixtureSnapshot {
 			revision: mixture.revision,
 			temperature: mixture.temperature,
 			volume: mixture.volume,
 			minimum_heat_capacity: mixture.minimum_heat_capacity,
+			total_moles: total_moles(mixture),
+			pressure: mixture_pressure(mixture),
+			heat_capacity,
 			gases: mixture.gases,
 			immutable: mixture.immutable,
 		})
@@ -1808,6 +2073,948 @@ impl DogmosWorld {
 		Ok(u32::try_from(output.len()).unwrap_or(u32::MAX))
 	}
 
+	pub fn pending_stage_epoch(&self) -> Option<u64> {
+		self.stage_cursor.as_ref().map(|cursor| cursor.stage_epoch)
+	}
+
+	pub fn process_stage_chunk_cancellable(
+		&mut self,
+		request: StageChunkRequest,
+		mut should_cancel: impl FnMut() -> bool,
+	) -> Result<StageChunkResult, WorldError> {
+		if request.work_limit == 0 || request.work_limit > MAX_STAGE_WORK_LIMIT {
+			return Err(WorldError::InvalidStageWorkLimit(request.work_limit));
+		}
+		if !request.seconds_per_tick.is_finite() || request.seconds_per_tick <= 0.0 {
+			return Err(WorldError::InvalidSecondsPerTick);
+		}
+		if self.frontier.committed_epoch() != Some(request.frontier_epoch) {
+			return Err(WorldError::StageConflict);
+		}
+		match &self.stage_cursor {
+			Some(cursor) if !cursor.matches(request) => return Err(WorldError::StageConflict),
+			None => {
+				if request.stage == WorldStage::React {
+					self.gas_registry
+						.as_ref()
+						.ok_or(WorldError::GasRegistryMissing)?;
+					self.reaction_registry
+						.as_ref()
+						.ok_or(WorldError::ReactionRegistryMissing)?;
+				}
+				self.stage_cursor = Some(StageCursor::new(request, self.topology.revision()));
+				self.stage_diffusion =
+					(request.stage == WorldStage::ProcessTurfs).then(StageDiffusionState::new);
+				self.stage_heat = (request.stage == WorldStage::TurfHeat).then(StageHeatState::new);
+				self.stage_reactions = (request.stage == WorldStage::React).then(|| {
+					let active_continuations = self
+						.continuations
+						.iter()
+						.filter_map(|slot| {
+							slot.continuation
+								.as_ref()
+								.map(|continuation| continuation.mixture)
+						})
+						.collect();
+					StageReactionState {
+						targets: Vec::new(),
+						active_continuations,
+						seen_mixtures: BTreeSet::new(),
+						staged: BTreeMap::new(),
+						staged_events: Vec::new(),
+						pending: None,
+						next_target: 0,
+					}
+				});
+				self.stage_components = matches!(
+					request.stage,
+					WorldStage::Equalize | WorldStage::ExcitedGroups
+				)
+				.then(StageComponentState::new);
+			}
+			Some(_) => {}
+		}
+
+		let frontier_len = u32::try_from(self.frontier.committed().len()).unwrap_or(u32::MAX);
+		if self
+			.stage_cursor
+			.as_ref()
+			.is_some_and(|cursor| cursor.topology_revision != self.topology.revision())
+		{
+			return Err(WorldError::StageConflict);
+		}
+		let mut work_items = 0;
+		while self
+			.stage_cursor
+			.as_ref()
+			.is_some_and(|cursor| cursor.next_frontier_index < frontier_len)
+			&& work_items < request.work_limit
+		{
+			if should_cancel() {
+				return Err(WorldError::Cancelled);
+			}
+			let index = self
+				.stage_cursor
+				.as_ref()
+				.expect("stage cursor was created")
+				.next_frontier_index;
+			if request.stage == WorldStage::ProcessTurfs {
+				let handle = self.frontier.committed()[index as usize];
+				self.prepare_stage_diffusion_turf(handle)?;
+			} else if request.stage == WorldStage::TurfHeat {
+				let handle = self.frontier.committed()[index as usize];
+				self.prepare_stage_heat_turf(handle)?;
+			} else if request.stage == WorldStage::React {
+				let handle = self.frontier.committed()[index as usize];
+				self.prepare_stage_reaction_turf(handle);
+			} else if matches!(
+				request.stage,
+				WorldStage::Equalize | WorldStage::ExcitedGroups
+			) {
+				let handle = self.frontier.committed()[index as usize];
+				self.prepare_stage_component_turf(handle);
+			}
+			self.stage_cursor
+				.as_mut()
+				.expect("stage cursor was created")
+				.next_frontier_index += 1;
+			work_items += 1;
+		}
+		let remaining_estimate = frontier_len.saturating_sub(
+			self.stage_cursor
+				.as_ref()
+				.expect("stage cursor was created")
+				.next_frontier_index,
+		);
+		if remaining_estimate != 0 {
+			return Ok(StageChunkResult {
+				work_items,
+				pending: true,
+				remaining_estimate,
+				..StageChunkResult::default()
+			});
+		}
+		if request.stage == WorldStage::ProcessTurfs {
+			while work_items < request.work_limit {
+				let Some(next_node) = self
+					.stage_diffusion
+					.as_ref()
+					.filter(|state| state.next_node < state.turfs.len())
+					.map(|state| state.next_node)
+				else {
+					break;
+				};
+				if should_cancel() {
+					return Err(WorldError::Cancelled);
+				}
+				self.compute_stage_diffusion_node(next_node)?;
+				self.stage_diffusion
+					.as_mut()
+					.expect("process-turfs stage owns diffusion state")
+					.next_node += 1;
+				work_items += 1;
+			}
+			let remaining_nodes = self
+				.stage_diffusion
+				.as_ref()
+				.map(|state| state.turfs.len().saturating_sub(state.next_node))
+				.unwrap_or_default();
+			if remaining_nodes != 0 {
+				return Ok(StageChunkResult {
+					work_items,
+					pending: true,
+					remaining_estimate: u32::try_from(remaining_nodes).unwrap_or(u32::MAX),
+					..StageChunkResult::default()
+				});
+			}
+			let completed = self.commit_stage_diffusion()?;
+			self.stage_cursor = None;
+			return Ok(StageChunkResult {
+				work_items,
+				pending: false,
+				remaining_estimate: 0,
+				produced_equalize_seeds: completed,
+				..StageChunkResult::default()
+			});
+		}
+		if request.stage == WorldStage::TurfHeat {
+			while work_items < request.work_limit {
+				let Some(next_node) = self
+					.stage_heat
+					.as_ref()
+					.filter(|state| state.next_node < state.nodes.len())
+					.map(|state| state.next_node)
+				else {
+					break;
+				};
+				if should_cancel() {
+					return Err(WorldError::Cancelled);
+				}
+				self.compute_stage_heat_node(next_node, request.seconds_per_tick as f32)?;
+				self.stage_heat
+					.as_mut()
+					.expect("turf-heat stage owns heat state")
+					.next_node += 1;
+				work_items += 1;
+			}
+			let remaining_nodes = self
+				.stage_heat
+				.as_ref()
+				.map(|state| state.nodes.len().saturating_sub(state.next_node))
+				.unwrap_or_default();
+			if remaining_nodes != 0 {
+				return Ok(StageChunkResult {
+					work_items,
+					pending: true,
+					remaining_estimate: u32::try_from(remaining_nodes).unwrap_or(u32::MAX),
+					..StageChunkResult::default()
+				});
+			}
+			while work_items < request.work_limit && self.advance_stage_heat_topology()? {
+				if should_cancel() {
+					return Err(WorldError::Cancelled);
+				}
+				work_items += 1;
+			}
+			if !self.stage_heat_topology_complete() {
+				return Ok(StageChunkResult {
+					work_items,
+					pending: true,
+					remaining_estimate: 1,
+					..StageChunkResult::default()
+				});
+			}
+			self.prepare_stage_heat_conduction(request.seconds_per_tick as f32)?;
+			while work_items < request.work_limit && self.advance_stage_heat_conduction()? {
+				if should_cancel() {
+					return Err(WorldError::Cancelled);
+				}
+				work_items += 1;
+			}
+			if !self.stage_heat_conduction_complete() {
+				return Ok(StageChunkResult {
+					work_items,
+					pending: true,
+					remaining_estimate: 1,
+					..StageChunkResult::default()
+				});
+			}
+			let (completed, callback_events) = self.commit_stage_heat()?;
+			self.stage_cursor = None;
+			return Ok(StageChunkResult {
+				work_items,
+				callback_events,
+				pending: false,
+				remaining_estimate: 0,
+				produced_heat_seeds: completed,
+				..StageChunkResult::default()
+			});
+		}
+		if request.stage == WorldStage::React {
+			while work_items < request.work_limit {
+				let Some(next_target) = self
+					.stage_reactions
+					.as_ref()
+					.filter(|state| {
+						state.pending.is_none() && state.next_target < state.targets.len()
+					})
+					.map(|state| state.next_target)
+				else {
+					break;
+				};
+				if should_cancel() {
+					return Err(WorldError::Cancelled);
+				}
+				self.compute_stage_reaction_target(next_target)?;
+				self.stage_reactions
+					.as_mut()
+					.expect("reaction stage owns reaction state")
+					.next_target += 1;
+				work_items += 1;
+			}
+			let remaining_targets = self
+				.stage_reactions
+				.as_ref()
+				.map(|state| {
+					if state.pending.is_some() {
+						0
+					} else {
+						state.targets.len().saturating_sub(state.next_target)
+					}
+				})
+				.unwrap_or_default();
+			if remaining_targets != 0 {
+				return Ok(StageChunkResult {
+					work_items,
+					pending: true,
+					remaining_estimate: u32::try_from(remaining_targets).unwrap_or(u32::MAX),
+					..StageChunkResult::default()
+				});
+			}
+			let (_, callback_events) = self.commit_stage_reactions()?;
+			self.stage_cursor = None;
+			return Ok(StageChunkResult {
+				work_items,
+				callback_events,
+				pending: false,
+				remaining_estimate: 0,
+				..StageChunkResult::default()
+			});
+		}
+		if matches!(
+			request.stage,
+			WorldStage::Equalize | WorldStage::ExcitedGroups
+		) {
+			while work_items < request.work_limit {
+				if self
+					.stage_components
+					.as_ref()
+					.is_some_and(|state| state.component_ready)
+				{
+					if should_cancel() {
+						return Err(WorldError::Cancelled);
+					}
+					self.process_ready_stage_component(request.stage, &mut should_cancel)?;
+					work_items += 1;
+					continue;
+				}
+				if !self.advance_stage_component_discovery() {
+					break;
+				}
+				work_items += 1;
+			}
+			if !self.stage_component_discovery_complete() {
+				return Ok(StageChunkResult {
+					work_items,
+					callback_events: 0,
+					pending: true,
+					remaining_estimate: 1,
+					..StageChunkResult::default()
+				});
+			}
+			let callback_events = self.commit_stage_components()?;
+			self.stage_cursor = None;
+			return Ok(StageChunkResult {
+				work_items,
+				callback_events,
+				pending: false,
+				remaining_estimate: 0,
+				..StageChunkResult::default()
+			});
+		}
+		unreachable!("every simulation stage has a dedicated resumable cursor")
+	}
+
+	fn prepare_stage_diffusion_turf(&mut self, turf_handle: TurfHandle) -> Result<(), WorldError> {
+		let Ok(turf) = self.require_turf_handle(turf_handle) else {
+			return Ok(());
+		};
+		let Some(mixture_handle) = turf.mixture else {
+			return Ok(());
+		};
+		let mixture = self.require_handle(mixture_handle)?;
+		let immutable = mixture.immutable;
+		let revision = mixture.revision;
+		let gases = mixture.gases;
+		let state = self
+			.stage_diffusion
+			.as_mut()
+			.expect("process-turfs stage owns diffusion state");
+		if !immutable && !state.seen_mixtures.insert(mixture_handle) {
+			return Err(WorldError::DuplicateMutableTurfMixture(mixture_handle));
+		}
+		if !immutable && revision == u32::MAX {
+			return Err(WorldError::RevisionExhausted(mixture_handle));
+		}
+		let index = state.turfs.len();
+		state.turfs.push(turf_handle);
+		state.mixtures.push(mixture_handle);
+		state.index_by_turf.insert(turf_handle, index);
+		state.input.push(gases);
+		state.output.push([0.0; MAX_GAS_SLOTS]);
+		Ok(())
+	}
+
+	fn compute_stage_diffusion_node(&mut self, index: usize) -> Result<(), WorldError> {
+		let state = self
+			.stage_diffusion
+			.as_ref()
+			.expect("process-turfs stage owns diffusion state");
+		let turf = state.turfs[index];
+		let neighbors = self
+			.topology
+			.gas_neighbors(turf)
+			.filter_map(|neighbor| state.index_by_turf.get(&neighbor.handle).copied())
+			.collect::<Vec<_>>();
+		let self_weight = diffusion_self_weight(neighbors.len() as u32)
+			.map_err(|error| WorldError::State(error.to_string()))?;
+		let mut output = [0.0; MAX_GAS_SLOTS];
+		for (gas_index, output_value) in output.iter_mut().enumerate() {
+			let mut next_value = state.input[index][gas_index] * self_weight;
+			for neighbor in &neighbors {
+				next_value += state.input[*neighbor][gas_index] * GAS_DIFFUSION_CONSTANT;
+			}
+			*output_value = next_value;
+		}
+		self.stage_diffusion
+			.as_mut()
+			.expect("process-turfs stage owns diffusion state")
+			.output[index] = output;
+		Ok(())
+	}
+
+	fn commit_stage_diffusion(&mut self) -> Result<u32, WorldError> {
+		let state = self
+			.stage_diffusion
+			.take()
+			.expect("process-turfs stage owns diffusion state");
+		let work_items = u32::try_from(state.mixtures.len())
+			.map_err(|_| WorldError::State("turf count exceeds u32".into()))?;
+		for (handle, gases) in state.mixtures.into_iter().zip(state.output) {
+			let mixture = self.require_handle_mut(handle)?;
+			if mixture.immutable {
+				continue;
+			}
+			mixture.gases = gases;
+			mixture.revision += 1;
+		}
+		Ok(work_items)
+	}
+
+	fn prepare_stage_heat_turf(&mut self, turf_handle: TurfHandle) -> Result<(), WorldError> {
+		let Ok(turf) = self.require_turf_handle(turf_handle) else {
+			return Ok(());
+		};
+		let Some(heat) = turf.heat else {
+			return Ok(());
+		};
+		let mixture = turf.mixture;
+		let state = self
+			.stage_heat
+			.as_mut()
+			.expect("turf-heat stage owns heat state");
+		let index = u32::try_from(state.nodes.len())
+			.map_err(|_| WorldError::State("turf heat count exceeds u32".into()))?;
+		state.nodes.push((turf_handle, heat, mixture));
+		state.index_by_slot.insert(turf_handle.slot, index);
+		state.temperatures.push(heat.temperature);
+		state.conductivities.push(heat.thermal_conductivity);
+		state.heat_capacities.push(heat.heat_capacity);
+		state.row_sums.push(0.0);
+		Ok(())
+	}
+
+	fn compute_stage_heat_node(
+		&mut self,
+		index: usize,
+		seconds_per_tick: f32,
+	) -> Result<(), WorldError> {
+		let (turf, heat_state, mixture_handle, mut temperature) = {
+			let state = self
+				.stage_heat
+				.as_ref()
+				.expect("turf-heat stage owns heat state");
+			let (turf, heat_state, mixture_handle) = state.nodes[index];
+			(turf, heat_state, mixture_handle, state.temperatures[index])
+		};
+		let elapsed_heat_scale =
+			seconds_per_tick / crate::numerics::conduction::BASE_HEAT_STEP_SECONDS;
+		if heat_state.adjacent_to_space && temperature > 273.15 {
+			if self.realistic_space_radiation {
+				let emitted = STEFAN_BOLTZMANN_CONSTANT
+					* f64::from(seconds_per_tick)
+					* f64::from(temperature).powi(4);
+				let received = RADIATION_FROM_SPACE * f64::from(seconds_per_tick);
+				temperature = (f64::from(temperature)
+					- (emitted - received) / f64::from(heat_state.heat_capacity))
+				.max(f64::from(MINIMUM_TEMPERATURE_K)) as f32;
+			} else if temperature > 293.15 {
+				let heat = heat_exchange_energy(
+					heat_state.thermal_conductivity
+						* elapsed_heat_scale
+						* (temperature - MINIMUM_TEMPERATURE_K),
+					7000.0,
+					heat_state.heat_capacity,
+				);
+				temperature =
+					(temperature - heat / heat_state.heat_capacity).max(MINIMUM_TEMPERATURE_K);
+			}
+		}
+
+		if let Some(mixture_handle) = mixture_handle {
+			if !self
+				.stage_heat
+				.as_mut()
+				.expect("turf-heat stage owns heat state")
+				.linked_mixtures
+				.insert(mixture_handle)
+			{
+				return Err(WorldError::DuplicateMutableTurfMixture(mixture_handle));
+			}
+			let specific_heats = self
+				.gas_registry
+				.as_ref()
+				.ok_or(WorldError::GasRegistryMissing)?
+				.specific_heats();
+			let mut mixture = self.require_handle(mixture_handle)?.clone();
+			if !mixture.immutable {
+				let gas_capacity = record_heat_capacity(&mixture, specific_heats);
+				let temperature_delta = mixture.temperature - temperature;
+				if (temperature > MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION_K
+					|| mixture.temperature >= MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION_K)
+					&& temperature_delta.abs() > MINIMUM_TEMPERATURE_DELTA_TO_CONSIDER
+					&& gas_capacity > MINIMUM_HEAT_CAPACITY
+				{
+					if mixture.revision == u32::MAX {
+						return Err(WorldError::RevisionExhausted(mixture_handle));
+					}
+					let heat = heat_state.thermal_conductivity
+						* OPEN_HEAT_TRANSFER_COEFFICIENT
+						* elapsed_heat_scale
+						* temperature_delta
+						* harmonic_heat_capacity(gas_capacity, heat_state.heat_capacity);
+					mixture.temperature =
+						(mixture.temperature - heat / gas_capacity).max(MINIMUM_TEMPERATURE_K);
+					temperature =
+						(temperature + heat / heat_state.heat_capacity).max(MINIMUM_TEMPERATURE_K);
+					self.stage_heat
+						.as_mut()
+						.expect("turf-heat stage owns heat state")
+						.staged_mixtures
+						.insert(mixture_handle, mixture);
+				}
+			}
+		}
+
+		let state = self
+			.stage_heat
+			.as_mut()
+			.expect("turf-heat stage owns heat state");
+		state.temperatures[index] = temperature;
+		if temperature > MINIMUM_TEMPERATURE_START_SUPERCONDUCTION_K
+			&& temperature > heat_state.heat_capacity
+		{
+			state
+				.staged_events
+				.push(WorldEvent::TurfDestructionRequest { turf });
+		}
+		Ok(())
+	}
+
+	fn advance_stage_heat_topology(&mut self) -> Result<bool, WorldError> {
+		loop {
+			let Some((turf, neighbor_index)) = self.stage_heat.as_ref().and_then(|state| {
+				state
+					.nodes
+					.get(state.next_topology_node)
+					.map(|(turf, _, _)| (*turf, state.next_topology_neighbor))
+			}) else {
+				return Ok(false);
+			};
+			let neighbors = self.topology.heat_neighbors(turf).collect::<Vec<_>>();
+			if neighbor_index >= neighbors.len() {
+				let state = self
+					.stage_heat
+					.as_mut()
+					.expect("turf-heat stage owns heat state");
+				state.next_topology_node += 1;
+				state.next_topology_neighbor = 0;
+				continue;
+			}
+			let neighbor = neighbors[neighbor_index].handle;
+			let state = self
+				.stage_heat
+				.as_mut()
+				.expect("turf-heat stage owns heat state");
+			state.next_topology_neighbor += 1;
+			let Some(&second) = state.index_by_slot.get(&neighbor.slot) else {
+				return Ok(true);
+			};
+			let first = state.index_by_slot[&turf.slot];
+			if first >= second {
+				return Ok(true);
+			}
+			let first_index = first as usize;
+			let second_index = second as usize;
+			state.row_sums[first_index] += crate::numerics::conduction::heat_row_weight(
+				state.conductivities[first_index],
+				state.conductivities[second_index],
+				state.heat_capacities[first_index],
+				state.heat_capacities[second_index],
+			)
+			.map_err(|error| WorldError::State(error.to_string()))?;
+			state.row_sums[second_index] += crate::numerics::conduction::heat_row_weight(
+				state.conductivities[second_index],
+				state.conductivities[first_index],
+				state.heat_capacities[second_index],
+				state.heat_capacities[first_index],
+			)
+			.map_err(|error| WorldError::State(error.to_string()))?;
+			state.edges.push((first, second));
+			return Ok(true);
+		}
+	}
+
+	fn stage_heat_topology_complete(&self) -> bool {
+		self.stage_heat
+			.as_ref()
+			.is_some_and(|state| state.next_topology_node >= state.nodes.len())
+	}
+
+	fn prepare_stage_heat_conduction(&mut self, seconds_per_tick: f32) -> Result<(), WorldError> {
+		let state = self
+			.stage_heat
+			.as_mut()
+			.expect("turf-heat stage owns heat state");
+		if state.conduction_substeps.is_some() {
+			return Ok(());
+		}
+		let elapsed_scale = seconds_per_tick / crate::numerics::conduction::BASE_HEAT_STEP_SECONDS;
+		let maximum_scaled_sum =
+			state.row_sums.iter().copied().fold(0.0_f32, f32::max) * elapsed_scale;
+		if !maximum_scaled_sum.is_finite()
+			|| maximum_scaled_sum > crate::numerics::conduction::MAX_CONDUCTION_SUBSTEPS as f32
+		{
+			return Err(WorldError::State(
+				crate::numerics::conduction::ConductionError::TooManySubsteps.to_string(),
+			));
+		}
+		let substeps = (maximum_scaled_sum.ceil() as u32).max(1);
+		state.conduction_substeps = Some(substeps);
+		state.conduction_scale = elapsed_scale / substeps as f32;
+		Ok(())
+	}
+
+	fn advance_stage_heat_conduction(&mut self) -> Result<bool, WorldError> {
+		if self.stage_heat_conduction_complete() {
+			return Ok(false);
+		}
+		let state = self
+			.stage_heat
+			.as_mut()
+			.expect("turf-heat stage owns heat state");
+		if state.edges.is_empty() {
+			state.conduction_substep = state.conduction_substeps.unwrap_or(1);
+			return Ok(false);
+		}
+		let (first, second) = state.edges[state.conduction_edge];
+		let first_index = first as usize;
+		let second_index = second as usize;
+		let difference = state.temperatures[second_index] - state.temperatures[first_index];
+		let first_weight = crate::numerics::conduction::heat_row_weight(
+			state.conductivities[first_index],
+			state.conductivities[second_index],
+			state.heat_capacities[first_index],
+			state.heat_capacities[second_index],
+		)
+		.map_err(|error| WorldError::State(error.to_string()))?
+			* state.conduction_scale;
+		let second_weight = crate::numerics::conduction::heat_row_weight(
+			state.conductivities[second_index],
+			state.conductivities[first_index],
+			state.heat_capacities[second_index],
+			state.heat_capacities[first_index],
+		)
+		.map_err(|error| WorldError::State(error.to_string()))?
+			* state.conduction_scale;
+		state.temperatures[first_index] += difference * first_weight;
+		state.temperatures[second_index] -= difference * second_weight;
+		state.conduction_edge += 1;
+		if state.conduction_edge == state.edges.len() {
+			state.conduction_edge = 0;
+			state.conduction_substep += 1;
+		}
+		Ok(true)
+	}
+
+	fn stage_heat_conduction_complete(&self) -> bool {
+		self.stage_heat.as_ref().is_some_and(|state| {
+			state.conduction_substeps.is_some_and(|substeps| {
+				state.edges.is_empty() || state.conduction_substep >= substeps
+			})
+		})
+	}
+
+	fn commit_stage_heat(&mut self) -> Result<(u32, u32), WorldError> {
+		let state = self
+			.stage_heat
+			.take()
+			.expect("turf-heat stage owns heat state");
+		let requested_events = self.events.len().saturating_add(state.staged_events.len());
+		if requested_events > self.max_events as usize {
+			self.stage_heat = Some(state);
+			return Err(WorldError::EventCapacityExceeded {
+				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
+				capacity: self.max_events,
+			});
+		}
+		let completed = u32::try_from(state.nodes.len())
+			.map_err(|_| WorldError::State("turf heat count exceeds u32".into()))?;
+		let callback_events = u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX);
+		for (handle, mut mixture) in state.staged_mixtures {
+			let current = self.require_handle_mut(handle)?;
+			mixture.revision = current.revision + 1;
+			*current = mixture;
+		}
+		for ((handle, _, _), temperature) in state.nodes.into_iter().zip(state.temperatures) {
+			self.require_turf_handle_mut(handle)?
+				.heat
+				.as_mut()
+				.expect("turf heat state was validated")
+				.temperature = temperature;
+		}
+		self.events.extend(state.staged_events);
+		Ok((completed, callback_events))
+	}
+
+	fn prepare_stage_reaction_turf(&mut self, turf_handle: TurfHandle) {
+		let Some(mixture) = self
+			.require_turf_handle(turf_handle)
+			.ok()
+			.and_then(|turf| turf.mixture)
+		else {
+			return;
+		};
+		self.stage_reactions
+			.as_mut()
+			.expect("reaction stage owns reaction state")
+			.targets
+			.push((turf_handle, mixture));
+	}
+
+	fn compute_stage_reaction_target(&mut self, index: usize) -> Result<(), WorldError> {
+		let (turf, mixture, should_process) = {
+			let state = self
+				.stage_reactions
+				.as_mut()
+				.expect("reaction stage owns reaction state");
+			let (turf, mixture) = state.targets[index];
+			let should_process = state.seen_mixtures.insert(mixture)
+				&& !state.active_continuations.contains(&mixture);
+			(turf, mixture, should_process)
+		};
+		if !should_process {
+			return Ok(());
+		}
+		let sequence = self.evaluate_reaction_sequence(turf.into(), mixture, 0, 0, None)?;
+		let state = self
+			.stage_reactions
+			.as_mut()
+			.expect("reaction stage owns reaction state");
+		state.staged_events.extend(sequence.events);
+		if sequence.native_updates > 0 {
+			state.staged.insert(mixture, sequence.mixture);
+		}
+		if let Some(dm_reaction) = sequence.pending {
+			state.pending = Some((turf, mixture, dm_reaction));
+		}
+		Ok(())
+	}
+
+	fn commit_stage_reactions(&mut self) -> Result<(u32, u32), WorldError> {
+		let state = self
+			.stage_reactions
+			.take()
+			.expect("reaction stage owns reaction state");
+		let requested_events = self
+			.events
+			.len()
+			.saturating_add(state.staged_events.len())
+			.saturating_add(usize::from(state.pending.is_some()));
+		if requested_events > self.max_events as usize {
+			self.stage_reactions = Some(state);
+			return Err(WorldError::EventCapacityExceeded {
+				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
+				capacity: self.max_events,
+			});
+		}
+		let continuation_event = if let Some((turf, mixture, pending)) = state.pending {
+			let token = self.allocate_continuation(ReactionContinuation {
+				turf: Some(turf),
+				mixture,
+				target: turf.into(),
+				next_reaction_index: pending.next_reaction_index,
+				reaction_profile_threshold_ms: None,
+			})?;
+			Some(WorldEvent::RunDmReaction {
+				turf: Some(turf),
+				mixture,
+				target: turf.into(),
+				reaction: pending.reaction,
+				continuation: token,
+			})
+		} else {
+			None
+		};
+		for (handle, mut record) in state.staged {
+			let current = self.require_handle_mut(handle)?;
+			record.revision = current.revision + 1;
+			*current = record;
+		}
+		let callback_events = state
+			.staged_events
+			.len()
+			.saturating_add(usize::from(continuation_event.is_some()));
+		self.events.extend(state.staged_events);
+		if let Some(event) = continuation_event {
+			self.events.push(event);
+		}
+		Ok((
+			u32::try_from(state.targets.len()).unwrap_or(u32::MAX),
+			u32::try_from(callback_events).unwrap_or(u32::MAX),
+		))
+	}
+
+	fn prepare_stage_component_turf(&mut self, turf_handle: TurfHandle) {
+		if self
+			.require_turf_handle(turf_handle)
+			.ok()
+			.is_none_or(|turf| turf.mixture.is_none())
+		{
+			return;
+		}
+		let state = self
+			.stage_components
+			.as_mut()
+			.expect("component stage owns traversal state");
+		state.targets.push(turf_handle);
+		state.active_by_slot.insert(turf_handle.slot, turf_handle);
+	}
+
+	fn advance_stage_component_discovery(&mut self) -> bool {
+		loop {
+			let state = self
+				.stage_components
+				.as_ref()
+				.expect("component stage owns traversal state");
+			if let Some(current) = state.queue.get(state.queue_index).copied() {
+				let neighbors = self.topology.gas_neighbors(current).collect::<Vec<_>>();
+				if state.next_neighbor >= neighbors.len() {
+					let state = self
+						.stage_components
+						.as_mut()
+						.expect("component stage owns traversal state");
+					state.queue_index += 1;
+					state.next_neighbor = 0;
+					continue;
+				}
+				let neighbor = neighbors[state.next_neighbor].handle;
+				let state = self
+					.stage_components
+					.as_mut()
+					.expect("component stage owns traversal state");
+				state.next_neighbor += 1;
+				if state.active_by_slot.get(&neighbor.slot) == Some(&neighbor)
+					&& state.visited.insert(neighbor.slot)
+				{
+					state.queue.push(neighbor);
+				}
+				return true;
+			}
+			if !state.queue.is_empty() {
+				self.stage_components
+					.as_mut()
+					.expect("component stage owns traversal state")
+					.component_ready = true;
+				return false;
+			}
+			if state.next_seed >= state.targets.len() {
+				return false;
+			}
+			let seed = state.targets[state.next_seed];
+			let state = self
+				.stage_components
+				.as_mut()
+				.expect("component stage owns traversal state");
+			state.next_seed += 1;
+			if state.visited.insert(seed.slot) {
+				state.queue.push(seed);
+			}
+			return true;
+		}
+	}
+
+	fn process_ready_stage_component(
+		&mut self,
+		stage: WorldStage,
+		should_cancel: &mut impl FnMut() -> bool,
+	) -> Result<(), WorldError> {
+		let component = self
+			.stage_components
+			.as_ref()
+			.expect("component stage owns traversal state")
+			.queue
+			.clone();
+		let mixture_handles = component
+			.iter()
+			.filter_map(|turf| self.require_turf_handle(*turf).ok()?.mixture)
+			.collect::<BTreeSet<_>>();
+		let before = mixture_handles
+			.iter()
+			.map(|handle| Ok((*handle, self.require_handle(*handle)?.clone())))
+			.collect::<Result<Vec<_>, WorldError>>()?;
+		let event_start = self.events.len();
+		self.stage_component_turfs = Some(component);
+		self.use_committed_frontier = true;
+		let result = match stage {
+			WorldStage::Equalize => self.process_equalize(should_cancel),
+			WorldStage::ExcitedGroups => self.process_excited_groups(should_cancel),
+			_ => unreachable!("only component stages use component traversal"),
+		};
+		self.use_committed_frontier = false;
+		self.stage_component_turfs = None;
+		result?;
+		let after = mixture_handles
+			.iter()
+			.map(|handle| Ok((*handle, self.require_handle(*handle)?.clone())))
+			.collect::<Result<Vec<_>, WorldError>>()?;
+		for (handle, record) in before {
+			*self.require_handle_mut(handle)? = record;
+		}
+		let component_events = self.events.split_off(event_start);
+		let state = self
+			.stage_components
+			.as_mut()
+			.expect("component stage owns traversal state");
+		state.staged_records.extend(after);
+		state.staged_events.extend(component_events);
+		state.queue.clear();
+		state.queue_index = 0;
+		state.next_neighbor = 0;
+		state.component_ready = false;
+		Ok(())
+	}
+
+	fn commit_stage_components(&mut self) -> Result<u32, WorldError> {
+		let state = self
+			.stage_components
+			.take()
+			.expect("component stage owns traversal state");
+		let requested_events = self.events.len().saturating_add(state.staged_events.len());
+		if requested_events > self.max_events as usize {
+			self.stage_components = Some(state);
+			return Err(WorldError::EventCapacityExceeded {
+				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
+				capacity: self.max_events,
+			});
+		}
+		let callback_events = u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX);
+		for (handle, record) in state.staged_records {
+			*self.require_handle_mut(handle)? = record;
+		}
+		self.events.extend(state.staged_events);
+		Ok(callback_events)
+	}
+
+	fn stage_component_discovery_complete(&self) -> bool {
+		self.stage_components.as_ref().is_some_and(|state| {
+			state.next_seed >= state.targets.len()
+				&& state.queue.is_empty()
+				&& !state.component_ready
+		})
+	}
+
+	#[cfg(debug_assertions)]
 	pub fn process_stage_cancellable(
 		&mut self,
 		stage: WorldStage,
@@ -1822,6 +3029,7 @@ impl DogmosWorld {
 		)
 	}
 
+	#[cfg(debug_assertions)]
 	pub fn process_stage_cancellable_with_event_limit(
 		&mut self,
 		stage: WorldStage,
@@ -1836,6 +3044,7 @@ impl DogmosWorld {
 		result
 	}
 
+	#[cfg(debug_assertions)]
 	fn process_stage_cancellable_inner(
 		&mut self,
 		stage: WorldStage,
@@ -1854,14 +3063,18 @@ impl DogmosWorld {
 			WorldStage::ProcessTurfs => {}
 			WorldStage::React => return self.process_reactions(&mut should_cancel),
 		}
-		let has_turf_state = self.turfs.iter().any(|slot| slot.turf.is_some());
-		let turf_handles = self
-			.turfs
+		let active_turfs = self.stage_turf_handles();
+		let has_turf_state = !active_turfs.is_empty();
+		let turf_handles = active_turfs
 			.iter()
-			.filter_map(|slot| slot.turf.as_ref()?.mixture)
+			.filter_map(|handle| self.require_turf_handle(*handle).ok()?.mixture)
 			.collect::<Vec<_>>();
 		if has_turf_state {
-			return self.process_turf_diffusion(turf_handles, &mut should_cancel);
+			let frontier_graph = self
+				.use_committed_frontier
+				.then(|| self.build_turf_graph_for_handles(&active_turfs))
+				.transpose()?;
+			return self.process_turf_diffusion(turf_handles, frontier_graph, &mut should_cancel);
 		}
 		let work_items = u32::try_from(self.live_count())
 			.map_err(|_| WorldError::State("mixture count exceeds u32".into()))?;
@@ -1930,6 +3143,7 @@ impl DogmosWorld {
 		Ok(StageResult { work_items })
 	}
 
+	#[cfg(debug_assertions)]
 	fn process_reactions(
 		&mut self,
 		should_cancel: &mut impl FnMut() -> bool,
@@ -1953,19 +3167,9 @@ impl DogmosWorld {
 			})
 			.collect::<BTreeSet<_>>();
 		let targets = self
-			.turfs
-			.iter()
-			.enumerate()
-			.filter_map(|(slot, turf_slot)| {
-				let turf = turf_slot.turf.as_ref()?;
-				Some((
-					TurfHandle {
-						slot: slot as u32,
-						generation: turf_slot.generation?,
-					},
-					turf.mixture?,
-				))
-			})
+			.stage_turf_handles()
+			.into_iter()
+			.filter_map(|handle| Some((handle, self.require_turf_handle(handle).ok()?.mixture?)))
 			.collect::<Vec<_>>();
 		let mut seen_mixtures = BTreeSet::new();
 		let mut staged = BTreeMap::<MixtureHandle, MixtureRecord>::new();
@@ -2433,22 +3637,12 @@ impl DogmosWorld {
 			return Err(WorldError::Cancelled);
 		}
 		let nodes = self
-			.turfs
-			.iter()
-			.enumerate()
-			.filter_map(|(slot, turf_slot)| {
-				let turf = turf_slot.turf.as_ref()?;
+			.stage_turf_handles()
+			.into_iter()
+			.filter_map(|handle| {
+				let turf = self.require_turf_handle(handle).ok()?;
 				let mixture = turf.mixture?;
-				Some((
-					slot as u32,
-					(
-						TurfHandle {
-							slot: slot as u32,
-							generation: turf_slot.generation?,
-						},
-						mixture,
-					),
-				))
+				Some((handle.slot, (handle, mixture)))
 			})
 			.collect::<BTreeMap<_, _>>();
 		if nodes.is_empty() {
@@ -2465,10 +3659,14 @@ impl DogmosWorld {
 		for slot in nodes.keys().copied() {
 			adjacency.entry(slot).or_default();
 		}
-		for edge in &self.turf_edges {
-			if nodes.contains_key(&edge.left) && nodes.contains_key(&edge.right) {
-				adjacency.entry(edge.left).or_default().push(edge.right);
-				adjacency.entry(edge.right).or_default().push(edge.left);
+		for (slot, (handle, _)) in &nodes {
+			for neighbor in self.topology.gas_neighbors(*handle) {
+				if nodes.contains_key(&neighbor.handle.slot) {
+					adjacency
+						.entry(*slot)
+						.or_default()
+						.push(neighbor.handle.slot);
+				}
 			}
 		}
 		for neighbors in adjacency.values_mut() {
@@ -2581,16 +3779,11 @@ impl DogmosWorld {
 			return Err(WorldError::Cancelled);
 		}
 		let turf_handles = self
-			.turfs
-			.iter()
-			.enumerate()
-			.filter_map(|(slot, turf_slot)| {
-				let turf = turf_slot.turf.as_ref()?;
-				turf.mixture?;
-				Some(TurfHandle {
-					slot: slot as u32,
-					generation: turf_slot.generation?,
-				})
+			.stage_turf_handles()
+			.into_iter()
+			.filter(|handle| {
+				self.require_turf_handle(*handle)
+					.is_ok_and(|turf| turf.mixture.is_some())
 			})
 			.collect::<Vec<_>>();
 		if turf_handles.is_empty() {
@@ -2600,9 +3793,15 @@ impl DogmosWorld {
 		for handle in &turf_handles {
 			adjacency.entry(handle.slot).or_default();
 		}
-		for edge in &self.turf_edges {
-			adjacency.entry(edge.left).or_default().push(edge.right);
-			adjacency.entry(edge.right).or_default().push(edge.left);
+		for handle in &turf_handles {
+			for neighbor in self.topology.gas_neighbors(*handle) {
+				if adjacency.contains_key(&neighbor.handle.slot) {
+					adjacency
+						.entry(handle.slot)
+						.or_default()
+						.push(neighbor.handle.slot);
+				}
+			}
 		}
 		for neighbors in adjacency.values_mut() {
 			neighbors.sort_unstable();
@@ -2824,19 +4023,25 @@ impl DogmosWorld {
 			records.insert(mixture_handle, mixture);
 			local_losses.insert(turf_slot, lost);
 		}
-		for edge in self.turf_firelock_edges.iter().filter(|edge| {
-			component_slots.contains(&edge.left) && component_slots.contains(&edge.right)
-		}) {
-			let (source_slot, target_slot) =
-				if immutable_turfs.contains(&edge.left) && !immutable_turfs.contains(&edge.right) {
-					(edge.right, edge.left)
-				} else {
-					(edge.left, edge.right)
-				};
-			events.push(WorldEvent::FirelockConsideration {
-				source: self.current_turf_handle(source_slot)?,
-				target: self.current_turf_handle(target_slot)?,
-			});
+		for left in component_slots.iter().copied() {
+			let left_handle = self.current_turf_handle(left)?;
+			for neighbor in self.topology.gas_neighbors(left_handle).filter(|neighbor| {
+				neighbor.firelock
+					&& left < neighbor.handle.slot
+					&& component_slots.contains(&neighbor.handle.slot)
+			}) {
+				let right = neighbor.handle.slot;
+				let (source_slot, target_slot) =
+					if immutable_turfs.contains(&left) && !immutable_turfs.contains(&right) {
+						(right, left)
+					} else {
+						(left, right)
+					};
+				events.push(WorldEvent::FirelockConsideration {
+					source: self.current_turf_handle(source_slot)?,
+					target: self.current_turf_handle(target_slot)?,
+				});
+			}
 		}
 
 		let mut accumulated_losses = local_losses.clone();
@@ -2902,6 +4107,7 @@ impl DogmosWorld {
 		Ok(())
 	}
 
+	#[cfg(debug_assertions)]
 	fn process_turf_heat(
 		&mut self,
 		should_cancel: &mut impl FnMut() -> bool,
@@ -2911,15 +4117,10 @@ impl DogmosWorld {
 			return Err(WorldError::Cancelled);
 		}
 		let nodes = self
-			.turfs
-			.iter()
-			.enumerate()
-			.filter_map(|(slot, turf_slot)| {
-				let turf = turf_slot.turf.as_ref()?;
-				let handle = TurfHandle {
-					slot: slot as u32,
-					generation: turf_slot.generation?,
-				};
+			.stage_turf_handles()
+			.into_iter()
+			.filter_map(|handle| {
+				let turf = self.require_turf_handle(handle).ok()?;
 				Some((handle, turf.heat?, turf.mixture))
 			})
 			.collect::<Vec<_>>();
@@ -2934,19 +4135,14 @@ impl DogmosWorld {
 			.map(|(index, (handle, _, _))| (handle.slot, index as u32))
 			.collect::<BTreeMap<_, _>>();
 		let edges = self
-			.heat_edges
-			.iter()
-			.map(|edge| {
-				let first = dense_by_slot
-					.get(&edge.left)
-					.copied()
-					.ok_or(WorldError::State("heat edge has no first node".into()))?;
-				let second = dense_by_slot
-					.get(&edge.right)
-					.copied()
-					.ok_or(WorldError::State("heat edge has no second node".into()))?;
-				Ok((first, second))
+			.topology
+			.heat_slot_edges()
+			.filter_map(|(left, right)| {
+				let first = dense_by_slot.get(&left).copied()?;
+				let second = dense_by_slot.get(&right).copied()?;
+				Some((first, second))
 			})
+			.map(|(first, second)| Ok((first, second)))
 			.collect::<Result<Vec<_>, WorldError>>()?;
 		let mut temperatures = nodes
 			.iter()
@@ -3069,9 +4265,11 @@ impl DogmosWorld {
 		Ok(StageResult { work_items })
 	}
 
+	#[cfg(debug_assertions)]
 	fn process_turf_diffusion(
 		&mut self,
 		handles: Vec<MixtureHandle>,
+		frontier_graph: Option<DiffusionGraph>,
 		should_cancel: &mut impl FnMut() -> bool,
 	) -> Result<StageResult, WorldError> {
 		let work_items = u32::try_from(handles.len())
@@ -3089,8 +4287,8 @@ impl DogmosWorld {
 				return Err(WorldError::RevisionExhausted(handle));
 			}
 		}
-		if self.turf_graph.is_none() {
-			self.turf_graph = Some(self.build_turf_graph(&self.turf_edges)?);
+		if frontier_graph.is_none() && self.turf_graph.is_none() {
+			self.turf_graph = Some(self.build_turf_graph(&self.topology)?);
 		}
 		self.input.clear();
 		for handle in handles.iter().copied() {
@@ -3098,10 +4296,12 @@ impl DogmosWorld {
 			self.input.extend_from_slice(&gases);
 		}
 		self.output.resize(self.input.len(), 0.0);
+		let graph = frontier_graph
+			.as_ref()
+			.or(self.turf_graph.as_ref())
+			.expect("turf graph was built above");
 		diffusion_step_into_cancellable(
-			self.turf_graph
-				.as_ref()
-				.expect("turf graph was built above"),
+			graph,
 			MAX_GAS_SLOTS as u32,
 			&self.input,
 			&mut self.output,
@@ -3134,7 +4334,7 @@ impl DogmosWorld {
 	}
 
 	pub fn turf_edge_count(&self) -> usize {
-		self.turf_edges.len()
+		self.topology.gas_edge_count()
 	}
 
 	pub fn slot_count(&self) -> usize {
@@ -3646,21 +4846,33 @@ impl DogmosWorld {
 	}
 
 	fn require_turf_handle(&self, handle: TurfHandle) -> Result<&TurfRecord, WorldError> {
-		let Some(slot) = self.turfs.get(handle.slot as usize) else {
-			return Err(WorldError::UnknownTurfHandle(handle));
-		};
-		let Some(generation) = slot.generation else {
-			return Err(WorldError::UnknownTurfHandle(handle));
-		};
-		if generation != handle.generation {
-			return Err(WorldError::StaleTurfHandle {
-				requested: handle,
-				current: generation,
-			});
+		require_turf_handle_in(&self.turfs, handle)
+	}
+
+	fn stage_turf_handles(&self) -> Vec<TurfHandle> {
+		if let Some(component) = &self.stage_component_turfs {
+			return component.clone();
 		}
-		slot.turf
-			.as_ref()
-			.ok_or(WorldError::UnknownTurfHandle(handle))
+		if self.use_committed_frontier {
+			return self
+				.frontier
+				.committed()
+				.iter()
+				.copied()
+				.filter(|handle| self.require_turf_handle(*handle).is_ok())
+				.collect();
+		}
+		self.turfs
+			.iter()
+			.enumerate()
+			.filter_map(|(slot, turf_slot)| {
+				turf_slot.turf.as_ref()?;
+				Some(TurfHandle {
+					slot: slot as u32,
+					generation: turf_slot.generation?,
+				})
+			})
+			.collect()
 	}
 
 	fn require_turf_handle_mut(
@@ -3690,21 +4902,28 @@ impl DogmosWorld {
 	}
 
 	fn remove_incident_turf_edges(&mut self, slot: u32) {
-		let previous_len = self.turf_edges.len();
-		self.turf_edges
-			.retain(|key| key.left != slot && key.right != slot);
-		self.turf_firelock_edges
-			.retain(|key| key.left != slot && key.right != slot);
-		if self.turf_edges.len() != previous_len {
-			self.turf_graph = None;
-		}
+		self.topology.remove_slot(slot);
+		self.turf_graph = None;
 	}
 
 	fn remove_incident_heat_edges(&mut self, slot: u32) {
-		self.heat_edges
-			.retain(|key| key.left != slot && key.right != slot);
+		let gas_edges = self
+			.topology
+			.gas_slot_edges()
+			.filter(|(left, right, _)| *left == slot || *right == slot)
+			.collect::<Vec<_>>();
+		self.topology.remove_slot(slot);
+		for (left, right, firelock) in gas_edges {
+			let left = self.current_turf_handle(left).ok();
+			let right = self.current_turf_handle(right).ok();
+			if let (Some(left), Some(right)) = (left, right) {
+				let _ = self.topology.connect_gas(left, right);
+				let _ = self.topology.set_firelock(left, right, firelock);
+			}
+		}
 	}
 
+	#[cfg(debug_assertions)]
 	fn live_count(&self) -> usize {
 		self.mixtures
 			.iter()
@@ -3750,7 +4969,7 @@ impl DogmosWorld {
 		validate_graph(&nodes, &directed).map_err(|error| WorldError::Graph(error.to_string()))
 	}
 
-	fn build_turf_graph(&self, edges: &BTreeSet<EdgeKey>) -> Result<DiffusionGraph, WorldError> {
+	fn build_turf_graph(&self, topology: &PackedTopology) -> Result<DiffusionGraph, WorldError> {
 		let nodes = self
 			.turfs
 			.iter()
@@ -3767,17 +4986,58 @@ impl DogmosWorld {
 				})
 			})
 			.collect::<Vec<_>>();
-		let directed = edges
-			.iter()
-			.flat_map(|edge| {
+		let directed = topology
+			.gas_slot_edges()
+			.flat_map(|(left, right, _)| {
 				[
 					DirectedEdge {
-						from: NodeHandle(edge.left),
-						to: NodeHandle(edge.right),
+						from: NodeHandle(left),
+						to: NodeHandle(right),
 					},
 					DirectedEdge {
-						from: NodeHandle(edge.right),
-						to: NodeHandle(edge.left),
+						from: NodeHandle(right),
+						to: NodeHandle(left),
+					},
+				]
+			})
+			.collect::<Vec<_>>();
+		validate_graph(&nodes, &directed).map_err(|error| WorldError::Graph(error.to_string()))
+	}
+
+	#[cfg(debug_assertions)]
+	fn build_turf_graph_for_handles(
+		&self,
+		handles: &[TurfHandle],
+	) -> Result<DiffusionGraph, WorldError> {
+		let allowed = handles
+			.iter()
+			.map(|handle| handle.slot)
+			.collect::<BTreeSet<_>>();
+		let nodes = handles
+			.iter()
+			.filter_map(|handle| {
+				let turf = self.require_turf_handle(*handle).ok()?;
+				let mixture = turf.mixture?;
+				Some(GraphNode {
+					handle: NodeHandle(handle.slot),
+					generation: handle.generation,
+					mixture: Some(mixture),
+				})
+			})
+			.collect::<Vec<_>>();
+		let directed = self
+			.topology
+			.gas_slot_edges()
+			.filter(|(left, right, _)| allowed.contains(left) && allowed.contains(right))
+			.flat_map(|(left, right, _)| {
+				[
+					DirectedEdge {
+						from: NodeHandle(left),
+						to: NodeHandle(right),
+					},
+					DirectedEdge {
+						from: NodeHandle(right),
+						to: NodeHandle(left),
 					},
 				]
 			})

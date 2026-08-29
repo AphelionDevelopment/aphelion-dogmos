@@ -37,10 +37,13 @@ fn operation_ids_are_complete_and_stable() {
 		OperationKind::ContinuationCancel,
 		OperationKind::ServiceTelemetry,
 		OperationKind::TurfHeatSnapshot,
+		OperationKind::FrontierBegin,
+		OperationKind::FrontierAppend,
+		OperationKind::FrontierCommit,
 	];
 	let expected = [
 		1_u16, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-		29, 30, 31, 32, 33, 34, 35, 36, 37,
+		29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
 	];
 	for (operation, expected) in operations.into_iter().zip(expected) {
 		assert_eq!(operation as u16, expected);
@@ -59,7 +62,7 @@ fn golden_header_bytes_are_architecture_independent() {
 		0x8877_6655_4433_2211,
 	);
 	let expected = [
-		0x44, 0x47, 0x4d, 0x53, 0x08, 0x00, 0x30, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
+		0x44, 0x47, 0x4d, 0x53, 0x09, 0x00, 0x30, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
 		0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x44, 0x33, 0x22, 0x11, 0x00, 0x00,
 		0x00, 0x00, 0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x11, 0x22, 0x33, 0x44, 0x55,
 		0x66, 0x77, 0x88,
@@ -95,6 +98,10 @@ fn golden_handshake_bytes_are_architecture_independent() {
 			max_batch_operations: 0x1112_1314,
 			max_callback_events: 0x0002_2324,
 			max_pending_continuations: 1024,
+			max_frontier_handles: 0x2122_2324,
+			max_stage_work_items: 4096,
+			max_reaction_transactions: 64,
+			reserved: 0,
 			max_world_bytes: 0x3132_3334_3536_3738,
 		},
 		process_id: 0x4142_4344,
@@ -112,14 +119,18 @@ fn golden_handshake_bytes_are_architecture_independent() {
 	assert_eq!(&bytes[124..128], &[0x14, 0x13, 0x12, 0x11]);
 	assert_eq!(&bytes[128..132], &[0x24, 0x23, 0x02, 0x00]);
 	assert_eq!(&bytes[132..136], &1024_u32.to_le_bytes());
-	assert_eq!(
-		&bytes[136..144],
-		&[0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31]
-	);
-	assert_eq!(&bytes[144..148], &[0x44, 0x43, 0x42, 0x41]);
-	assert_eq!(&bytes[148..152], &[0x54, 0x53, 0x52, 0x51]);
+	assert_eq!(&bytes[136..140], &[0x24, 0x23, 0x22, 0x21]);
+	assert_eq!(&bytes[140..144], &4096_u32.to_le_bytes());
+	assert_eq!(&bytes[144..148], &64_u32.to_le_bytes());
+	assert_eq!(&bytes[148..152], &[0; 4]);
 	assert_eq!(
 		&bytes[152..160],
+		&[0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31]
+	);
+	assert_eq!(&bytes[160..164], &[0x44, 0x43, 0x42, 0x41]);
+	assert_eq!(&bytes[164..168], &[0x54, 0x53, 0x52, 0x51]);
+	assert_eq!(
+		&bytes[168..176],
 		&[0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61]
 	);
 	assert_eq!(HandshakePayload::decode(&bytes).unwrap(), handshake);

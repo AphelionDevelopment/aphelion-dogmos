@@ -1,4 +1,5 @@
 use dogmos_core::{
+	frontier::FrontierError,
 	metadata::{
 		FireProductRule, GameplayHandle, GasFireRole, GasId, GasMetadata, GasProduct,
 		GasRequirement, NativeReactionKind, ReactionExecution, ReactionId, ReactionMetadata,
@@ -10,6 +11,7 @@ use dogmos_core::{
 		LifecycleMutation as CoreLifecycleMutation,
 		MixtureStateMutation as CoreMixtureStateMutation,
 		ReactionContinuationToken as CoreContinuationToken,
+		StageChunkRequest as CoreStageChunkRequest,
 		TurfAdjacencyMutation as CoreTurfAdjacencyMutation,
 		TurfFirelockMutation as CoreTurfFirelockMutation,
 		TurfHeatAdjacencyMutation as CoreTurfHeatAdjacencyMutation,
@@ -23,15 +25,16 @@ use dogmos_process_metrics::{
 	PROCESS_WORKING_SET_AVAILABLE,
 };
 use dogmos_protocol::{
-	AdjacencyMutation, CallbackBatchHeader, CallbackEvent, CallbackEventKind, ContinuationToken,
-	GasMetadataRegistration, LifecycleAction, LifecycleMutation, MixtureAdjustment,
-	MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot, MixtureStateMutation,
-	ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
-	TurfAdjacencyMutation, TurfDestructionReason, TurfHeatAdjacencyMutation, TurfHeatMutation,
-	TurfHeatSnapshot, TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole,
-	WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_KIND_COUNT,
-	CALLBACK_EVENT_LEN, CONTINUATION_TICK_MILLIS, DEFAULT_CONTINUATION_TIMEOUT_TICKS,
-	MAX_GAS_SLOTS, SERVICE_PROCESS_CPU_AVAILABLE, SERVICE_PROCESS_RSS_AVAILABLE,
+	AdjacencyMutation, CallbackBatchHeader, CallbackEvent, CallbackEventKind, CallbackScope,
+	ContinuationToken, GasMetadataRegistration, LifecycleAction, LifecycleMutation,
+	MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot,
+	MixtureStateMutation, ReactionMetadataRegistration, ScalarValue, ServiceTelemetry,
+	SimulationStage, TurfAdjacencyMutation, TurfDestructionReason, TurfHeatAdjacencyMutation,
+	TurfHeatMutation, TurfHeatSnapshot, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
+	WireGasFireRole, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
+	CALLBACK_EVENT_KIND_COUNT, CALLBACK_EVENT_LEN, CONTINUATION_TICK_MILLIS,
+	DEFAULT_CONTINUATION_TIMEOUT_TICKS, MAX_GAS_SLOTS, SERVICE_PROCESS_CPU_AVAILABLE,
+	SERVICE_PROCESS_RSS_AVAILABLE,
 };
 use std::{
 	collections::{BTreeMap, BTreeSet, VecDeque},
@@ -73,6 +76,12 @@ pub enum StateError {
 	CallbackBackpressure,
 	CallbackOutputTooSmall,
 	CallbackSequenceExhausted,
+	ReactionTransactionCapacityExceeded,
+	ReactionTransactionIdExhausted,
+	UnknownReactionTransaction(u64),
+	FrontierConflict,
+	FrontierIncomplete,
+	StageConflict,
 	ContinuationCapacityExceeded,
 	ContinuationIdExhausted,
 	ContinuationDeadlineExhausted,
@@ -98,6 +107,11 @@ impl Error for StateError {}
 pub struct StageResult {
 	pub work_items: u32,
 	pub callback_events: u32,
+	pub pending: bool,
+	pub remaining_estimate: u32,
+	pub produced_equalize_seeds: u32,
+	pub produced_group_seeds: u32,
+	pub produced_heat_seeds: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -112,9 +126,16 @@ struct PendingCallbackEvent {
 }
 
 impl PendingCallbackEvent {
-	fn with_sequence(self, sequence: u64) -> CallbackEvent {
+	fn scoped(
+		self,
+		scope: CallbackScope,
+		transaction_id: u64,
+		scope_sequence: u64,
+	) -> CallbackEvent {
 		CallbackEvent {
-			sequence,
+			scope_sequence,
+			transaction_id,
+			scope,
 			kind: self.kind,
 			flags: self.flags,
 			subject: self.subject,
@@ -132,6 +153,7 @@ struct PendingContinuation {
 	deadline_ticks: u64,
 	turf: Option<WireHandle>,
 	mixture: WireHandle,
+	transaction_id: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -140,10 +162,21 @@ struct QueuedCallback {
 	enqueued_ticks: u64,
 }
 
+struct ReactionCallbackQueue {
+	callbacks: VecDeque<QueuedCallback>,
+	next_sequence: u64,
+	complete: bool,
+}
+
 pub struct ServiceState {
 	world: DogmosWorld,
-	callback_events: VecDeque<QueuedCallback>,
+	general_callbacks: VecDeque<QueuedCallback>,
+	reaction_callbacks: BTreeMap<u64, ReactionCallbackQueue>,
+	pending_callback_count: u32,
 	max_callback_events: u32,
+	max_reaction_transactions: u32,
+	reaction_transaction_high_water: u32,
+	next_reaction_transaction_id: u64,
 	callback_high_water: u32,
 	callback_rejected: u64,
 	callback_enqueued: u64,
@@ -170,13 +203,20 @@ pub struct ServiceState {
 impl ServiceState {
 	#[cfg(test)]
 	pub fn new(max_world_bytes: u64, max_callback_events: u32) -> Self {
-		Self::new_for_world(max_world_bytes, max_callback_events, max_callback_events, 1)
+		Self::new_for_world(
+			max_world_bytes,
+			max_callback_events,
+			max_callback_events,
+			max_callback_events,
+			1,
+		)
 	}
 
 	pub fn new_for_world(
 		max_world_bytes: u64,
 		max_callback_events: u32,
 		max_pending_continuations: u32,
+		max_reaction_transactions: u32,
 		world_generation: u32,
 	) -> Self {
 		Self {
@@ -185,8 +225,13 @@ impl ServiceState {
 				max_callback_events,
 				max_pending_continuations,
 			),
-			callback_events: VecDeque::new(),
+			general_callbacks: VecDeque::new(),
+			reaction_callbacks: BTreeMap::new(),
+			pending_callback_count: 0,
 			max_callback_events,
+			max_reaction_transactions,
+			reaction_transaction_high_water: 0,
+			next_reaction_transaction_id: 1,
 			callback_high_water: 0,
 			callback_rejected: 0,
 			callback_enqueued: 0,
@@ -234,16 +279,39 @@ impl ServiceState {
 		} else {
 			0
 		};
+		let (stage_kind, stage_epoch, stage_cursor, stage_remaining) = self
+			.world
+			.stage_telemetry()
+			.map_or((0, 0, 0, 0), |(stage, epoch, cursor, remaining)| {
+				(
+					simulation_stage_from_world(stage) as u32,
+					epoch,
+					cursor,
+					remaining,
+				)
+			});
+		let general_callback_depth = self.general_callbacks.len() as u32;
+		let oldest_callback_ticks = self
+			.general_callbacks
+			.front()
+			.map(|callback| callback.enqueued_ticks)
+			.into_iter()
+			.chain(self.reaction_callbacks.values().filter_map(|queue| {
+				queue
+					.callbacks
+					.front()
+					.map(|callback| callback.enqueued_ticks)
+			}))
+			.min();
 		ServiceTelemetry {
-			callback_depth: self.callback_events.len().try_into().unwrap_or(u32::MAX),
+			callback_depth: self.pending_callback_count,
 			callback_capacity: self.max_callback_events,
 			callback_high_water: self.callback_high_water,
 			continuation_depth: self.pending_continuation_count(),
 			continuation_capacity: self.max_pending_continuations,
 			continuation_high_water: self.continuation_high_water,
-			oldest_callback_age_ticks: self.callback_events.front().map_or(0, |callback| {
-				now_ticks.saturating_sub(callback.enqueued_ticks)
-			}),
+			oldest_callback_age_ticks: oldest_callback_ticks
+				.map_or(0, |enqueued_ticks| now_ticks.saturating_sub(enqueued_ticks)),
 			callback_enqueued: self.callback_enqueued,
 			callback_drained: self.callback_drained,
 			callback_rejected: self.callback_rejected,
@@ -256,6 +324,21 @@ impl ServiceState {
 			service_process_available_flags,
 			service_rss_bytes,
 			service_cpu_total_milliseconds,
+			general_callback_depth,
+			reaction_callback_depth: self
+				.pending_callback_count
+				.saturating_sub(general_callback_depth),
+			reaction_transaction_depth: self.reaction_callbacks.len() as u32,
+			reaction_transaction_high_water: self.reaction_transaction_high_water,
+			frontier_count: self.world.committed_frontier().len() as u32,
+			stage_kind,
+			frontier_upload_bytes: self.world.frontier_upload_bytes(),
+			stage_epoch,
+			stage_cursor,
+			stage_remaining,
+			topology_revision: self.world.topology_revision(),
+			reusable_workset_bytes: self.world.reusable_workset_bytes(),
+			packed_topology_bytes: self.world.packed_topology_bytes(),
 		}
 	}
 
@@ -265,6 +348,32 @@ impl ServiceState {
 
 	pub fn record_request_timeout(&mut self) {
 		self.request_timeouts = self.request_timeouts.saturating_add(1);
+	}
+
+	pub fn begin_frontier(&mut self, epoch: u64, expected_count: u32) -> Result<(), StateError> {
+		self.world
+			.begin_frontier(epoch, expected_count)
+			.map_err(map_world_error)
+	}
+
+	pub fn append_frontier(
+		&mut self,
+		epoch: u64,
+		offset: u32,
+		handles: &[WireHandle],
+	) -> Result<u32, StateError> {
+		let handles = handles
+			.iter()
+			.copied()
+			.map(core_turf_handle)
+			.collect::<Vec<_>>();
+		self.world
+			.append_frontier(epoch, offset, &handles)
+			.map_err(map_world_error)
+	}
+
+	pub fn commit_frontier(&mut self, epoch: u64) -> Result<u32, StateError> {
+		self.world.commit_frontier(epoch).map_err(map_world_error)
 	}
 
 	pub fn enqueue_diagnostic_callbacks(&mut self, count: u32) -> Result<u32, StateError> {
@@ -296,10 +405,10 @@ impl ServiceState {
 			return self.enqueue_callback_batch_at(std::slice::from_ref(&callback), now_ticks);
 		}
 		callback
-			.with_sequence(self.next_callback_sequence)
+			.scoped(CallbackScope::General, 0, self.next_callback_sequence)
 			.encode()
 			.map_err(|error| StateError::State(error.to_string()))?;
-		let (new_depth, next_callback_sequence) = match self.prepare_callback_enqueue(count) {
+		let new_depth = match self.prepare_callback_enqueue(count) {
 			Ok(prepared) => prepared,
 			Err(StateError::CallbackBackpressure) => {
 				self.record_callback_rejected(CallbackEventKind::Diagnostic, count);
@@ -307,9 +416,20 @@ impl ServiceState {
 			}
 			Err(error) => return Err(error),
 		};
+		let next_callback_sequence = self
+			.next_callback_sequence
+			.checked_add(u64::from(count))
+			.ok_or(StateError::CallbackSequenceExhausted)?;
+		self.general_callbacks
+			.try_reserve_exact(count as usize)
+			.map_err(|_| StateError::AllocationFailed)?;
 		for index in 0..count {
-			self.callback_events.push_back(QueuedCallback {
-				event: callback.with_sequence(self.next_callback_sequence + u64::from(index)),
+			self.general_callbacks.push_back(QueuedCallback {
+				event: callback.scoped(
+					CallbackScope::General,
+					0,
+					self.next_callback_sequence + u64::from(index),
+				),
 				enqueued_ticks: now_ticks,
 			});
 		}
@@ -335,11 +455,11 @@ impl ServiceState {
 		let count = u32::try_from(callbacks.len()).map_err(|_| StateError::CallbackBackpressure)?;
 		for callback in callbacks {
 			callback
-				.with_sequence(self.next_callback_sequence)
+				.scoped(CallbackScope::General, 0, self.next_callback_sequence)
 				.encode()
 				.map_err(|error| StateError::State(error.to_string()))?;
 		}
-		let (new_depth, next_callback_sequence) = match self.prepare_callback_enqueue(count) {
+		let new_depth = match self.prepare_callback_enqueue(count) {
 			Ok(prepared) => prepared,
 			Err(StateError::CallbackBackpressure) => {
 				for callback in callbacks {
@@ -349,9 +469,20 @@ impl ServiceState {
 			}
 			Err(error) => return Err(error),
 		};
+		let next_callback_sequence = self
+			.next_callback_sequence
+			.checked_add(u64::from(count))
+			.ok_or(StateError::CallbackSequenceExhausted)?;
+		self.general_callbacks
+			.try_reserve_exact(count as usize)
+			.map_err(|_| StateError::AllocationFailed)?;
 		for (index, callback) in callbacks.iter().copied().enumerate() {
-			self.callback_events.push_back(QueuedCallback {
-				event: callback.with_sequence(self.next_callback_sequence + index as u64),
+			self.general_callbacks.push_back(QueuedCallback {
+				event: callback.scoped(
+					CallbackScope::General,
+					0,
+					self.next_callback_sequence + index as u64,
+				),
 				enqueued_ticks: now_ticks,
 			});
 			self.record_callback_enqueued(callback.kind, 1);
@@ -360,28 +491,18 @@ impl ServiceState {
 		Ok(count)
 	}
 
-	fn prepare_callback_enqueue(&mut self, count: u32) -> Result<(u32, u64), StateError> {
-		let depth = u32::try_from(self.callback_events.len())
-			.map_err(|_| StateError::CallbackBackpressure)?;
-		let Some(new_depth) = depth.checked_add(count) else {
+	fn prepare_callback_enqueue(&mut self, count: u32) -> Result<u32, StateError> {
+		let Some(new_depth) = self.pending_callback_count.checked_add(count) else {
 			return Err(StateError::CallbackBackpressure);
 		};
 		if new_depth > self.max_callback_events {
 			return Err(StateError::CallbackBackpressure);
 		}
-		let next_callback_sequence = self
-			.next_callback_sequence
-			.checked_add(u64::from(count))
-			.ok_or(StateError::CallbackSequenceExhausted)?;
-		if count > 0 {
-			self.callback_events
-				.try_reserve_exact(count as usize)
-				.map_err(|_| StateError::AllocationFailed)?;
-		}
-		Ok((new_depth, next_callback_sequence))
+		Ok(new_depth)
 	}
 
 	fn finish_callback_enqueue(&mut self, new_depth: u32, next_callback_sequence: u64) {
+		self.pending_callback_count = new_depth;
 		self.next_callback_sequence = next_callback_sequence;
 		self.callback_high_water = self.callback_high_water.max(new_depth);
 	}
@@ -404,17 +525,30 @@ impl ServiceState {
 		*counter = counter.saturating_add(u64::from(count));
 	}
 
+	#[cfg(test)]
 	pub fn drain_callbacks(
 		&mut self,
 		max_events: u32,
 		output: &mut [u8],
 	) -> Result<usize, StateError> {
+		self.drain_scoped_callbacks(CallbackScope::General, 0, max_events, output)
+	}
+
+	pub fn drain_scoped_callbacks(
+		&mut self,
+		scope: CallbackScope,
+		transaction_id: u64,
+		max_events: u32,
+		output: &mut [u8],
+	) -> Result<usize, StateError> {
 		let now_ticks = self.current_ticks();
-		self.drain_callbacks_at(max_events, output, now_ticks)
+		self.drain_callbacks_at(scope, transaction_id, max_events, output, now_ticks)
 	}
 
 	fn drain_callbacks_at(
 		&mut self,
+		scope: CallbackScope,
+		transaction_id: u64,
 		max_events: u32,
 		output: &mut [u8],
 		now_ticks: u64,
@@ -424,14 +558,24 @@ impl ServiceState {
 			return Err(StateError::CallbackOutputTooSmall);
 		}
 		let output_event_capacity = (output.len() - CALLBACK_BATCH_HEADER_LEN) / CALLBACK_EVENT_LEN;
-		let returned = self
-			.callback_events
+		let queue = match scope {
+			CallbackScope::General if transaction_id == 0 => &mut self.general_callbacks,
+			CallbackScope::Reaction if transaction_id != 0 => {
+				&mut self
+					.reaction_callbacks
+					.get_mut(&transaction_id)
+					.ok_or(StateError::UnknownReactionTransaction(transaction_id))?
+					.callbacks
+			}
+			_ => return Err(StateError::UnknownReactionTransaction(transaction_id)),
+		};
+		let returned = queue
 			.len()
 			.min(max_events as usize)
 			.min(output_event_capacity);
+		let mut drained_kinds = Vec::with_capacity(returned);
 		for index in 0..returned {
-			let callback = self
-				.callback_events
+			let callback = queue
 				.pop_front()
 				.expect("returned count was bounded by queue length");
 			let start = CALLBACK_BATCH_HEADER_LEN + index * CALLBACK_EVENT_LEN;
@@ -441,11 +585,24 @@ impl ServiceState {
 					.encode()
 					.map_err(|error| StateError::State(error.to_string()))?,
 			);
-			self.record_callback_drained(callback.event.kind);
+			drained_kinds.push(callback.event.kind);
+		}
+		let remaining = queue.len() as u32;
+		self.pending_callback_count -= returned as u32;
+		for kind in drained_kinds {
+			self.record_callback_drained(kind);
+		}
+		let remove_transaction = scope == CallbackScope::Reaction
+			&& self
+				.reaction_callbacks
+				.get(&transaction_id)
+				.is_some_and(|queue| queue.complete && queue.callbacks.is_empty());
+		if remove_transaction {
+			self.reaction_callbacks.remove(&transaction_id);
 		}
 		let header = CallbackBatchHeader {
 			returned: returned as u32,
-			remaining: self.callback_events.len() as u32,
+			remaining,
 			capacity: self.max_callback_events,
 			high_water: self.callback_high_water,
 			rejected: self.callback_rejected,
@@ -472,12 +629,27 @@ impl ServiceState {
 			self.pending_continuations.remove(&id);
 			self.continuation_timeouts = self.continuation_timeouts.saturating_add(1);
 		}
-		self.callback_events.retain(|callback| {
+		self.general_callbacks.retain(|callback| {
 			callback
 				.event
 				.continuation
 				.is_none_or(|token| self.pending_continuations.contains_key(&token.id))
 		});
+		for queue in self.reaction_callbacks.values_mut() {
+			queue.callbacks.retain(|callback| {
+				callback
+					.event
+					.continuation
+					.is_none_or(|token| self.pending_continuations.contains_key(&token.id))
+			});
+		}
+		self.pending_callback_count = self.general_callbacks.len() as u32
+			+ self
+				.reaction_callbacks
+				.values()
+				.map(|queue| queue.callbacks.len() as u32)
+				.sum::<u32>();
+		self.remove_orphaned_reaction_transactions();
 		Ok(())
 	}
 
@@ -765,6 +937,9 @@ impl ServiceState {
 			temperature: ScalarValue(f64::from(mixture.temperature)),
 			volume: ScalarValue(f64::from(mixture.volume)),
 			minimum_heat_capacity: ScalarValue(f64::from(mixture.minimum_heat_capacity)),
+			total_moles: ScalarValue(f64::from(mixture.total_moles)),
+			pressure: ScalarValue(f64::from(mixture.pressure)),
+			heat_capacity: ScalarValue(f64::from(mixture.heat_capacity)),
 			immutable: mixture.immutable,
 			gases,
 		})
@@ -821,13 +996,12 @@ impl ServiceState {
 			reaction_profile_threshold_ms,
 		} = request
 		{
-			let queue_depth = u32::try_from(self.callback_events.len())
-				.map_err(|_| StateError::CallbackBackpressure)?;
+			let transaction_id = self.begin_reaction_transaction()?;
 			let event_limit = self
 				.max_callback_events
-				.checked_sub(queue_depth)
+				.checked_sub(self.pending_callback_count)
 				.ok_or(StateError::CallbackBackpressure)?;
-			let progress = self
+			let progress = match self
 				.world
 				.react_mixture_with_event_limit(
 					core_handle(handle),
@@ -835,12 +1009,26 @@ impl ServiceState {
 					reaction_profile_threshold_ms.map(|threshold| threshold.0 as f32),
 					event_limit,
 				)
-				.map_err(map_world_error)?;
-			self.enqueue_world_events_at(event_limit, self.current_ticks())?;
+				.map_err(map_world_error)
+			{
+				Ok(progress) => progress,
+				Err(error) => {
+					self.reaction_callbacks.remove(&transaction_id);
+					return Err(error);
+				}
+			};
+			self.enqueue_world_events_at(
+				event_limit,
+				self.current_ticks(),
+				CallbackScope::Reaction,
+				transaction_id,
+			)?;
+			self.finish_reaction_transaction(transaction_id, !progress.pending)?;
 			return Ok(MixtureCommandResponse::ReactionProgress {
 				flags: progress.flags,
 				work_items: progress.work_items,
 				pending: progress.pending,
+				transaction_id,
 			});
 		}
 		let command = match request {
@@ -1083,6 +1271,7 @@ impl ServiceState {
 		}
 	}
 
+	#[cfg(test)]
 	pub fn process_stage_cancellable(
 		&mut self,
 		stage: SimulationStage,
@@ -1093,6 +1282,51 @@ impl ServiceState {
 		self.process_stage_cancellable_at(stage, seconds_per_tick, now_ticks, should_cancel)
 	}
 
+	pub fn process_stage_chunk_cancellable(
+		&mut self,
+		stage: SimulationStage,
+		frontier_epoch: u64,
+		stage_epoch: u64,
+		work_limit: u32,
+		seconds_per_tick: f64,
+		should_cancel: impl FnMut() -> bool,
+	) -> Result<StageResult, StateError> {
+		let now_ticks = self.current_ticks();
+		let stage = simulation_stage(stage);
+		let event_limit = self
+			.max_callback_events
+			.checked_sub(self.pending_callback_count)
+			.ok_or(StateError::CallbackBackpressure)?;
+		self.world_events
+			.try_reserve_exact(event_limit as usize)
+			.map_err(|_| StateError::AllocationFailed)?;
+		let result = self
+			.world
+			.process_stage_chunk_cancellable(
+				CoreStageChunkRequest {
+					stage,
+					frontier_epoch,
+					stage_epoch,
+					work_limit,
+					seconds_per_tick,
+				},
+				should_cancel,
+			)
+			.map_err(map_world_error)?;
+		let callback_events =
+			self.enqueue_world_events_at(event_limit, now_ticks, CallbackScope::General, 0)?;
+		Ok(StageResult {
+			work_items: result.work_items,
+			callback_events,
+			pending: result.pending,
+			remaining_estimate: result.remaining_estimate,
+			produced_equalize_seeds: result.produced_equalize_seeds,
+			produced_group_seeds: result.produced_group_seeds,
+			produced_heat_seeds: result.produced_heat_seeds,
+		})
+	}
+
+	#[cfg(test)]
 	fn process_stage_cancellable_at(
 		&mut self,
 		stage: SimulationStage,
@@ -1107,17 +1341,15 @@ impl ServiceState {
 			SimulationStage::ProcessTurfHeat => WorldStage::TurfHeat,
 			SimulationStage::ProcessReactions => WorldStage::React,
 		};
-		let queue_depth = u32::try_from(self.callback_events.len())
-			.map_err(|_| StateError::CallbackBackpressure)?;
 		let remaining_capacity = self
 			.max_callback_events
-			.checked_sub(queue_depth)
+			.checked_sub(self.pending_callback_count)
 			.ok_or(StateError::CallbackBackpressure)?;
 		let event_limit = remaining_capacity;
 		self.next_callback_sequence
 			.checked_add(u64::from(event_limit))
 			.ok_or(StateError::CallbackSequenceExhausted)?;
-		self.callback_events
+		self.general_callbacks
 			.try_reserve_exact(event_limit as usize)
 			.map_err(|_| StateError::AllocationFailed)?;
 		self.world_events
@@ -1138,10 +1370,16 @@ impl ServiceState {
 				should_cancel,
 			)
 			.map_err(map_world_error)?;
-		let event_count = self.enqueue_world_events_at(event_limit, now_ticks)?;
+		let event_count =
+			self.enqueue_world_events_at(event_limit, now_ticks, CallbackScope::General, 0)?;
 		Ok(StageResult {
 			work_items: result.work_items,
 			callback_events: event_count,
+			pending: false,
+			remaining_estimate: 0,
+			produced_equalize_seeds: 0,
+			produced_group_seeds: 0,
+			produced_heat_seeds: 0,
 		})
 	}
 
@@ -1199,11 +1437,9 @@ impl ServiceState {
 		now_ticks: u64,
 	) -> Result<MixtureCommandResponse, StateError> {
 		let continuation = self.require_continuation_at(token, now_ticks)?;
-		let queue_depth = u32::try_from(self.callback_events.len())
-			.map_err(|_| StateError::CallbackBackpressure)?;
 		let remaining_callbacks = self
 			.max_callback_events
-			.checked_sub(queue_depth)
+			.checked_sub(self.pending_callback_count)
 			.ok_or(StateError::CallbackBackpressure)?;
 		let event_limit = remaining_callbacks;
 		let updated = self
@@ -1212,7 +1448,15 @@ impl ServiceState {
 			.map_err(map_world_error)?;
 		self.pending_continuations.remove(&token.id);
 		self.remove_queued_continuation(token.id);
-		self.enqueue_world_events_at(event_limit, now_ticks)?;
+		self.enqueue_world_events_at(
+			event_limit,
+			now_ticks,
+			callback_scope(continuation.transaction_id),
+			continuation.transaction_id,
+		)?;
+		if continuation.transaction_id != 0 {
+			self.finish_reaction_transaction(continuation.transaction_id, true)?;
+		}
 		Ok(MixtureCommandResponse::Applied { updated })
 	}
 
@@ -1223,11 +1467,9 @@ impl ServiceState {
 		now_ticks: u64,
 	) -> Result<MixtureCommandResponse, StateError> {
 		let continuation = self.require_continuation_at(token, now_ticks)?;
-		let queue_depth = u32::try_from(self.callback_events.len())
-			.map_err(|_| StateError::CallbackBackpressure)?;
 		let event_limit = self
 			.max_callback_events
-			.checked_sub(queue_depth)
+			.checked_sub(self.pending_callback_count)
 			.ok_or(StateError::CallbackBackpressure)?;
 		let progress = self
 			.world
@@ -1239,11 +1481,20 @@ impl ServiceState {
 			.map_err(map_world_error)?;
 		self.pending_continuations.remove(&token.id);
 		self.remove_queued_continuation(token.id);
-		self.enqueue_world_events_at(event_limit, now_ticks)?;
+		self.enqueue_world_events_at(
+			event_limit,
+			now_ticks,
+			callback_scope(continuation.transaction_id),
+			continuation.transaction_id,
+		)?;
+		if continuation.transaction_id != 0 {
+			self.finish_reaction_transaction(continuation.transaction_id, !progress.pending)?;
+		}
 		Ok(MixtureCommandResponse::ReactionProgress {
 			flags: progress.flags,
 			work_items: progress.work_items,
 			pending: progress.pending,
+			transaction_id: continuation.transaction_id,
 		})
 	}
 
@@ -1267,6 +1518,9 @@ impl ServiceState {
 			.map_err(map_world_error)?;
 		self.pending_continuations.remove(&token.id);
 		self.remove_queued_continuation(token.id);
+		if continuation.transaction_id != 0 {
+			self.remove_reaction_transaction(continuation.transaction_id);
+		}
 		Ok(())
 	}
 
@@ -1295,6 +1549,9 @@ impl ServiceState {
 		if now_ticks >= continuation.deadline_ticks {
 			self.pending_continuations.remove(&token.id);
 			self.remove_queued_continuation(token.id);
+			if continuation.transaction_id != 0 {
+				self.remove_reaction_transaction(continuation.transaction_id);
+			}
 			self.world
 				.cancel_reaction(continuation.core_token)
 				.map_err(map_world_error)?;
@@ -1304,11 +1561,58 @@ impl ServiceState {
 		Ok(continuation)
 	}
 
-	fn enqueue_world_events_at(&mut self, maximum: u32, now_ticks: u64) -> Result<u32, StateError> {
+	fn begin_reaction_transaction(&mut self) -> Result<u64, StateError> {
+		if self.reaction_callbacks.len() as u32 >= self.max_reaction_transactions {
+			return Err(StateError::ReactionTransactionCapacityExceeded);
+		}
+		let transaction_id = self.next_reaction_transaction_id;
+		if transaction_id == 0 {
+			return Err(StateError::ReactionTransactionIdExhausted);
+		}
+		self.next_reaction_transaction_id = transaction_id
+			.checked_add(1)
+			.ok_or(StateError::ReactionTransactionIdExhausted)?;
+		self.reaction_callbacks.insert(
+			transaction_id,
+			ReactionCallbackQueue {
+				callbacks: VecDeque::new(),
+				next_sequence: 1,
+				complete: false,
+			},
+		);
+		self.reaction_transaction_high_water = self
+			.reaction_transaction_high_water
+			.max(self.reaction_callbacks.len() as u32);
+		Ok(transaction_id)
+	}
+
+	fn finish_reaction_transaction(
+		&mut self,
+		transaction_id: u64,
+		complete: bool,
+	) -> Result<(), StateError> {
+		let queue = self
+			.reaction_callbacks
+			.get_mut(&transaction_id)
+			.ok_or(StateError::UnknownReactionTransaction(transaction_id))?;
+		queue.complete |= complete;
+		if queue.complete && queue.callbacks.is_empty() {
+			self.reaction_callbacks.remove(&transaction_id);
+		}
+		Ok(())
+	}
+
+	fn enqueue_world_events_at(
+		&mut self,
+		maximum: u32,
+		now_ticks: u64,
+		scope: CallbackScope,
+		transaction_id: u64,
+	) -> Result<u32, StateError> {
 		let event_count = self
 			.world
 			.drain_events_into(maximum, &mut self.world_events);
-		let (new_depth, next_callback_sequence) = match self.prepare_callback_enqueue(event_count) {
+		let new_depth = match self.prepare_callback_enqueue(event_count) {
 			Ok(prepared) => prepared,
 			Err(StateError::CallbackBackpressure) => {
 				for index in 0..self.world_events.len() {
@@ -1319,6 +1623,19 @@ impl ServiceState {
 			}
 			Err(error) => return Err(error),
 		};
+		let first_sequence = match scope {
+			CallbackScope::General if transaction_id == 0 => self.next_callback_sequence,
+			CallbackScope::Reaction if transaction_id != 0 => {
+				self.reaction_callbacks
+					.get(&transaction_id)
+					.ok_or(StateError::UnknownReactionTransaction(transaction_id))?
+					.next_sequence
+			}
+			_ => return Err(StateError::UnknownReactionTransaction(transaction_id)),
+		};
+		let next_sequence = first_sequence
+			.checked_add(u64::from(event_count))
+			.ok_or(StateError::CallbackSequenceExhausted)?;
 		self.pending_callback_scratch.clear();
 		self.pending_continuation_scratch.clear();
 		let continuation_count = self
@@ -1371,6 +1688,7 @@ impl ServiceState {
 							deadline_ticks,
 							turf: turf.map(wire_handle_from_turf),
 							mixture: wire_handle(mixture),
+							transaction_id,
 						},
 					));
 					Some(token)
@@ -1379,7 +1697,7 @@ impl ServiceState {
 			};
 			let callback = pending_callback_from_world_event(event, continuation);
 			callback
-				.with_sequence(self.next_callback_sequence + index as u64)
+				.scoped(scope, transaction_id, first_sequence + index as u64)
 				.encode()
 				.map_err(|error| StateError::State(error.to_string()))?;
 			self.pending_callback_scratch.push(callback);
@@ -1389,35 +1707,127 @@ impl ServiceState {
 			self.pending_continuations.insert(id, continuation);
 		}
 		self.continuation_high_water = self.continuation_high_water.max(new_continuation_count);
+		match scope {
+			CallbackScope::General => {
+				self.general_callbacks
+					.try_reserve_exact(event_count as usize)
+					.map_err(|_| StateError::AllocationFailed)?;
+				for (index, callback) in self.pending_callback_scratch.iter().copied().enumerate() {
+					self.general_callbacks.push_back(QueuedCallback {
+						event: callback.scoped(
+							scope,
+							transaction_id,
+							first_sequence + index as u64,
+						),
+						enqueued_ticks: now_ticks,
+					});
+				}
+				self.next_callback_sequence = next_sequence;
+			}
+			CallbackScope::Reaction => {
+				let queue = self
+					.reaction_callbacks
+					.get_mut(&transaction_id)
+					.ok_or(StateError::UnknownReactionTransaction(transaction_id))?;
+				queue
+					.callbacks
+					.try_reserve_exact(event_count as usize)
+					.map_err(|_| StateError::AllocationFailed)?;
+				for (index, callback) in self.pending_callback_scratch.iter().copied().enumerate() {
+					queue.callbacks.push_back(QueuedCallback {
+						event: callback.scoped(
+							scope,
+							transaction_id,
+							first_sequence + index as u64,
+						),
+						enqueued_ticks: now_ticks,
+					});
+				}
+				queue.next_sequence = next_sequence;
+			}
+		}
 		for index in 0..self.pending_callback_scratch.len() {
-			let callback = self.pending_callback_scratch[index];
-			self.callback_events.push_back(QueuedCallback {
-				event: callback.with_sequence(self.next_callback_sequence + index as u64),
-				enqueued_ticks: now_ticks,
-			});
-			self.record_callback_enqueued(callback.kind, 1);
+			self.record_callback_enqueued(self.pending_callback_scratch[index].kind, 1);
 		}
 		self.pending_callback_scratch.clear();
-		self.finish_callback_enqueue(new_depth, next_callback_sequence);
+		self.pending_callback_count = new_depth;
+		self.callback_high_water = self.callback_high_water.max(new_depth);
 		Ok(event_count)
 	}
 
 	fn remove_queued_continuation(&mut self, continuation_id: u64) {
-		self.callback_events.retain(|callback| {
+		self.general_callbacks.retain(|callback| {
 			callback
 				.event
 				.continuation
 				.is_none_or(|token| token.id != continuation_id)
 		});
+		for queue in self.reaction_callbacks.values_mut() {
+			queue.callbacks.retain(|callback| {
+				callback
+					.event
+					.continuation
+					.is_none_or(|token| token.id != continuation_id)
+			});
+		}
+		self.recount_pending_callbacks();
 	}
 
 	fn remove_orphaned_continuation_callbacks(&mut self) {
-		self.callback_events.retain(|callback| {
+		self.general_callbacks.retain(|callback| {
 			callback
 				.event
 				.continuation
 				.is_none_or(|token| self.pending_continuations.contains_key(&token.id))
 		});
+		for queue in self.reaction_callbacks.values_mut() {
+			queue.callbacks.retain(|callback| {
+				callback
+					.event
+					.continuation
+					.is_none_or(|token| self.pending_continuations.contains_key(&token.id))
+			});
+		}
+		self.recount_pending_callbacks();
+		self.remove_orphaned_reaction_transactions();
+	}
+
+	fn remove_reaction_transaction(&mut self, transaction_id: u64) {
+		if let Some(queue) = self.reaction_callbacks.remove(&transaction_id) {
+			self.pending_callback_count = self
+				.pending_callback_count
+				.saturating_sub(queue.callbacks.len() as u32);
+		}
+	}
+
+	fn remove_orphaned_reaction_transactions(&mut self) {
+		let active_transactions = self
+			.pending_continuations
+			.values()
+			.filter_map(|continuation| {
+				(continuation.transaction_id != 0).then_some(continuation.transaction_id)
+			})
+			.collect::<BTreeSet<_>>();
+		let orphaned = self
+			.reaction_callbacks
+			.iter()
+			.filter_map(|(transaction_id, queue)| {
+				(!queue.complete && !active_transactions.contains(transaction_id))
+					.then_some(*transaction_id)
+			})
+			.collect::<Vec<_>>();
+		for transaction_id in orphaned {
+			self.remove_reaction_transaction(transaction_id);
+		}
+	}
+
+	fn recount_pending_callbacks(&mut self) {
+		self.pending_callback_count = self.general_callbacks.len() as u32
+			+ self
+				.reaction_callbacks
+				.values()
+				.map(|queue| queue.callbacks.len() as u32)
+				.sum::<u32>();
 	}
 
 	fn current_ticks(&self) -> u64 {
@@ -1596,6 +2006,9 @@ fn pending_callback_from_world_event(
 
 fn map_world_error(error: WorldError) -> StateError {
 	match error {
+		WorldError::Frontier(FrontierError::Incomplete { .. }) => StateError::FrontierIncomplete,
+		WorldError::Frontier(FrontierError::AllocationFailed) => StateError::AllocationFailed,
+		WorldError::Frontier(_) => StateError::FrontierConflict,
 		WorldError::GasMetadata(_)
 		| WorldError::GasRegistryAlreadyInstalled
 		| WorldError::GasRegistryInstallationTooLate
@@ -1659,6 +2072,8 @@ fn map_world_error(error: WorldError) -> StateError {
 			StateError::State(WorldError::InvalidEqualizeHardTurfLimit.to_string())
 		}
 		WorldError::InvalidSecondsPerTick => StateError::InvalidSecondsPerTick,
+		WorldError::InvalidStageWorkLimit(_) => StateError::StageConflict,
+		WorldError::StageConflict => StateError::StageConflict,
 		WorldError::StageNotImplemented(stage) => StateError::StageNotImplemented(match stage {
 			WorldStage::ProcessTurfs => SimulationStage::ProcessTurfs,
 			WorldStage::Equalize => SimulationStage::ProcessTurfEqualize,
@@ -1677,6 +2092,34 @@ fn map_world_error(error: WorldError) -> StateError {
 			StateError::State("invalid reaction profiling threshold".into())
 		}
 		WorldError::Cancelled => StateError::Cancelled,
+	}
+}
+
+fn simulation_stage(stage: SimulationStage) -> WorldStage {
+	match stage {
+		SimulationStage::ProcessTurfs => WorldStage::ProcessTurfs,
+		SimulationStage::ProcessTurfEqualize => WorldStage::Equalize,
+		SimulationStage::ProcessExcitedGroups => WorldStage::ExcitedGroups,
+		SimulationStage::ProcessTurfHeat => WorldStage::TurfHeat,
+		SimulationStage::ProcessReactions => WorldStage::React,
+	}
+}
+
+fn simulation_stage_from_world(stage: WorldStage) -> SimulationStage {
+	match stage {
+		WorldStage::ProcessTurfs => SimulationStage::ProcessTurfs,
+		WorldStage::Equalize => SimulationStage::ProcessTurfEqualize,
+		WorldStage::ExcitedGroups => SimulationStage::ProcessExcitedGroups,
+		WorldStage::TurfHeat => SimulationStage::ProcessTurfHeat,
+		WorldStage::React => SimulationStage::ProcessReactions,
+	}
+}
+
+fn callback_scope(transaction_id: u64) -> CallbackScope {
+	if transaction_id == 0 {
+		CallbackScope::General
+	} else {
+		CallbackScope::Reaction
 	}
 }
 
@@ -1935,8 +2378,8 @@ mod tests {
 		let second_event =
 			CallbackEvent::decode(&first[CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN..])
 				.unwrap();
-		assert_eq!(first_event.sequence, 1);
-		assert_eq!(second_event.sequence, 2);
+		assert_eq!(first_event.scope_sequence, 1);
+		assert_eq!(second_event.scope_sequence, 2);
 
 		let mut second = [0_u8; CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN];
 		let second_len = state.drain_callbacks(3, &mut second).unwrap();
@@ -1948,7 +2391,7 @@ mod tests {
 		assert_eq!(
 			CallbackEvent::decode(&second[CALLBACK_BATCH_HEADER_LEN..])
 				.unwrap()
-				.sequence,
+				.scope_sequence,
 			3
 		);
 
@@ -1957,7 +2400,7 @@ mod tests {
 			state.enqueue_diagnostic_callbacks(1),
 			Err(StateError::CallbackSequenceExhausted)
 		);
-		assert!(state.callback_events.is_empty());
+		assert!(state.general_callbacks.is_empty());
 	}
 
 	#[test]
@@ -2009,15 +2452,15 @@ mod tests {
 		let second =
 			CallbackEvent::decode(&output[CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN..])
 				.unwrap();
-		assert_eq!(first.sequence, 1);
+		assert_eq!(first.scope_sequence, 1);
 		assert_eq!(first.kind, CallbackEventKind::PressureDifference);
-		assert_eq!(second.sequence, 2);
+		assert_eq!(second.scope_sequence, 2);
 		assert_eq!(second.kind, CallbackEventKind::DecompressionFloorRip);
 	}
 
 	#[test]
 	fn callback_telemetry_is_fixed_cost_and_tracks_age_and_kind() {
-		let mut state = ServiceState::new_for_world(1024 * 1024, 2, 1, 1);
+		let mut state = ServiceState::new_for_world(1024 * 1024, 2, 1, 1, 1);
 		state.enqueue_diagnostic_callbacks_at(2, 10).unwrap();
 		let process = CurrentProcessMetrics {
 			available_flags: PROCESS_WORKING_SET_AVAILABLE | PROCESS_CPU_AVAILABLE,
@@ -2056,7 +2499,9 @@ mod tests {
 		assert_eq!(telemetry.request_timeouts, 1);
 
 		let mut output = [0_u8; CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN];
-		state.drain_callbacks_at(1, &mut output, 18).unwrap();
+		state
+			.drain_callbacks_at(CallbackScope::General, 0, 1, &mut output, 18)
+			.unwrap();
 		let telemetry = state.telemetry_at_with_process_metrics(18, process);
 		assert_eq!(telemetry.callback_depth, 1);
 		assert_eq!(telemetry.callback_drained, 1);
@@ -2390,7 +2835,7 @@ mod tests {
 	fn direct_reaction_routes_mixture_and_arbitrary_holder_through_callback_and_resume() {
 		let mixture = handle(0, 1);
 		let holder = handle(41, 9);
-		let mut state = ServiceState::new_for_world(1024 * 1024, 8, 1, 7);
+		let mut state = ServiceState::new_for_world(1024 * 1024, 8, 1, 1, 7);
 		state
 			.install_gases(vec![GasMetadataRegistration {
 				id: 0,
@@ -2426,22 +2871,26 @@ mod tests {
 			}])
 			.unwrap();
 
-		assert_eq!(
-			state
-				.apply_mixture_command(MixtureCommandRequest::React {
-					handle: mixture,
-					target: holder,
-					reaction_profile_threshold_ms: None,
-				})
-				.unwrap(),
-			MixtureCommandResponse::ReactionProgress {
-				flags: 0,
-				work_items: 1,
-				pending: true,
-			}
-		);
+		let progress = state
+			.apply_mixture_command(MixtureCommandRequest::React {
+				handle: mixture,
+				target: holder,
+				reaction_profile_threshold_ms: None,
+			})
+			.unwrap();
+		let MixtureCommandResponse::ReactionProgress {
+			flags: 0,
+			work_items: 1,
+			pending: true,
+			transaction_id,
+		} = progress
+		else {
+			panic!("unexpected reaction progress: {progress:?}");
+		};
 		let mut output = vec![0_u8; CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN];
-		state.drain_callbacks_at(1, &mut output, 10).unwrap();
+		state
+			.drain_callbacks_at(CallbackScope::Reaction, transaction_id, 1, &mut output, 10)
+			.unwrap();
 		let event = CallbackEvent::decode(&output[CALLBACK_BATCH_HEADER_LEN..]).unwrap();
 		assert_eq!(event.kind, CallbackEventKind::RunDmReaction);
 		assert_eq!(event.subject, mixture);
@@ -2453,6 +2902,7 @@ mod tests {
 				flags: 1,
 				work_items: 0,
 				pending: false,
+				transaction_id,
 			})
 		);
 	}
@@ -2575,7 +3025,7 @@ mod tests {
 
 	#[test]
 	fn continuation_tokens_are_deadline_bound_and_single_use() {
-		let mut state = ServiceState::new_for_world(1024 * 1024, 8, 1, 7);
+		let mut state = ServiceState::new_for_world(1024 * 1024, 8, 1, 1, 7);
 		state
 			.install_gases(vec![GasMetadataRegistration {
 				id: 0,
@@ -2740,7 +3190,9 @@ mod tests {
 			.process_stage_cancellable_at(SimulationStage::ProcessReactions, 0.5, 65, || false)
 			.unwrap();
 		assert_eq!(state.pending_continuation_count(), 1);
-		let output_len = state.drain_callbacks_at(1, &mut output, 115).unwrap();
+		let output_len = state
+			.drain_callbacks_at(CallbackScope::General, 0, 1, &mut output, 115)
+			.unwrap();
 		assert_eq!(output_len, CALLBACK_BATCH_HEADER_LEN);
 		assert_eq!(
 			CallbackBatchHeader::decode(&output[..CALLBACK_BATCH_HEADER_LEN])
@@ -2759,7 +3211,7 @@ mod tests {
 		state
 			.process_stage_cancellable_at(SimulationStage::ProcessReactions, 0.5, 116, || false)
 			.unwrap();
-		let lifecycle_event = state.callback_events.front().unwrap().event;
+		let lifecycle_event = state.general_callbacks.front().unwrap().event;
 		let lifecycle_token = lifecycle_event.continuation.unwrap();
 		state
 			.apply_turf_lifecycle(&[WireTurfLifecycleMutation {
@@ -2769,7 +3221,7 @@ mod tests {
 			}])
 			.unwrap();
 		assert_eq!(state.pending_continuation_count(), 0);
-		assert!(state.callback_events.is_empty());
+		assert!(state.general_callbacks.is_empty());
 		assert_eq!(
 			state.resume_continuation_at(lifecycle_token, 117),
 			Err(StateError::UnknownContinuation(lifecycle_token))

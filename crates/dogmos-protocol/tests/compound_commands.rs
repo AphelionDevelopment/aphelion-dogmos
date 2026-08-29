@@ -1,11 +1,15 @@
 use dogmos_protocol::{
-	decode_adjacency_batch, decode_lifecycle_batch, decode_mixture_state_batch,
-	encode_mixture_state_batch, AdjacencyMutation, LifecycleAction, LifecycleMutation,
-	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolError,
-	ScalarValue, SimulationStage, SimulationStageRequest, SimulationStageResponse, WireHandle,
-	ADJACENCY_MUTATION_LEN, DOGMOS_PROTOCOL_VERSION, LIFECYCLE_MUTATION_LEN, MAX_GAS_SLOTS,
-	MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN,
-	SIMULATION_STAGE_RESPONSE_LEN,
+	decode_adjacency_batch, decode_frontier_append_into, decode_lifecycle_batch,
+	decode_mixture_state_batch, encode_mixture_state_batch, AdjacencyMutation,
+	FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
+	FrontierCommitRequest, FrontierCommitResponse, LifecycleAction, LifecycleMutation,
+	MixtureCommandResponse, MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation,
+	OperationKind, ProtocolError, ScalarValue, SimulationStage, SimulationStageRequest,
+	SimulationStageResponse, WireHandle, ADJACENCY_MUTATION_LEN, DOGMOS_PROTOCOL_VERSION,
+	FRONTIER_APPEND_HEADER_LEN, FRONTIER_APPEND_RESPONSE_LEN, FRONTIER_BEGIN_REQUEST_LEN,
+	FRONTIER_BEGIN_RESPONSE_LEN, FRONTIER_COMMIT_REQUEST_LEN, FRONTIER_COMMIT_RESPONSE_LEN,
+	LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
+	MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 
 fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -34,7 +38,7 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 #[test]
 fn compound_operation_ids_are_stable() {
-	assert_eq!(DOGMOS_PROTOCOL_VERSION, 8);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 9);
 	assert_eq!(OperationKind::MixtureSnapshot as u16, 18);
 	assert_eq!(OperationKind::MixtureLifecycleBatch as u16, 19);
 	assert_eq!(OperationKind::AdjacencyBatch as u16, 20);
@@ -45,6 +49,9 @@ fn compound_operation_ids_are_stable() {
 	assert_eq!(OperationKind::TurfHeatBatch as u16, 26);
 	assert_eq!(OperationKind::TurfHeatAdjacencyBatch as u16, 27);
 	assert_eq!(OperationKind::TurfHeatSnapshot as u16, 37);
+	assert_eq!(OperationKind::FrontierBegin as u16, 38);
+	assert_eq!(OperationKind::FrontierAppend as u16, 39);
+	assert_eq!(OperationKind::FrontierCommit as u16, 40);
 	assert_eq!(OperationKind::MixtureCommand as u16, 28);
 	assert_eq!(OperationKind::GasMetadataInstall as u16, 29);
 	assert_eq!(OperationKind::ReactionMetadataInstall as u16, 30);
@@ -56,6 +63,158 @@ fn compound_operation_ids_are_stable() {
 	assert_eq!(
 		OperationKind::try_from(21),
 		Ok(OperationKind::SimulationStage)
+	);
+}
+
+#[test]
+fn frontier_requests_have_exact_bounded_layouts() {
+	let begin = FrontierBeginRequest {
+		epoch: 0x0102_0304_0506_0708,
+		expected_count: 513,
+	};
+	let begin_bytes = begin.encode();
+	assert_eq!(begin_bytes.len(), FRONTIER_BEGIN_REQUEST_LEN);
+	assert_eq!(&begin_bytes[0..8], &begin.epoch.to_le_bytes());
+	assert_eq!(&begin_bytes[8..12], &513_u32.to_le_bytes());
+	assert_eq!(&begin_bytes[12..16], &[0; 4]);
+	assert_eq!(FrontierBeginRequest::decode(&begin_bytes), Ok(begin));
+
+	let handles = vec![handle(7, 11), handle(13, 17)];
+	let append = FrontierAppendRequest {
+		epoch: begin.epoch,
+		offset: 511,
+		handles: handles.clone(),
+	};
+	let append_bytes = append.encode().unwrap();
+	assert_eq!(append_bytes.len(), FRONTIER_APPEND_HEADER_LEN + 16);
+	assert_eq!(&append_bytes[0..8], &begin.epoch.to_le_bytes());
+	assert_eq!(&append_bytes[8..12], &511_u32.to_le_bytes());
+	assert_eq!(&append_bytes[12..16], &2_u32.to_le_bytes());
+	assert_eq!(&append_bytes[16..24], &handles[0].encode());
+	assert_eq!(&append_bytes[24..32], &handles[1].encode());
+	let mut decoded_handles = vec![handle(99, 99)];
+	let decoded_header = decode_frontier_append_into(&append_bytes, &mut decoded_handles).unwrap();
+	assert_eq!(decoded_header.epoch, append.epoch);
+	assert_eq!(decoded_header.offset, append.offset);
+	assert_eq!(decoded_header.count, 2);
+	assert_eq!(decoded_handles, handles);
+
+	let commit = FrontierCommitRequest { epoch: begin.epoch };
+	let commit_bytes = commit.encode();
+	assert_eq!(commit_bytes.len(), FRONTIER_COMMIT_REQUEST_LEN);
+	assert_eq!(FrontierCommitRequest::decode(&commit_bytes), Ok(commit));
+}
+
+#[test]
+fn frontier_responses_have_exact_layouts() {
+	let begin = FrontierBeginResponse { epoch: 41 };
+	let begin_bytes = begin.encode();
+	assert_eq!(begin_bytes.len(), FRONTIER_BEGIN_RESPONSE_LEN);
+	assert_eq!(FrontierBeginResponse::decode(&begin_bytes), Ok(begin));
+	let append = FrontierAppendResponse { accepted_count: 2 };
+	let append_bytes = append.encode();
+	assert_eq!(append_bytes.len(), FRONTIER_APPEND_RESPONSE_LEN);
+	assert_eq!(FrontierAppendResponse::decode(&append_bytes), Ok(append));
+
+	let commit = FrontierCommitResponse {
+		epoch: 41,
+		count: 513,
+	};
+	let commit_bytes = commit.encode();
+	assert_eq!(commit_bytes.len(), FRONTIER_COMMIT_RESPONSE_LEN);
+	assert_eq!(&commit_bytes[0..8], &41_u64.to_le_bytes());
+	assert_eq!(&commit_bytes[8..12], &513_u32.to_le_bytes());
+	assert_eq!(&commit_bytes[12..16], &[0; 4]);
+	assert_eq!(FrontierCommitResponse::decode(&commit_bytes), Ok(commit));
+}
+
+#[test]
+fn frontier_append_rejects_zero_oversized_duplicate_and_inexact_records() {
+	let zero = FrontierAppendRequest {
+		epoch: 1,
+		offset: 0,
+		handles: Vec::new(),
+	};
+	assert_eq!(
+		zero.encode(),
+		Err(ProtocolError::InvalidFrontierAppendCount(0))
+	);
+
+	let oversized = FrontierAppendRequest {
+		epoch: 1,
+		offset: 0,
+		handles: vec![handle(1, 1); MAX_FRONTIER_APPEND_HANDLES + 1],
+	};
+	assert_eq!(
+		oversized.encode(),
+		Err(ProtocolError::InvalidFrontierAppendCount(
+			(MAX_FRONTIER_APPEND_HANDLES + 1) as u32
+		))
+	);
+
+	let duplicate = FrontierAppendRequest {
+		epoch: 1,
+		offset: 0,
+		handles: vec![handle(1, 2), handle(1, 2)],
+	};
+	assert_eq!(
+		duplicate.encode(),
+		Err(ProtocolError::DuplicateFrontierHandle(handle(1, 2)))
+	);
+
+	let valid = FrontierAppendRequest {
+		epoch: 1,
+		offset: 0,
+		handles: vec![handle(1, 2)],
+	}
+	.encode()
+	.unwrap();
+	assert!(matches!(
+		decode_frontier_append_into(&valid[..valid.len() - 1], &mut Vec::new()),
+		Err(ProtocolError::InvalidPayloadLength { .. })
+	));
+	let mut trailing = valid;
+	trailing.push(0);
+	assert!(matches!(
+		decode_frontier_append_into(&trailing, &mut Vec::new()),
+		Err(ProtocolError::InvalidPayloadLength { .. })
+	));
+}
+
+#[test]
+fn frontier_and_stage_reserved_fields_are_rejected() {
+	let mut begin = FrontierBeginRequest {
+		epoch: 1,
+		expected_count: 1,
+	}
+	.encode();
+	begin[12..16].copy_from_slice(&7_u32.to_le_bytes());
+	assert_eq!(
+		FrontierBeginRequest::decode(&begin),
+		Err(ProtocolError::ReservedFrontierField(7))
+	);
+
+	let request = SimulationStageRequest {
+		stage: SimulationStage::ProcessTurfs,
+		frontier_epoch: 1,
+		stage_epoch: 2,
+		work_limit: 256,
+		seconds_per_tick: ScalarValue(0.5),
+	};
+	let mut request_bytes = request.encode().unwrap();
+	request_bytes[28..32].copy_from_slice(&3_u32.to_le_bytes());
+	assert_eq!(
+		SimulationStageRequest::decode(&request_bytes),
+		Err(ProtocolError::ReservedSimulationStageField(3))
+	);
+
+	let invalid_limit = SimulationStageRequest {
+		work_limit: 0,
+		..request
+	};
+	assert_eq!(
+		invalid_limit.encode(),
+		Err(ProtocolError::InvalidStageWorkLimit(0))
 	);
 }
 
@@ -87,7 +246,7 @@ fn mixture_state_batch_round_trips_exact_fixed_records() {
 }
 
 #[test]
-fn mixture_state_batch_matches_complete_protocol_v8_golden_bytes() {
+fn mixture_state_batch_matches_complete_protocol_v9_golden_bytes() {
 	const GOLDEN_HEX: &str = concat!(
 		"01000000070000000b0000000400000000000000000000000000104000000000",
 		"00002040000000000000f03f0000000000000000000000000000000000000000",
@@ -173,6 +332,9 @@ fn mixture_snapshot_has_a_fixed_cross_bitness_layout() {
 		temperature: ScalarValue(293.15),
 		volume: ScalarValue(2500.0),
 		minimum_heat_capacity: ScalarValue(80.0),
+		total_moles: ScalarValue(13.75),
+		pressure: ScalarValue(1.5),
+		heat_capacity: ScalarValue(275.0),
 		immutable: true,
 		gases,
 	};
@@ -182,6 +344,9 @@ fn mixture_snapshot_has_a_fixed_cross_bitness_layout() {
 	assert_eq!(&bytes[4..8], &2_u32.to_le_bytes());
 	assert_eq!(&bytes[24..32], &80.0_f64.to_le_bytes());
 	assert_eq!(&bytes[32..36], &1_u32.to_le_bytes());
+	assert_eq!(&bytes[40..48], &13.75_f64.to_le_bytes());
+	assert_eq!(&bytes[48..56], &1.5_f64.to_le_bytes());
+	assert_eq!(&bytes[56..64], &275.0_f64.to_le_bytes());
 	assert_eq!(MixtureSnapshot::decode(&bytes), Ok(snapshot));
 }
 
@@ -274,11 +439,20 @@ fn adjacency_batch_round_trips_and_rejects_non_finite_conductivity() {
 fn simulation_stage_request_is_fixed_width_and_validated() {
 	let request = SimulationStageRequest {
 		stage: SimulationStage::ProcessTurfHeat,
+		frontier_epoch: 0x0102_0304_0506_0708,
+		stage_epoch: 0x1112_1314_1516_1718,
+		work_limit: 256,
 		seconds_per_tick: ScalarValue(0.5),
 	};
 	let bytes = request.encode().unwrap();
 	assert_eq!(bytes.len(), SIMULATION_STAGE_REQUEST_LEN);
 	assert_eq!(SimulationStageRequest::decode(&bytes), Ok(request));
+	assert_eq!(&bytes[4..8], &[0; 4]);
+	assert_eq!(&bytes[8..16], &request.frontier_epoch.to_le_bytes());
+	assert_eq!(&bytes[16..24], &request.stage_epoch.to_le_bytes());
+	assert_eq!(&bytes[24..28], &256_u32.to_le_bytes());
+	assert_eq!(&bytes[28..32], &[0; 4]);
+	assert_eq!(&bytes[32..40], &0.5_f64.to_le_bytes());
 	let mut unknown = bytes;
 	unknown[0..4].copy_from_slice(&99_u32.to_le_bytes());
 	assert_eq!(
@@ -291,6 +465,9 @@ fn simulation_stage_request_is_fixed_width_and_validated() {
 fn reaction_stage_has_a_stable_wire_discriminant() {
 	let request = SimulationStageRequest {
 		stage: SimulationStage::ProcessReactions,
+		frontier_epoch: 1,
+		stage_epoch: 2,
+		work_limit: 1,
 		seconds_per_tick: ScalarValue(0.5),
 	};
 	let bytes = request.encode().unwrap();
@@ -303,12 +480,44 @@ fn simulation_stage_response_is_fixed_width() {
 	let response = SimulationStageResponse {
 		work_items: 64,
 		callback_events: 3,
+		pending: true,
+		remaining_estimate: 129,
+		produced_equalize_seeds: 7,
+		produced_group_seeds: 5,
+		produced_heat_seeds: 2,
 	};
 	let bytes = response.encode();
 	assert_eq!(bytes.len(), SIMULATION_STAGE_RESPONSE_LEN);
 	assert_eq!(SimulationStageResponse::decode(&bytes), Ok(response));
 	assert!(matches!(
-		SimulationStageResponse::decode(&bytes[..7]),
+		SimulationStageResponse::decode(&bytes[..31]),
 		Err(ProtocolError::InvalidPayloadLength { .. })
 	));
+}
+
+#[test]
+fn reaction_progress_uses_the_final_eight_bytes_for_its_transaction() {
+	let response = MixtureCommandResponse::ReactionProgress {
+		flags: 1,
+		work_items: 17,
+		pending: true,
+		transaction_id: 0x0102_0304_0506_0708,
+	};
+	let bytes = response.encode().unwrap();
+	assert_eq!(&bytes[8..12], &17_u32.to_le_bytes());
+	assert_eq!(&bytes[12..16], &1_u32.to_le_bytes());
+	assert_eq!(&bytes[16..24], &0x0102_0304_0506_0708_u64.to_le_bytes());
+	assert_eq!(MixtureCommandResponse::decode(&bytes), Ok(response));
+
+	let opaque_bits = MixtureCommandResponse::ReactionProgress {
+		flags: 1,
+		work_items: 17,
+		pending: true,
+		transaction_id: f64::NAN.to_bits(),
+	};
+	let opaque_bytes = opaque_bits.encode().unwrap();
+	assert_eq!(
+		MixtureCommandResponse::decode(&opaque_bytes),
+		Ok(opaque_bits)
+	);
 }

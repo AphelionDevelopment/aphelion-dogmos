@@ -285,6 +285,7 @@ fn mixture_command_responses_have_one_fixed_layout() {
 			flags: 5,
 			work_items: 2,
 			pending: true,
+			transaction_id: 17,
 		},
 	];
 	for (index, response) in responses.into_iter().enumerate() {

@@ -5,13 +5,14 @@ use dogmos_protocol::{
 	encode_adjacency_batch, encode_lifecycle_batch, encode_mixture_state_batch,
 	encode_turf_heat_batch, encode_turf_lifecycle_batch, read_frame_into, write_frame,
 	AdjacencyMutation, BuildIdentity, CallbackBatchHeader, CallbackBatchRequest, CallbackEvent,
-	CapacityLimits, HandshakePayload, LifecycleAction, LifecycleMutation, MixtureSnapshot,
-	MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolHeader, ScalarValue,
-	ServiceErrorCode, ServiceTelemetry, SimulationStage, SimulationStageRequest, TurfHeatMutation,
-	TurfHeatSnapshot, TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireHandle,
+	CallbackScope, CapacityLimits, FrontierBeginRequest, FrontierCommitRequest, HandshakePayload,
+	LifecycleAction, LifecycleMutation, MixtureSnapshot, MixtureSnapshotRequest,
+	MixtureStateMutation, OperationKind, ProtocolHeader, ScalarValue, ServiceErrorCode,
+	ServiceTelemetry, SimulationStage, SimulationStageRequest, TurfHeatMutation, TurfHeatSnapshot,
+	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireHandle,
 	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
 	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
-	SERVICE_TELEMETRY_LEN, TURF_HEAT_SNAPSHOT_LEN,
+	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_HEAT_SNAPSHOT_LEN,
 };
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, Stream};
 use std::{
@@ -44,6 +45,10 @@ fn handshake(service_path: &std::path::Path) -> HandshakePayload {
 			max_batch_operations: 4096,
 			max_callback_events: 1024,
 			max_pending_continuations: 1024,
+			max_frontier_handles: 4096,
+			max_stage_work_items: 4096,
+			max_reaction_transactions: 1024,
+			reserved: 0,
 			max_world_bytes: 8 * 1024 * 1024 * 1024,
 		},
 		process_id: std::process::id(),
@@ -234,7 +239,13 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 			.unwrap(),
 		260
 	);
-	let enqueue_request = CallbackBatchRequest { max_events: 1024 }.encode();
+	let enqueue_request = CallbackBatchRequest {
+		max_events: 1024,
+		scope: CallbackScope::General,
+		transaction_id: 0,
+	}
+	.encode()
+	.unwrap();
 	let mut accepted = [0_u8; 4];
 	assert_eq!(
 		client
@@ -250,12 +261,24 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 	assert!(matches!(
 		client.round_trip_into(
 			OperationKind::DiagnosticCallbackEnqueue,
-			&CallbackBatchRequest { max_events: 1 }.encode(),
+			&CallbackBatchRequest {
+				max_events: 1,
+				scope: CallbackScope::General,
+				transaction_id: 0,
+			}
+			.encode()
+			.unwrap(),
 			&mut accepted,
 		),
 		Err(ClientError::Server(ServiceErrorCode::CallbackBackpressure))
 	));
-	let callback_request = CallbackBatchRequest { max_events: 64 }.encode();
+	let callback_request = CallbackBatchRequest {
+		max_events: 64,
+		scope: CallbackScope::General,
+		transaction_id: 0,
+	}
+	.encode()
+	.unwrap();
 	let mut callbacks = [0_u8; CALLBACK_BATCH_HEADER_LEN + 64 * CALLBACK_EVENT_LEN];
 	assert_eq!(
 		client
@@ -279,7 +302,7 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 			&callbacks[CALLBACK_BATCH_HEADER_LEN..CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN]
 		)
 		.unwrap()
-		.sequence,
+		.scope_sequence,
 		1
 	);
 	assert_eq!(
@@ -474,13 +497,34 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 		Err(ClientError::Server(ServiceErrorCode::InvalidGraph))
 	));
 
+	client
+		.round_trip_into(
+			OperationKind::FrontierBegin,
+			&FrontierBeginRequest {
+				epoch: 1,
+				expected_count: 0,
+			}
+			.encode(),
+			&mut [0_u8; 8],
+		)
+		.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::FrontierCommit,
+			&FrontierCommitRequest { epoch: 1 }.encode(),
+			&mut [0_u8; 16],
+		)
+		.unwrap();
 	let stage = SimulationStageRequest {
 		stage: SimulationStage::ProcessTurfs,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 4096,
 		seconds_per_tick: ScalarValue(0.5),
 	}
 	.encode()
 	.unwrap();
-	let mut stage_result = [0_u8; 8];
+	let mut stage_result = [0_u8; SIMULATION_STAGE_RESPONSE_LEN];
 	assert!(matches!(
 		client.round_trip_into_with_deadline(
 			OperationKind::SimulationStage,
@@ -505,7 +549,7 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 		client
 			.round_trip_into(OperationKind::SimulationStage, &stage, &mut stage_result,)
 			.unwrap(),
-		8
+		SIMULATION_STAGE_RESPONSE_LEN
 	);
 
 	let malformed_lifecycle = [2_u8, 0, 0, 0];
@@ -519,7 +563,7 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 	));
 	assert_eq!(client.echo(b"still connected").unwrap(), b"still connected");
 	let mut telemetry_bytes = [0_u8; SERVICE_TELEMETRY_LEN];
-	assert_eq!(telemetry_bytes.len(), 272);
+	assert_eq!(telemetry_bytes.len(), SERVICE_TELEMETRY_LEN);
 	assert_eq!(
 		client
 			.round_trip_into(OperationKind::ServiceTelemetry, &[], &mut telemetry_bytes)

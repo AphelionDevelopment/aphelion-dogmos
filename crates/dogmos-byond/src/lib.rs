@@ -18,8 +18,10 @@ use dogmos_protocol::{
 	encode_continuation_adjust_multiple_request, encode_gas_metadata_batch, encode_lifecycle_batch,
 	encode_mixture_state_batch, encode_reaction_metadata_batch, encode_turf_adjacency_batch,
 	encode_turf_heat_adjacency_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
-	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, ContinuationCommandRequest,
-	ContinuationResumeRequest, ContinuationToken, GasMetadataRegistration, LifecycleAction,
+	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CallbackScope,
+	ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
+	FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
+	FrontierCommitRequest, FrontierCommitResponse, GasMetadataRegistration, LifecycleAction,
 	LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse,
 	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind,
 	ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
@@ -28,11 +30,12 @@ use dogmos_protocol::{
 	TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
 	WireGasRequirement, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
 	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, GAS_METADATA_RECORD_LEN,
-	MAX_GAS_SLOTS, MIXTURE_ADJUSTMENT_LEN, MIXTURE_ADJUST_MULTIPLE_HEADER_LEN,
-	MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN,
-	MIXTURE_STATE_MUTATION_LEN, REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN,
-	SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN,
-	TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
+	MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_ADJUSTMENT_LEN,
+	MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN,
+	MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, REACTION_METADATA_RECORD_LEN,
+	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN,
+	TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN,
+	TURF_LIFECYCLE_MUTATION_LEN,
 };
 use std::{fs, path::Path, sync::Mutex, time::Duration};
 
@@ -82,7 +85,7 @@ const PRODUCTION_MAX_REACTION_METADATA: usize =
 	(BENCHMARK_CONTROL_PAYLOAD - 4) / REACTION_METADATA_RECORD_LEN;
 const PRODUCTION_CONTINUATION_TOKEN_FIELDS: usize = 10;
 const PRODUCTION_CALLBACK_HEADER_FIELDS: usize = 12;
-const PRODUCTION_CALLBACK_EVENT_FIELDS: usize = 31;
+const PRODUCTION_CALLBACK_EVENT_FIELDS: usize = 36;
 const PRODUCTION_MAX_CALLBACK_EVENTS: u32 = 256;
 const PROCESS_METRICS_LAYOUT_VERSION: u32 = 1;
 const PROCESS_METRICS_FIELDS: usize = 28;
@@ -294,7 +297,7 @@ fn dogmos_process_metrics() -> eyre::Result<ByondValue> {
 #[doc(hidden)]
 pub fn decode_production_service_telemetry(response: &[u8]) -> eyre::Result<Vec<f32>> {
 	let telemetry = ServiceTelemetry::decode(response)?;
-	let mut fields = Vec::with_capacity(134);
+	let mut fields = Vec::with_capacity(182);
 	for value in [
 		telemetry.callback_depth,
 		telemetry.callback_capacity,
@@ -328,6 +331,23 @@ pub fn decode_production_service_telemetry(response: &[u8]) -> eyre::Result<Vec<
 	append_u32_words(&mut fields, telemetry.service_process_available_flags);
 	append_u64_words(&mut fields, telemetry.service_rss_bytes);
 	append_u64_words(&mut fields, telemetry.service_cpu_total_milliseconds);
+	for value in [
+		telemetry.general_callback_depth,
+		telemetry.reaction_callback_depth,
+		telemetry.reaction_transaction_depth,
+		telemetry.reaction_transaction_high_water,
+		telemetry.frontier_count,
+		telemetry.stage_kind,
+	] {
+		append_u32_words(&mut fields, value);
+	}
+	append_u64_words(&mut fields, telemetry.frontier_upload_bytes);
+	append_u64_words(&mut fields, telemetry.stage_epoch);
+	append_u32_words(&mut fields, telemetry.stage_cursor);
+	append_u32_words(&mut fields, telemetry.stage_remaining);
+	append_u64_words(&mut fields, telemetry.topology_revision);
+	append_u64_words(&mut fields, telemetry.reusable_workset_bytes);
+	append_u64_words(&mut fields, telemetry.packed_topology_bytes);
 	Ok(fields)
 }
 
@@ -394,17 +414,38 @@ fn validate_current_process_metrics(metrics: CurrentProcessMetrics) -> eyre::Res
 }
 
 #[auxmacros::bind("/proc/dogmos_callback_drain")]
-fn dogmos_callback_drain(max_events: ByondValue) -> eyre::Result<ByondValue> {
-	let max_events = exact_u32(max_events.get_number()?, "callback drain maximum events")?;
+fn dogmos_callback_drain(fields: ByondValue) -> eyre::Result<ByondValue> {
+	let fields = bounded_number_list(fields, "callback drain", 7)?;
+	if fields.len() != 7 {
+		return Err(eyre::eyre!(
+			"callback drain requires scope, four transaction words, and two maximum-event words"
+		));
+	}
+	let scope = CallbackScope::try_from(exact_u16(fields[0], "callback scope")?)?;
+	let transaction_id = join_u64_words([
+		exact_u16(fields[1], "callback transaction word 0")?,
+		exact_u16(fields[2], "callback transaction word 1")?,
+		exact_u16(fields[3], "callback transaction word 2")?,
+		exact_u16(fields[4], "callback transaction word 3")?,
+	]);
+	let max_events = join_u32_words(
+		exact_u16(fields[5], "callback maximum word 0")?,
+		exact_u16(fields[6], "callback maximum word 1")?,
+	);
 	if max_events > PRODUCTION_MAX_CALLBACK_EVENTS {
 		return Err(eyre::eyre!(
 			"callback drain requested {max_events} events, maximum {PRODUCTION_MAX_CALLBACK_EVENTS}"
 		));
 	}
-	let request = CallbackBatchRequest { max_events }.encode();
+	let request = CallbackBatchRequest {
+		max_events,
+		scope,
+		transaction_id,
+	}
+	.encode()?;
 	let response_capacity = CALLBACK_BATCH_HEADER_LEN + max_events as usize * CALLBACK_EVENT_LEN;
 	let response = production_request(OperationKind::CallbackBatch, &request, response_capacity)?;
-	let fields = decode_production_callback_batch(&response, max_events)?;
+	let fields = decode_production_callback_batch(&response, max_events, scope, transaction_id)?;
 	let mut output = ByondValue::new_list()?;
 	for field in fields {
 		output.push_list(field.into())?;
@@ -416,6 +457,8 @@ fn dogmos_callback_drain(max_events: ByondValue) -> eyre::Result<ByondValue> {
 pub fn decode_production_callback_batch(
 	response: &[u8],
 	requested_max: u32,
+	requested_scope: CallbackScope,
+	requested_transaction_id: u64,
 ) -> eyre::Result<Vec<f32>> {
 	if response.len() < CALLBACK_BATCH_HEADER_LEN {
 		return Err(eyre::eyre!(
@@ -457,19 +500,26 @@ pub fn decode_production_callback_batch(
 		.0
 	{
 		let event = CallbackEvent::decode(event_bytes)?;
+		if event.scope != requested_scope || event.transaction_id != requested_transaction_id {
+			return Err(eyre::eyre!(
+				"Dogmos callback response returned the wrong scope or transaction"
+			));
+		}
 		if let Some(sequence) = last_sequence {
 			let expected = sequence.checked_add(1).ok_or_else(|| {
 				eyre::eyre!("Dogmos callback sequence overflowed after {sequence}")
 			})?;
-			if event.sequence != expected {
+			if event.scope_sequence != expected {
 				return Err(eyre::eyre!(
 					"Dogmos callback sequence is not contiguous at {}",
-					event.sequence
+					event.scope_sequence
 				));
 			}
 		}
-		last_sequence = Some(event.sequence);
-		append_u64_words(&mut fields, event.sequence);
+		last_sequence = Some(event.scope_sequence);
+		append_u64_words(&mut fields, event.scope_sequence);
+		append_u64_words(&mut fields, event.transaction_id);
+		fields.push(event.scope as u16 as f32);
 		fields.push(event.kind as u16 as f32);
 		fields.push(f32::from(event.flags));
 		append_u32_words(&mut fields, event.subject.slot);
@@ -782,7 +832,7 @@ fn dogmos_mixture_snapshot(fields: ByondValue) -> eyre::Result<ByondValue> {
 pub fn decode_production_mixture_snapshot(response: &[u8]) -> eyre::Result<Vec<f32>> {
 	let snapshot = MixtureSnapshot::decode(response)?;
 	let revision_words = split_u32_words(snapshot.revision);
-	let mut fields = Vec::with_capacity(7 + MAX_GAS_SLOTS);
+	let mut fields = Vec::with_capacity(10 + MAX_GAS_SLOTS);
 	fields.extend([
 		f32::from(revision_words[0]),
 		f32::from(revision_words[1]),
@@ -793,6 +843,9 @@ pub fn decode_production_mixture_snapshot(response: &[u8]) -> eyre::Result<Vec<f
 			snapshot.minimum_heat_capacity.0,
 			"mixture snapshot minimum heat capacity",
 		)?,
+		finite_byond_scalar(snapshot.total_moles.0, "mixture snapshot total moles")?,
+		finite_byond_scalar(snapshot.pressure.0, "mixture snapshot pressure")?,
+		finite_byond_scalar(snapshot.heat_capacity.0, "mixture snapshot heat capacity")?,
 		f32::from(snapshot.immutable),
 	]);
 	for (index, gas) in snapshot.gases.into_iter().enumerate() {
@@ -1488,12 +1541,129 @@ pub fn encode_production_turf_heat_adjacency_batch(values: &[f32]) -> eyre::Resu
 	Ok(output)
 }
 
+#[auxmacros::bind("/proc/dogmos_frontier_begin")]
+fn dogmos_frontier_begin(fields: ByondValue) -> eyre::Result<ByondValue> {
+	let fields = bounded_number_list(fields, "frontier begin", 6)?;
+	let request = encode_production_frontier_begin(&fields)?;
+	let response = production_request(OperationKind::FrontierBegin, &request, 8)?;
+	let epoch = FrontierBeginResponse::decode(&response)?.epoch;
+	let mut output = ByondValue::new_list()?;
+	for word in split_u64_words(epoch) {
+		output.push_list(f32::from(word).into())?;
+	}
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn encode_production_frontier_begin(fields: &[f32]) -> eyre::Result<[u8; 16]> {
+	if fields.len() != 6 {
+		return Err(eyre::eyre!(
+			"frontier begin requires four epoch words and two count words"
+		));
+	}
+	Ok(FrontierBeginRequest {
+		epoch: join_u64_words(exact_words4(&fields[..4], "frontier epoch")?),
+		expected_count: join_u32_words(
+			exact_u16(fields[4], "frontier count word 0")?,
+			exact_u16(fields[5], "frontier count word 1")?,
+		),
+	}
+	.encode())
+}
+
+#[auxmacros::bind("/proc/dogmos_frontier_append")]
+fn dogmos_frontier_append(records: ByondValue) -> eyre::Result<ByondValue> {
+	let records = bounded_number_list(
+		records,
+		"frontier append",
+		6 + MAX_FRONTIER_APPEND_HANDLES * 4,
+	)?;
+	let request = encode_production_frontier_append(&records)?;
+	let response = production_request(OperationKind::FrontierAppend, &request, 4)?;
+	let accepted = FrontierAppendResponse::decode(&response)?.accepted_count;
+	let mut output = ByondValue::new_list()?;
+	for word in split_u32_words(accepted) {
+		output.push_list(f32::from(word).into())?;
+	}
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn encode_production_frontier_append(fields: &[f32]) -> eyre::Result<Vec<u8>> {
+	if fields.len() < 10 || !(fields.len() - 6).is_multiple_of(4) {
+		return Err(eyre::eyre!(
+			"frontier append requires epoch, offset, and at least one fixed four-word handle"
+		));
+	}
+	let handle_count = (fields.len() - 6) / 4;
+	if handle_count > MAX_FRONTIER_APPEND_HANDLES {
+		return Err(eyre::eyre!(
+			"frontier append contains {handle_count} handles, maximum {MAX_FRONTIER_APPEND_HANDLES}"
+		));
+	}
+	let handles = fields[6..]
+		.as_chunks::<4>()
+		.0
+		.iter()
+		.enumerate()
+		.map(|(index, words)| {
+			Ok(WireHandle {
+				slot: join_u32_words(
+					exact_u16(words[0], &format!("frontier handle {index} slot word 0"))?,
+					exact_u16(words[1], &format!("frontier handle {index} slot word 1"))?,
+				),
+				generation: join_u32_words(
+					exact_u16(
+						words[2],
+						&format!("frontier handle {index} generation word 0"),
+					)?,
+					exact_u16(
+						words[3],
+						&format!("frontier handle {index} generation word 1"),
+					)?,
+				),
+			})
+		})
+		.collect::<eyre::Result<Vec<_>>>()?;
+	Ok(FrontierAppendRequest {
+		epoch: join_u64_words(exact_words4(&fields[..4], "frontier epoch")?),
+		offset: join_u32_words(
+			exact_u16(fields[4], "frontier offset word 0")?,
+			exact_u16(fields[5], "frontier offset word 1")?,
+		),
+		handles,
+	}
+	.encode()?)
+}
+
+#[auxmacros::bind("/proc/dogmos_frontier_commit")]
+fn dogmos_frontier_commit(fields: ByondValue) -> eyre::Result<ByondValue> {
+	let fields = bounded_number_list(fields, "frontier commit", 4)?;
+	if fields.len() != 4 {
+		return Err(eyre::eyre!("frontier commit requires four epoch words"));
+	}
+	let request = FrontierCommitRequest {
+		epoch: join_u64_words(exact_words4(&fields, "frontier epoch")?),
+	}
+	.encode();
+	let response = production_request(OperationKind::FrontierCommit, &request, 16)?;
+	let response = FrontierCommitResponse::decode(&response)?;
+	let mut output_fields = Vec::with_capacity(6);
+	append_u64_words(&mut output_fields, response.epoch);
+	append_u32_words(&mut output_fields, response.count);
+	let mut output = ByondValue::new_list()?;
+	for field in output_fields {
+		output.push_list(field.into())?;
+	}
+	Ok(output)
+}
+
 #[auxmacros::bind("/proc/dogmos_simulation_stage")]
 fn dogmos_simulation_stage(fields: ByondValue) -> eyre::Result<ByondValue> {
-	let fields = bounded_number_list(fields, "simulation stage", 2)?;
-	if fields.len() != 2 {
+	let fields = bounded_number_list(fields, "simulation stage", 12)?;
+	if fields.len() != 12 {
 		return Err(eyre::eyre!(
-			"simulation stage requires exactly stage and seconds-per-tick"
+			"simulation stage requires stage, frontier epoch, stage epoch, work limit, and seconds-per-tick"
 		));
 	}
 	let request = encode_production_simulation_stage(fields.try_into().unwrap())?;
@@ -1512,26 +1682,35 @@ fn dogmos_simulation_stage(fields: ByondValue) -> eyre::Result<ByondValue> {
 
 #[doc(hidden)]
 pub fn encode_production_simulation_stage(
-	fields: [f32; 2],
+	fields: [f32; 12],
 ) -> eyre::Result<[u8; dogmos_protocol::SIMULATION_STAGE_REQUEST_LEN]> {
 	Ok(SimulationStageRequest {
 		stage: SimulationStage::try_from(exact_u32(fields[0], "simulation stage")?)?,
-		seconds_per_tick: ScalarValue(f64::from(fields[1])),
+		frontier_epoch: join_u64_words(exact_words4(&fields[1..5], "frontier epoch")?),
+		stage_epoch: join_u64_words(exact_words4(&fields[5..9], "stage epoch")?),
+		work_limit: join_u32_words(
+			exact_u16(fields[9], "stage work-limit word 0")?,
+			exact_u16(fields[10], "stage work-limit word 1")?,
+		),
+		seconds_per_tick: ScalarValue(f64::from(fields[11])),
 	}
 	.encode()?)
 }
 
 #[doc(hidden)]
-pub fn decode_production_simulation_stage(response: &[u8]) -> eyre::Result<[f32; 4]> {
+pub fn decode_production_simulation_stage(response: &[u8]) -> eyre::Result<[f32; 13]> {
 	let response = SimulationStageResponse::decode(response)?;
-	let work_items = split_u32_words(response.work_items);
-	let callback_events = split_u32_words(response.callback_events);
-	Ok([
-		f32::from(work_items[0]),
-		f32::from(work_items[1]),
-		f32::from(callback_events[0]),
-		f32::from(callback_events[1]),
-	])
+	let mut fields = Vec::with_capacity(13);
+	append_u32_words(&mut fields, response.work_items);
+	append_u32_words(&mut fields, response.callback_events);
+	fields.push(f32::from(response.pending));
+	append_u32_words(&mut fields, response.remaining_estimate);
+	append_u32_words(&mut fields, response.produced_equalize_seeds);
+	append_u32_words(&mut fields, response.produced_group_seeds);
+	append_u32_words(&mut fields, response.produced_heat_seeds);
+	Ok(fields
+		.try_into()
+		.expect("stage response has thirteen fields"))
 }
 
 fn production_counted_request(
@@ -1648,6 +1827,9 @@ fn dogmos_ipc_benchmark_adjacency_batch() -> eyre::Result<ByondValue> {
 fn dogmos_ipc_benchmark_simulation_stage() -> eyre::Result<ByondValue> {
 	let request = SimulationStageRequest {
 		stage: SimulationStage::ProcessTurfs,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 1,
 		seconds_per_tick: ScalarValue(0.5),
 	}
 	.encode()?;
@@ -1676,8 +1858,10 @@ fn dogmos_ipc_benchmark_simulation_stage() -> eyre::Result<ByondValue> {
 fn dogmos_ipc_benchmark_callback_enqueue(count: ByondValue) -> eyre::Result<ByondValue> {
 	let request = CallbackBatchRequest {
 		max_events: callback_count_from_number(count.get_number()?)?,
+		scope: CallbackScope::General,
+		transaction_id: 0,
 	}
-	.encode();
+	.encode()?;
 	let mut session = BENCHMARK_SESSION
 		.lock()
 		.map_err(|_| eyre::eyre!("Dogmos IPC benchmark session lock is poisoned"))?;
@@ -1702,8 +1886,10 @@ fn dogmos_ipc_benchmark_callback_enqueue(count: ByondValue) -> eyre::Result<Byon
 fn dogmos_ipc_benchmark_callback_drain(max_events: ByondValue) -> eyre::Result<ByondValue> {
 	let request = CallbackBatchRequest {
 		max_events: callback_count_from_number(max_events.get_number()?)?,
+		scope: CallbackScope::General,
+		transaction_id: 0,
 	}
-	.encode();
+	.encode()?;
 	let mut session = BENCHMARK_SESSION
 		.lock()
 		.map_err(|_| eyre::eyre!("Dogmos IPC benchmark session lock is poisoned"))?;
@@ -1996,12 +2182,16 @@ fn append_u32_words(output: &mut Vec<f32>, value: u32) {
 }
 
 fn append_u64_words(output: &mut Vec<f32>, value: u64) {
-	output.extend([
-		f32::from(value as u16),
-		f32::from((value >> 16) as u16),
-		f32::from((value >> 32) as u16),
-		f32::from((value >> 48) as u16),
-	]);
+	output.extend(split_u64_words(value).map(f32::from));
+}
+
+fn split_u64_words(value: u64) -> [u16; 4] {
+	[
+		value as u16,
+		(value >> 16) as u16,
+		(value >> 32) as u16,
+		(value >> 48) as u16,
+	]
 }
 
 fn join_u64_words(words: [u16; 4]) -> u64 {
@@ -2009,6 +2199,18 @@ fn join_u64_words(words: [u16; 4]) -> u64 {
 		| (u64::from(words[1]) << 16)
 		| (u64::from(words[2]) << 32)
 		| (u64::from(words[3]) << 48)
+}
+
+fn exact_words4(words: &[f32], field: &str) -> eyre::Result<[u16; 4]> {
+	if words.len() != 4 {
+		return Err(eyre::eyre!("{field} requires four 16-bit words"));
+	}
+	Ok([
+		exact_u16(words[0], &format!("{field} word 0"))?,
+		exact_u16(words[1], &format!("{field} word 1"))?,
+		exact_u16(words[2], &format!("{field} word 2"))?,
+		exact_u16(words[3], &format!("{field} word 3"))?,
+	])
 }
 
 fn append_continuation_token_fields(output: &mut Vec<f32>, token: Option<ContinuationToken>) {
@@ -2144,24 +2346,36 @@ fn encode_dm_mixture_command(
 }
 
 fn mixture_command_response_value(response: MixtureCommandResponse) -> eyre::Result<ByondValue> {
-	let (kind, first, second, third) = match response {
-		MixtureCommandResponse::Applied { updated } => (1.0, updated as f32, 0.0, 0.0),
-		MixtureCommandResponse::Scalar(value) => (2.0, value.0 as f32, 0.0, 0.0),
+	let (kind, first, second, third, transaction_id) = match response {
+		MixtureCommandResponse::Applied { updated } => (1.0, updated as f32, 0.0, 0.0, None),
+		MixtureCommandResponse::Scalar(value) => (2.0, value.0 as f32, 0.0, 0.0, None),
 		MixtureCommandResponse::Scalars(values) => {
-			(3.0, values[0].0 as f32, values[1].0 as f32, 0.0)
+			(3.0, values[0].0 as f32, values[1].0 as f32, 0.0, None)
 		}
-		MixtureCommandResponse::Boolean(value) => (4.0, f32::from(value), 0.0, 0.0),
+		MixtureCommandResponse::Boolean(value) => (4.0, f32::from(value), 0.0, 0.0, None),
 		MixtureCommandResponse::ReactionProgress {
 			flags,
 			work_items,
 			pending,
-		} => (5.0, flags as f32, work_items as f32, f32::from(pending)),
+			transaction_id,
+		} => (
+			5.0,
+			flags as f32,
+			work_items as f32,
+			f32::from(pending),
+			Some(transaction_id),
+		),
 	};
 	let mut output = ByondValue::new_list()?;
 	output.push_list(kind.into())?;
 	output.push_list(first.into())?;
 	output.push_list(second.into())?;
 	output.push_list(third.into())?;
+	if let Some(transaction_id) = transaction_id {
+		for word in split_u64_words(transaction_id) {
+			output.push_list(f32::from(word).into())?;
+		}
+	}
 	Ok(output)
 }
 
@@ -2195,6 +2409,7 @@ mod tests {
 		decode_production_turf_heat_snapshot, diagnostic_bytes_from_number,
 		encode_dm_mixture_command, encode_production_continuation_adjust_multiple,
 		encode_production_continuation_command, encode_production_continuation_resume,
+		encode_production_frontier_append, encode_production_frontier_begin,
 		encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
 		encode_production_mixture_lifecycle_batch, encode_production_mixture_state_batch,
 		encode_production_process_metrics, encode_production_reaction_metadata,
@@ -2211,15 +2426,15 @@ mod tests {
 		decode_gas_metadata_batch, decode_lifecycle_batch, decode_mixture_state_batch,
 		decode_reaction_metadata_batch, decode_turf_adjacency_batch,
 		decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
-		CallbackBatchHeader, CallbackEvent, CallbackEventKind, ContinuationCommandRequest,
-		ContinuationResumeRequest, ContinuationToken, GasMetadataRegistration, LifecycleAction,
-		LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureSnapshot,
-		ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
-		SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
-		TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatState,
-		TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
-		WireGasRequirement, WireHandle, WireReactionExecution, MAX_GAS_SLOTS,
-		SERVICE_PROCESS_ALL_AVAILABLE,
+		CallbackBatchHeader, CallbackEvent, CallbackEventKind, CallbackScope,
+		ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
+		FrontierBeginRequest, GasMetadataRegistration, LifecycleAction, LifecycleMutation,
+		MixtureAdjustment, MixtureCommandRequest, MixtureSnapshot, ReactionMetadataRegistration,
+		ScalarValue, ServiceTelemetry, SimulationStage, SimulationStageRequest,
+		SimulationStageResponse, TurfAdjacencyMutation, TurfHeatAdjacencyMutation,
+		TurfHeatMutation, TurfHeatSnapshot, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
+		WireGasFireRole, WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution,
+		MAX_GAS_SLOTS, SERVICE_PROCESS_ALL_AVAILABLE,
 	};
 
 	fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -2365,17 +2580,23 @@ mod tests {
 			temperature: ScalarValue(293.15),
 			volume: ScalarValue(2_500.0),
 			minimum_heat_capacity: ScalarValue(0.5),
+			total_moles: ScalarValue(10.75),
+			pressure: ScalarValue(10.5),
+			heat_capacity: ScalarValue(215.0),
 			immutable: true,
 			gases,
 		}
 		.encode()
 		.unwrap();
 		let fields = decode_production_mixture_snapshot(&response).unwrap();
-		assert_eq!(fields.len(), 7 + MAX_GAS_SLOTS);
+		assert_eq!(fields.len(), 10 + MAX_GAS_SLOTS);
 		assert_eq!(&fields[..3], &[0xba98 as f32, 0xfedc as f32, 2.0]);
-		assert_eq!(&fields[3..7], &[293.15, 2_500.0, 0.5, 1.0]);
-		assert_eq!(fields[7], 1.25);
-		assert_eq!(fields[7 + 31], 9.5);
+		assert_eq!(
+			&fields[3..10],
+			&[293.15, 2_500.0, 0.5, 10.75, 10.5, 215.0, 1.0]
+		);
+		assert_eq!(fields[10], 1.25);
+		assert_eq!(fields[10 + 31], 9.5);
 	}
 
 	#[test]
@@ -2500,25 +2721,114 @@ mod tests {
 
 	#[test]
 	fn production_stage_request_and_response_are_typed_and_lossless() {
-		let request = encode_production_simulation_stage([4.0, 0.5]).unwrap();
+		let request = encode_production_simulation_stage([
+			4.0,
+			0x4444 as f32,
+			0x3333 as f32,
+			0x2222 as f32,
+			0x1111 as f32,
+			0x8888 as f32,
+			0x7777 as f32,
+			0x6666 as f32,
+			0x5555 as f32,
+			0x0100 as f32,
+			0.0,
+			0.5,
+		])
+		.unwrap();
 		assert_eq!(
 			SimulationStageRequest::decode(&request).unwrap(),
 			SimulationStageRequest {
 				stage: SimulationStage::ProcessTurfs,
+				frontier_epoch: 0x1111_2222_3333_4444,
+				stage_epoch: 0x5555_6666_7777_8888,
+				work_limit: 256,
 				seconds_per_tick: ScalarValue(0.5),
 			}
 		);
 		let response = SimulationStageResponse {
 			work_items: 0xfedc_ba98,
 			callback_events: 0x7654_3210,
+			pending: true,
+			remaining_estimate: 0x1111_2222,
+			produced_equalize_seeds: 0x3333_4444,
+			produced_group_seeds: 0x5555_6666,
+			produced_heat_seeds: 0x7777_8888,
 		}
 		.encode();
 		assert_eq!(
 			decode_production_simulation_stage(&response).unwrap(),
-			[0xba98 as f32, 0xfedc as f32, 0x3210 as f32, 0x7654 as f32]
+			[
+				0xba98 as f32,
+				0xfedc as f32,
+				0x3210 as f32,
+				0x7654 as f32,
+				1.0,
+				0x2222 as f32,
+				0x1111 as f32,
+				0x4444 as f32,
+				0x3333 as f32,
+				0x6666 as f32,
+				0x5555 as f32,
+				0x8888 as f32,
+				0x7777 as f32,
+			]
 		);
-		assert!(encode_production_simulation_stage([6.0, 0.5]).is_err());
-		assert!(encode_production_simulation_stage([4.0, f32::NAN]).is_err());
+		let mut invalid = [0.0; 12];
+		invalid[0] = 6.0;
+		invalid[9] = 1.0;
+		invalid[11] = 0.5;
+		assert!(encode_production_simulation_stage(invalid).is_err());
+		invalid[0] = 4.0;
+		invalid[11] = f32::NAN;
+		assert!(encode_production_simulation_stage(invalid).is_err());
+	}
+
+	#[test]
+	fn production_frontier_requests_preserve_all_integer_bits_and_bounds() {
+		let begin = encode_production_frontier_begin(&[
+			0x4444 as f32,
+			0x3333 as f32,
+			0x2222 as f32,
+			0x1111 as f32,
+			0xba98 as f32,
+			0xfedc as f32,
+		])
+		.unwrap();
+		assert_eq!(
+			FrontierBeginRequest::decode(&begin).unwrap(),
+			FrontierBeginRequest {
+				epoch: 0x1111_2222_3333_4444,
+				expected_count: 0xfedc_ba98,
+			}
+		);
+
+		let append = encode_production_frontier_append(&[
+			0x4444 as f32,
+			0x3333 as f32,
+			0x2222 as f32,
+			0x1111 as f32,
+			0x3210 as f32,
+			0x7654 as f32,
+			0xcdef as f32,
+			0x89ab as f32,
+			0x4567 as f32,
+			0x0123 as f32,
+		])
+		.unwrap();
+		let mut handles = Vec::new();
+		let header = dogmos_protocol::decode_frontier_append_into(&append, &mut handles).unwrap();
+		assert_eq!(header.epoch, 0x1111_2222_3333_4444);
+		assert_eq!(header.offset, 0x7654_3210);
+		assert_eq!(
+			handles,
+			vec![WireHandle {
+				slot: 0x89ab_cdef,
+				generation: 0x0123_4567,
+			}]
+		);
+		assert!(encode_production_frontier_append(&[0.0; 6]).is_err());
+		assert!(encode_production_frontier_append(&vec![0.0; 6 + 513 * 4]).is_err());
 	}
 
 	#[test]
@@ -2653,24 +2963,39 @@ mod tests {
 			continuation_timeouts: 11,
 			request_timeouts: 12,
 			protocol_errors: 13,
-			callback_enqueued_by_kind: [14, 15, 16, 17, 18, 19, 20],
-			callback_drained_by_kind: [21, 22, 23, 24, 25, 26, 27],
-			callback_rejected_by_kind: [28, 29, 30, 31, 32, 33, u64::MAX],
+			callback_enqueued_by_kind: [14, 15, 16, 17, 18, 19, 20, 21],
+			callback_drained_by_kind: [22, 23, 24, 25, 26, 27, 28, 29],
+			callback_rejected_by_kind: [30, 31, 32, 33, 34, 35, 36, u64::MAX],
 			service_process_available_flags: SERVICE_PROCESS_ALL_AVAILABLE,
 			service_rss_bytes: 0x1111_2222_3333_4444,
 			service_cpu_total_milliseconds: 0x5555_6666_7777_8888,
+			general_callback_depth: 38,
+			reaction_callback_depth: 39,
+			reaction_transaction_depth: 40,
+			reaction_transaction_high_water: 41,
+			frontier_count: 42,
+			stage_kind: 5,
+			frontier_upload_bytes: 43,
+			stage_epoch: 44,
+			stage_cursor: 45,
+			stage_remaining: 46,
+			topology_revision: 47,
+			reusable_workset_bytes: 48,
+			packed_topology_bytes: 49,
 		};
 		let fields = decode_production_service_telemetry(&telemetry.encode()).unwrap();
-		assert_eq!(fields.len(), 134);
+		assert_eq!(fields.len(), 182);
 		assert_eq!(&fields[..2], &[0xba98 as f32, 0xfedc as f32]);
 		assert_eq!(
 			&fields[12..16],
 			&[0xcdef as f32, 0x89ab as f32, 0x4567 as f32, 0x0123 as f32]
 		);
-		assert_eq!(&fields[120..124], &[65_535.0; 4]);
-		assert_eq!(&fields[124..126], &[3.0, 0.0]);
-		assert_eq!(&fields[126..130], &[17_476.0, 13_107.0, 8_738.0, 4_369.0]);
-		assert_eq!(&fields[130..134], &[34_952.0, 30_583.0, 26_214.0, 21_845.0]);
+		assert_eq!(&fields[132..136], &[65_535.0; 4]);
+		assert_eq!(&fields[136..138], &[3.0, 0.0]);
+		assert_eq!(&fields[138..142], &[17_476.0, 13_107.0, 8_738.0, 4_369.0]);
+		assert_eq!(&fields[142..146], &[34_952.0, 30_583.0, 26_214.0, 21_845.0]);
+		assert_eq!(&fields[146..148], &[38.0, 0.0]);
+		assert_eq!(&fields[178..182], &[49.0, 0.0, 0.0, 0.0]);
 	}
 
 	#[test]
@@ -2696,12 +3021,13 @@ mod tests {
 			continuation_timeouts: 0,
 			request_timeouts: 0,
 			protocol_errors: 0,
-			callback_enqueued_by_kind: [0; 7],
-			callback_drained_by_kind: [0; 7],
-			callback_rejected_by_kind: [0; 7],
+			callback_enqueued_by_kind: [0; 8],
+			callback_drained_by_kind: [0; 8],
+			callback_rejected_by_kind: [0; 8],
 			service_process_available_flags: SERVICE_PROCESS_ALL_AVAILABLE,
 			service_rss_bytes: 0xdddd_eeee_ffff_0001,
 			service_cpu_total_milliseconds: u64::MAX,
+			..Default::default()
 		};
 
 		let fields = encode_production_process_metrics(host, &service.encode()).unwrap();
@@ -2733,12 +3059,13 @@ mod tests {
 			continuation_timeouts: 0,
 			request_timeouts: 0,
 			protocol_errors: 0,
-			callback_enqueued_by_kind: [0; 7],
-			callback_drained_by_kind: [0; 7],
-			callback_rejected_by_kind: [0; 7],
+			callback_enqueued_by_kind: [0; 8],
+			callback_drained_by_kind: [0; 8],
+			callback_rejected_by_kind: [0; 8],
 			service_process_available_flags: 0,
 			service_rss_bytes: 0,
 			service_cpu_total_milliseconds: 0,
+			..Default::default()
 		}
 		.encode();
 		let unknown_flags = CurrentProcessMetrics {
@@ -2768,7 +3095,9 @@ mod tests {
 			deadline_ticks: 0xfedc_ba98_7654_3210,
 		};
 		let event = CallbackEvent {
-			sequence: 0x1111_2222_3333_4444,
+			scope_sequence: 0x1111_2222_3333_4444,
+			transaction_id: 0x9999_aaaa_bbbb_cccc,
+			scope: CallbackScope::Reaction,
 			kind: CallbackEventKind::RunDmReaction,
 			flags: 0,
 			subject: handle(0x1234, 2),
@@ -2792,22 +3121,45 @@ mod tests {
 		.encode()
 		.to_vec();
 		response.extend(event.encode().unwrap());
-		let fields = decode_production_callback_batch(&response, 1).unwrap();
-		assert_eq!(fields.len(), 12 + 31);
+		let fields = decode_production_callback_batch(
+			&response,
+			1,
+			CallbackScope::Reaction,
+			0x9999_aaaa_bbbb_cccc,
+		)
+		.unwrap();
+		assert_eq!(fields.len(), 12 + 36);
 		assert_eq!(&fields[..2], &[1.0, 0.0]);
 		assert_eq!(
 			&fields[12..16],
 			&[0x4444 as f32, 0x3333 as f32, 0x2222 as f32, 0x1111 as f32]
 		);
-		assert_eq!(fields[16], CallbackEventKind::RunDmReaction as u16 as f32);
-		assert_eq!(fields[32], 1.0);
 		assert_eq!(
-			decode_production_continuation_token(&fields[33..43]).unwrap(),
+			&fields[16..20],
+			&[0xcccc as f32, 0xbbbb as f32, 0xaaaa as f32, 0x9999 as f32]
+		);
+		assert_eq!(fields[20], CallbackScope::Reaction as u16 as f32);
+		assert_eq!(fields[21], CallbackEventKind::RunDmReaction as u16 as f32);
+		assert_eq!(fields[37], 1.0);
+		assert_eq!(
+			decode_production_continuation_token(&fields[38..48]).unwrap(),
 			token
 		);
-		assert!(decode_production_callback_batch(&response, 0).is_err());
+		assert!(decode_production_callback_batch(
+			&response,
+			0,
+			CallbackScope::Reaction,
+			0x9999_aaaa_bbbb_cccc
+		)
+		.is_err());
 		response.pop();
-		assert!(decode_production_callback_batch(&response, 1).is_err());
+		assert!(decode_production_callback_batch(
+			&response,
+			1,
+			CallbackScope::Reaction,
+			0x9999_aaaa_bbbb_cccc
+		)
+		.is_err());
 
 		let mut wrapped = CallbackBatchHeader {
 			returned: 2,
@@ -2820,7 +3172,7 @@ mod tests {
 		.to_vec();
 		wrapped.extend(
 			CallbackEvent {
-				sequence: u64::MAX,
+				scope_sequence: u64::MAX,
 				..event
 			}
 			.encode()
@@ -2828,13 +3180,19 @@ mod tests {
 		);
 		wrapped.extend(
 			CallbackEvent {
-				sequence: 0,
+				scope_sequence: 0,
 				..event
 			}
 			.encode()
 			.unwrap(),
 		);
-		assert!(decode_production_callback_batch(&wrapped, 2).is_err());
+		assert!(decode_production_callback_batch(
+			&wrapped,
+			2,
+			CallbackScope::Reaction,
+			0x9999_aaaa_bbbb_cccc
+		)
+		.is_err());
 	}
 
 	#[test]

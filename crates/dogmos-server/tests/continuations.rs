@@ -3,14 +3,15 @@
 use dogmos_byond::{ClientError, DogmosClient};
 use dogmos_protocol::{
 	encode_gas_metadata_batch, encode_lifecycle_batch, encode_reaction_metadata_batch,
-	encode_turf_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CallbackEvent,
-	CapacityLimits, ContinuationCommandRequest, ContinuationResumeRequest, GasMetadataRegistration,
-	HandshakePayload, LifecycleAction, LifecycleMutation, MixtureCommandRequest,
-	MixtureCommandResponse, OperationKind, ReactionMetadataRegistration, ScalarValue,
-	ServiceErrorCode, SimulationStage, SimulationStageRequest, TurfLifecycleMutation,
-	WireGasFireRole, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
-	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD,
-	MIXTURE_COMMAND_RESPONSE_LEN,
+	encode_turf_lifecycle_batch, BuildIdentity, CallbackBatchRequest, CallbackEvent, CallbackScope,
+	CapacityLimits, ContinuationCommandRequest, ContinuationResumeRequest, FrontierAppendRequest,
+	FrontierBeginRequest, FrontierCommitRequest, GasMetadataRegistration, HandshakePayload,
+	LifecycleAction, LifecycleMutation, MixtureCommandRequest, MixtureCommandResponse,
+	OperationKind, ReactionMetadataRegistration, ScalarValue, ServiceErrorCode, SimulationStage,
+	SimulationStageRequest, TurfLifecycleMutation, WireGasFireRole, WireHandle,
+	WireReactionExecution, CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION,
+	DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MIXTURE_COMMAND_RESPONSE_LEN,
+	SIMULATION_STAGE_RESPONSE_LEN,
 };
 use std::{
 	error::Error,
@@ -48,6 +49,10 @@ fn dm_reaction_continuation_allows_nested_commands_then_fails_closed_on_service_
 			max_batch_operations: 4096,
 			max_callback_events: 8,
 			max_pending_continuations: 1,
+			max_frontier_handles: 4096,
+			max_stage_work_items: 4096,
+			max_reaction_transactions: 1,
+			reserved: 0,
 			max_world_bytes: 1024 * 1024,
 		},
 		process_id: std::process::id(),
@@ -144,19 +149,54 @@ fn dm_reaction_continuation_allows_nested_commands_then_fails_closed_on_service_
 		&request,
 		&mut count_response,
 	)?;
+	client.round_trip_into(
+		OperationKind::FrontierBegin,
+		&FrontierBeginRequest {
+			epoch: 1,
+			expected_count: 1,
+		}
+		.encode(),
+		&mut [0_u8; 8],
+	)?;
+	client.round_trip_into(
+		OperationKind::FrontierAppend,
+		&FrontierAppendRequest {
+			epoch: 1,
+			offset: 0,
+			handles: vec![WireHandle {
+				slot: 0,
+				generation: 1,
+			}],
+		}
+		.encode()?,
+		&mut [0_u8; 4],
+	)?;
+	client.round_trip_into(
+		OperationKind::FrontierCommit,
+		&FrontierCommitRequest { epoch: 1 }.encode(),
+		&mut [0_u8; 16],
+	)?;
 
 	let stage = SimulationStageRequest {
 		stage: SimulationStage::ProcessReactions,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 4096,
 		seconds_per_tick: ScalarValue(0.5),
 	}
 	.encode()?;
-	let mut stage_response = [0_u8; 8];
+	let mut stage_response = [0_u8; SIMULATION_STAGE_RESPONSE_LEN];
 	let mut callback_response = [0_u8; CALLBACK_BATCH_HEADER_LEN + CALLBACK_EVENT_LEN];
 	let mut command_response = [0_u8; MIXTURE_COMMAND_RESPONSE_LEN];
 	client.round_trip_into(OperationKind::SimulationStage, &stage, &mut stage_response)?;
 	client.round_trip_into(
 		OperationKind::CallbackBatch,
-		&CallbackBatchRequest { max_events: 1 }.encode(),
+		&CallbackBatchRequest {
+			max_events: 1,
+			scope: CallbackScope::General,
+			transaction_id: 0,
+		}
+		.encode()?,
 		&mut callback_response,
 	)?;
 	let token = CallbackEvent::decode(&callback_response[CALLBACK_BATCH_HEADER_LEN..])?
@@ -196,6 +236,7 @@ fn dm_reaction_continuation_allows_nested_commands_then_fails_closed_on_service_
 			flags: 1,
 			work_items: 0,
 			pending: false,
+			transaction_id: 0,
 		}
 	);
 	assert!(matches!(
@@ -210,7 +251,12 @@ fn dm_reaction_continuation_allows_nested_commands_then_fails_closed_on_service_
 	client.round_trip_into(OperationKind::SimulationStage, &stage, &mut stage_response)?;
 	client.round_trip_into(
 		OperationKind::CallbackBatch,
-		&CallbackBatchRequest { max_events: 1 }.encode(),
+		&CallbackBatchRequest {
+			max_events: 1,
+			scope: CallbackScope::General,
+			transaction_id: 0,
+		}
+		.encode()?,
 		&mut callback_response,
 	)?;
 	let cancel_token = CallbackEvent::decode(&callback_response[CALLBACK_BATCH_HEADER_LEN..])?
@@ -236,7 +282,12 @@ fn dm_reaction_continuation_allows_nested_commands_then_fails_closed_on_service_
 	client.round_trip_into(OperationKind::SimulationStage, &stage, &mut stage_response)?;
 	client.round_trip_into(
 		OperationKind::CallbackBatch,
-		&CallbackBatchRequest { max_events: 1 }.encode(),
+		&CallbackBatchRequest {
+			max_events: 1,
+			scope: CallbackScope::General,
+			transaction_id: 0,
+		}
+		.encode()?,
 		&mut callback_response,
 	)?;
 	let lost_token = CallbackEvent::decode(&callback_response[CALLBACK_BATCH_HEADER_LEN..])?

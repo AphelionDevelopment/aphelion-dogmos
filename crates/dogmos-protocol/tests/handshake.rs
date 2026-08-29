@@ -19,6 +19,10 @@ fn payload() -> HandshakePayload {
 			max_batch_operations: 4096,
 			max_callback_events: 1024,
 			max_pending_continuations: 1024,
+			max_frontier_handles: 100_000,
+			max_stage_work_items: 4096,
+			max_reaction_transactions: 64,
+			reserved: 0,
 			max_world_bytes: 8 * 1024 * 1024 * 1024,
 		},
 		process_id: 1234,
@@ -52,7 +56,7 @@ fn handshake_decoder_requires_exact_length() {
 #[test]
 fn handshake_rejects_zero_pid_and_invalid_capacity() {
 	let mut zero_pid = payload().encode();
-	zero_pid[144..148].copy_from_slice(&0_u32.to_le_bytes());
+	zero_pid[160..164].copy_from_slice(&0_u32.to_le_bytes());
 	assert_eq!(
 		HandshakePayload::decode(&zero_pid),
 		Err(ProtocolError::InvalidProcessId)

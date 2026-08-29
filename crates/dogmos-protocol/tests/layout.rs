@@ -31,7 +31,7 @@ fn public_handle_layout_uses_only_fixed_width_fields() {
 #[test]
 fn handshake_layout_uses_only_fixed_width_fields() {
 	assert_eq!(size_of::<BuildIdentity>(), 88);
-	assert_eq!(size_of::<CapacityLimits>(), 24);
-	assert_eq!(size_of::<HandshakePayload>(), 160);
-	assert_eq!(HANDSHAKE_PAYLOAD_LEN, 160);
+	assert_eq!(size_of::<CapacityLimits>(), 40);
+	assert_eq!(size_of::<HandshakePayload>(), 176);
+	assert_eq!(HANDSHAKE_PAYLOAD_LEN, 176);
 }

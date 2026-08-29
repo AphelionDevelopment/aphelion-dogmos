@@ -2,14 +2,16 @@ mod state;
 
 use dogmos_protocol::{
 	decode_adjacency_batch, decode_adjust_multiple_request,
-	decode_continuation_adjust_multiple_request, decode_gas_metadata_batch, decode_lifecycle_batch,
-	decode_mixture_state_batch, decode_reaction_metadata_batch, decode_turf_adjacency_batch,
-	decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
-	read_frame_into, write_frame, CallbackBatchRequest, ContinuationCommandRequest,
-	ContinuationResumeRequest, ContinuationToken, HandshakePayload, MixtureCommandRequest,
-	MixtureSnapshotRequest, OperationKind, ProtocolHeader, ServiceErrorCode,
-	SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR,
-	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
+	decode_continuation_adjust_multiple_request, decode_frontier_append_into,
+	decode_gas_metadata_batch, decode_lifecycle_batch, decode_mixture_state_batch,
+	decode_reaction_metadata_batch, decode_turf_adjacency_batch, decode_turf_heat_adjacency_batch,
+	decode_turf_heat_batch, decode_turf_lifecycle_batch, read_frame_into, write_frame,
+	CallbackBatchRequest, ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
+	FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse, FrontierCommitRequest,
+	FrontierCommitResponse, HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest,
+	OperationKind, ProtocolHeader, ServiceErrorCode, SimulationStageRequest,
+	SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN,
+	MAX_CONTROL_PAYLOAD,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -198,10 +200,12 @@ fn handle_primary(
 	let _authenticated_session = AuthenticatedSessionGuard(shutdown);
 	let mut request_sequence = RequestSequence::after_handshake(request.request_id);
 	let mut diagnostic_arena: Vec<u8> = Vec::new();
+	let mut frontier_handles = Vec::new();
 	let mut service_state = ServiceState::new_for_world(
 		expected.capacities.max_world_bytes,
 		expected.capacities.max_callback_events,
 		expected.capacities.max_pending_continuations,
+		expected.capacities.max_reaction_transactions,
 		expected.world_generation,
 	);
 
@@ -261,7 +265,9 @@ fn handle_primary(
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				}
-				let response_len = service_state.drain_callbacks(
+				let response_len = service_state.drain_scoped_callbacks(
+					callback_request.scope,
+					callback_request.transaction_id,
 					callback_request.max_events,
 					&mut payload[..expected.capacities.max_control_payload as usize],
 				)?;
@@ -605,8 +611,16 @@ fn handle_primary(
 					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
 					continue;
 				};
-				let result = match service_state.process_stage_cancellable(
+				if stage_request.work_limit > expected.capacities.max_stage_work_items {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				}
+				let result = match service_state.process_stage_chunk_cancellable(
 					stage_request.stage,
+					stage_request.frontier_epoch,
+					stage_request.stage_epoch,
+					stage_request.work_limit,
 					stage_request.seconds_per_tick.0,
 					|| deadline.is_expired(),
 				) {
@@ -619,9 +633,90 @@ fn handle_primary(
 				let response = SimulationStageResponse {
 					work_items: result.work_items,
 					callback_events: result.callback_events,
+					pending: result.pending,
+					remaining_estimate: result.remaining_estimate,
+					produced_equalize_seeds: result.produced_equalize_seeds,
+					produced_group_seeds: result.produced_group_seeds,
+					produced_heat_seeds: result.produced_heat_seeds,
 				}
 				.encode();
 				write_response(&mut stream, request, &response)?;
+			}
+			OperationKind::FrontierBegin => {
+				let Ok(frontier_request) = FrontierBeginRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				if frontier_request.expected_count > expected.capacities.max_frontier_handles {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				}
+				if let Err(error) = service_state
+					.begin_frontier(frontier_request.epoch, frontier_request.expected_count)
+				{
+					write_error_response(&mut stream, request, service_error_code(&error))?;
+					continue;
+				}
+				write_response(
+					&mut stream,
+					request,
+					&FrontierBeginResponse {
+						epoch: frontier_request.epoch,
+					}
+					.encode(),
+				)?;
+			}
+			OperationKind::FrontierAppend => {
+				let Ok(header) =
+					decode_frontier_append_into(&payload[..payload_len], &mut frontier_handles)
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let accepted_count = match service_state.append_frontier(
+					header.epoch,
+					header.offset,
+					&frontier_handles,
+				) {
+					Ok(count) => count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&FrontierAppendResponse { accepted_count }.encode(),
+				)?;
+			}
+			OperationKind::FrontierCommit => {
+				let Ok(frontier_request) = FrontierCommitRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let count = match service_state.commit_frontier(frontier_request.epoch) {
+					Ok(count) => count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&FrontierCommitResponse {
+						epoch: frontier_request.epoch,
+						count,
+					}
+					.encode(),
+				)?;
 			}
 			OperationKind::ServiceTelemetry => {
 				if payload_len != 0 {
@@ -653,6 +748,12 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		state::StateError::AllocationFailed => ServiceErrorCode::AllocationFailed,
 		state::StateError::Graph(_) => ServiceErrorCode::InvalidGraph,
 		state::StateError::CallbackBackpressure => ServiceErrorCode::CallbackBackpressure,
+		state::StateError::ReactionTransactionCapacityExceeded => {
+			ServiceErrorCode::CallbackBackpressure
+		}
+		state::StateError::FrontierConflict => ServiceErrorCode::FrontierConflict,
+		state::StateError::FrontierIncomplete => ServiceErrorCode::FrontierIncomplete,
+		state::StateError::StageConflict => ServiceErrorCode::StageConflict,
 		state::StateError::ContinuationCapacityExceeded => {
 			ServiceErrorCode::ContinuationCapacityExceeded
 		}
@@ -667,6 +768,7 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		state::StateError::Cancelled => ServiceErrorCode::DeadlineExceeded,
 		state::StateError::SelfAdjacency(_)
 		| state::StateError::DuplicateTurfAdjacency { .. }
+		| state::StateError::UnknownReactionTransaction(_)
 		| state::StateError::InvalidMetadata
 		| state::StateError::InvalidConductivity
 		| state::StateError::InvalidSecondsPerTick
@@ -674,6 +776,7 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		state::StateError::State(_)
 		| state::StateError::CallbackOutputTooSmall
 		| state::StateError::CallbackSequenceExhausted
+		| state::StateError::ReactionTransactionIdExhausted
 		| state::StateError::ContinuationIdExhausted
 		| state::StateError::ContinuationDeadlineExhausted => ServiceErrorCode::Internal,
 	}

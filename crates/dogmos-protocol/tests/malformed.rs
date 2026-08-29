@@ -186,6 +186,9 @@ fn service_error_codes_are_fixed_width_and_reject_unknown_values() {
 		ServiceErrorCode::ContinuationCapacityExceeded,
 		ServiceErrorCode::ContinuationWorldMismatch,
 		ServiceErrorCode::ContinuationTokenMismatch,
+		ServiceErrorCode::FrontierConflict,
+		ServiceErrorCode::FrontierIncomplete,
+		ServiceErrorCode::StageConflict,
 	];
 	for (index, error) in errors.into_iter().enumerate() {
 		let expected = (index as u32 + 1).to_le_bytes();
@@ -199,5 +202,49 @@ fn service_error_codes_are_fixed_width_and_reject_unknown_values() {
 	assert_eq!(
 		ServiceErrorCode::decode(&[1, 0, 0]),
 		Err(ProtocolError::InvalidServiceErrorLength { actual: 3 })
+	);
+}
+
+#[test]
+fn handshake_rejects_zero_required_capacities_and_nonzero_reserved_capacity() {
+	use dogmos_protocol::{BuildIdentity, CapacityLimits, HandshakePayload, DOGMOS_ABI_VERSION};
+
+	let valid = HandshakePayload {
+		auth_token: [1; 32],
+		identity: BuildIdentity {
+			abi_version: DOGMOS_ABI_VERSION,
+			protocol_version: DOGMOS_PROTOCOL_VERSION,
+			source_revision: [2; 20],
+			feature_fingerprint: [3; 32],
+			executable_digest: [4; 32],
+		},
+		capacities: CapacityLimits {
+			max_control_payload: 65_536,
+			max_batch_operations: 512,
+			max_callback_events: 1024,
+			max_pending_continuations: 64,
+			max_frontier_handles: 100_000,
+			max_stage_work_items: 4096,
+			max_reaction_transactions: 64,
+			reserved: 0,
+			max_world_bytes: 1 << 30,
+		},
+		process_id: 1,
+		world_generation: 1,
+		world_nonce: 1,
+	};
+
+	let mut zero_frontier = valid.encode();
+	zero_frontier[136..140].fill(0);
+	assert_eq!(
+		HandshakePayload::decode(&zero_frontier),
+		Err(ProtocolError::InvalidCapacityLimit("max_frontier_handles"))
+	);
+
+	let mut reserved = valid.encode();
+	reserved[148..152].copy_from_slice(&1_u32.to_le_bytes());
+	assert_eq!(
+		HandshakePayload::decode(&reserved),
+		Err(ProtocolError::ReservedCapacityField(1))
 	);
 }

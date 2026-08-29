@@ -13,14 +13,14 @@ pub use telemetry_wire::*;
 pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
-pub const DOGMOS_ABI_VERSION: u16 = 1;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 8;
+pub const DOGMOS_ABI_VERSION: u16 = 2;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 9;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
-pub const HANDSHAKE_PAYLOAD_LEN: usize = 160;
+pub const HANDSHAKE_PAYLOAD_LEN: usize = 176;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
 pub const MAX_CALLBACK_EVENTS: u32 = 1024 * 1024;
 pub const MAX_GAS_SLOTS: usize = 32;
-pub const MIXTURE_SNAPSHOT_LEN: usize = 40 + MAX_GAS_SLOTS * 8;
+pub const MIXTURE_SNAPSHOT_LEN: usize = 64 + MAX_GAS_SLOTS * 8;
 pub const MIXTURE_STATE_MUTATION_LEN: usize = 32 + MAX_GAS_SLOTS * 8;
 pub const LIFECYCLE_MUTATION_LEN: usize = 12;
 pub const ADJACENCY_MUTATION_LEN: usize = 24;
@@ -33,11 +33,19 @@ pub const MIXTURE_COMMAND_REQUEST_LEN: usize = 56;
 pub const MIXTURE_COMMAND_RESPONSE_LEN: usize = 24;
 pub const MIXTURE_ADJUST_MULTIPLE_HEADER_LEN: usize = 12;
 pub const MIXTURE_ADJUSTMENT_LEN: usize = 16;
-pub const SIMULATION_STAGE_REQUEST_LEN: usize = 12;
-pub const SIMULATION_STAGE_RESPONSE_LEN: usize = 8;
-pub const CALLBACK_BATCH_REQUEST_LEN: usize = 4;
+pub const SIMULATION_STAGE_REQUEST_LEN: usize = 40;
+pub const SIMULATION_STAGE_RESPONSE_LEN: usize = 32;
+pub const CALLBACK_BATCH_REQUEST_LEN: usize = 16;
 pub const CALLBACK_BATCH_HEADER_LEN: usize = 24;
-pub const CALLBACK_EVENT_LEN: usize = 88;
+pub const CALLBACK_EVENT_LEN: usize = 104;
+pub const FRONTIER_BEGIN_REQUEST_LEN: usize = 16;
+pub const FRONTIER_BEGIN_RESPONSE_LEN: usize = 8;
+pub const FRONTIER_APPEND_HEADER_LEN: usize = 16;
+pub const FRONTIER_APPEND_RESPONSE_LEN: usize = 4;
+pub const FRONTIER_COMMIT_REQUEST_LEN: usize = 8;
+pub const FRONTIER_COMMIT_RESPONSE_LEN: usize = 16;
+pub const MAX_FRONTIER_APPEND_HANDLES: usize = 512;
+pub const MAX_STAGE_WORK_ITEMS: u32 = 4096;
 pub const FLAG_RESPONSE: u16 = 1 << 0;
 pub const FLAG_ERROR: u16 = 1 << 1;
 const KNOWN_FLAGS: u16 = FLAG_RESPONSE | FLAG_ERROR;
@@ -80,6 +88,9 @@ pub enum OperationKind {
 	ContinuationCancel = 35,
 	ServiceTelemetry = 36,
 	TurfHeatSnapshot = 37,
+	FrontierBegin = 38,
+	FrontierAppend = 39,
+	FrontierCommit = 40,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +116,9 @@ pub enum ServiceErrorCode {
 	ContinuationCapacityExceeded = 18,
 	ContinuationWorldMismatch = 19,
 	ContinuationTokenMismatch = 20,
+	FrontierConflict = 21,
+	FrontierIncomplete = 22,
+	StageConflict = 23,
 }
 
 impl ServiceErrorCode {
@@ -139,6 +153,9 @@ impl ServiceErrorCode {
 			18 => Ok(Self::ContinuationCapacityExceeded),
 			19 => Ok(Self::ContinuationWorldMismatch),
 			20 => Ok(Self::ContinuationTokenMismatch),
+			21 => Ok(Self::FrontierConflict),
+			22 => Ok(Self::FrontierIncomplete),
+			23 => Ok(Self::StageConflict),
 			actual => Err(ProtocolError::UnknownServiceErrorCode(actual)),
 		}
 	}
@@ -180,6 +197,9 @@ impl TryFrom<u16> for OperationKind {
 			35 => Ok(Self::ContinuationCancel),
 			36 => Ok(Self::ServiceTelemetry),
 			37 => Ok(Self::TurfHeatSnapshot),
+			38 => Ok(Self::FrontierBegin),
+			39 => Ok(Self::FrontierAppend),
+			40 => Ok(Self::FrontierCommit),
 			actual => Err(ProtocolError::UnknownOperationKind(actual)),
 		}
 	}
@@ -379,6 +399,10 @@ pub struct CapacityLimits {
 	pub max_batch_operations: u32,
 	pub max_callback_events: u32,
 	pub max_pending_continuations: u32,
+	pub max_frontier_handles: u32,
+	pub max_stage_work_items: u32,
+	pub max_reaction_transactions: u32,
+	pub reserved: u32,
 	pub max_world_bytes: u64,
 }
 
@@ -406,10 +430,14 @@ impl HandshakePayload {
 		output[124..128].copy_from_slice(&self.capacities.max_batch_operations.to_le_bytes());
 		output[128..132].copy_from_slice(&self.capacities.max_callback_events.to_le_bytes());
 		output[132..136].copy_from_slice(&self.capacities.max_pending_continuations.to_le_bytes());
-		output[136..144].copy_from_slice(&self.capacities.max_world_bytes.to_le_bytes());
-		output[144..148].copy_from_slice(&self.process_id.to_le_bytes());
-		output[148..152].copy_from_slice(&self.world_generation.to_le_bytes());
-		output[152..160].copy_from_slice(&self.world_nonce.to_le_bytes());
+		output[136..140].copy_from_slice(&self.capacities.max_frontier_handles.to_le_bytes());
+		output[140..144].copy_from_slice(&self.capacities.max_stage_work_items.to_le_bytes());
+		output[144..148].copy_from_slice(&self.capacities.max_reaction_transactions.to_le_bytes());
+		output[148..152].copy_from_slice(&self.capacities.reserved.to_le_bytes());
+		output[152..160].copy_from_slice(&self.capacities.max_world_bytes.to_le_bytes());
+		output[160..164].copy_from_slice(&self.process_id.to_le_bytes());
+		output[164..168].copy_from_slice(&self.world_generation.to_le_bytes());
+		output[168..176].copy_from_slice(&self.world_nonce.to_le_bytes());
 		output
 	}
 
@@ -442,11 +470,15 @@ impl HandshakePayload {
 				max_batch_operations: read_u32(input, 124),
 				max_callback_events: read_u32(input, 128),
 				max_pending_continuations: read_u32(input, 132),
-				max_world_bytes: read_u64(input, 136),
+				max_frontier_handles: read_u32(input, 136),
+				max_stage_work_items: read_u32(input, 140),
+				max_reaction_transactions: read_u32(input, 144),
+				reserved: read_u32(input, 148),
+				max_world_bytes: read_u64(input, 152),
 			},
-			process_id: read_u32(input, 144),
-			world_generation: read_u32(input, 148),
-			world_nonce: read_u64(input, 152),
+			process_id: read_u32(input, 160),
+			world_generation: read_u32(input, 164),
+			world_nonce: read_u64(input, 168),
 		};
 		payload.validate()?;
 		Ok(payload)
@@ -524,6 +556,24 @@ impl HandshakePayload {
 				maximum: MAX_PENDING_CONTINUATIONS,
 			});
 		}
+		if self.capacities.reserved != 0 {
+			return Err(ProtocolError::ReservedCapacityField(
+				self.capacities.reserved,
+			));
+		}
+		if self.capacities.max_frontier_handles == 0 {
+			return Err(ProtocolError::InvalidCapacityLimit("max_frontier_handles"));
+		}
+		if self.capacities.max_stage_work_items == 0
+			|| self.capacities.max_stage_work_items > MAX_STAGE_WORK_ITEMS
+		{
+			return Err(ProtocolError::InvalidCapacityLimit("max_stage_work_items"));
+		}
+		if self.capacities.max_reaction_transactions == 0 {
+			return Err(ProtocolError::InvalidCapacityLimit(
+				"max_reaction_transactions",
+			));
+		}
 		Ok(())
 	}
 }
@@ -554,6 +604,197 @@ impl WireHandle {
 			generation: read_u32(input, 4),
 		})
 	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierBeginRequest {
+	pub epoch: u64,
+	pub expected_count: u32,
+}
+
+impl FrontierBeginRequest {
+	pub fn encode(self) -> [u8; FRONTIER_BEGIN_REQUEST_LEN] {
+		let mut output = [0_u8; FRONTIER_BEGIN_REQUEST_LEN];
+		output[0..8].copy_from_slice(&self.epoch.to_le_bytes());
+		output[8..12].copy_from_slice(&self.expected_count.to_le_bytes());
+		output
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, FRONTIER_BEGIN_REQUEST_LEN)?;
+		let reserved = read_u32(input, 12);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedFrontierField(reserved));
+		}
+		Ok(Self {
+			epoch: read_u64(input, 0),
+			expected_count: read_u32(input, 8),
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierBeginResponse {
+	pub epoch: u64,
+}
+
+impl FrontierBeginResponse {
+	pub fn encode(self) -> [u8; FRONTIER_BEGIN_RESPONSE_LEN] {
+		self.epoch.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, FRONTIER_BEGIN_RESPONSE_LEN)?;
+		Ok(Self {
+			epoch: read_u64(input, 0),
+		})
+	}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontierAppendRequest {
+	pub epoch: u64,
+	pub offset: u32,
+	pub handles: Vec<WireHandle>,
+}
+
+impl FrontierAppendRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+		validate_frontier_handles(&self.handles)?;
+		let count = self.handles.len() as u32;
+		let mut output = Vec::with_capacity(FRONTIER_APPEND_HEADER_LEN + self.handles.len() * 8);
+		output.extend_from_slice(&self.epoch.to_le_bytes());
+		output.extend_from_slice(&self.offset.to_le_bytes());
+		output.extend_from_slice(&count.to_le_bytes());
+		for handle in &self.handles {
+			output.extend_from_slice(&handle.encode());
+		}
+		Ok(output)
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierAppendHeader {
+	pub epoch: u64,
+	pub offset: u32,
+	pub count: u32,
+}
+
+pub fn decode_frontier_append_into(
+	input: &[u8],
+	handles: &mut Vec<WireHandle>,
+) -> Result<FrontierAppendHeader, ProtocolError> {
+	if input.len() < FRONTIER_APPEND_HEADER_LEN {
+		return Err(ProtocolError::InvalidPayloadLength {
+			expected: FRONTIER_APPEND_HEADER_LEN as u32,
+			actual: input.len() as u32,
+		});
+	}
+	let count = read_u32(input, 12);
+	if count == 0 || count as usize > MAX_FRONTIER_APPEND_HANDLES {
+		return Err(ProtocolError::InvalidFrontierAppendCount(count));
+	}
+	let expected = FRONTIER_APPEND_HEADER_LEN + count as usize * 8;
+	require_exact_len(input, expected)?;
+	for index in 0..count as usize {
+		let start = FRONTIER_APPEND_HEADER_LEN + index * 8;
+		let handle = WireHandle::decode(&input[start..start + 8])?;
+		for previous_index in 0..index {
+			let previous_start = FRONTIER_APPEND_HEADER_LEN + previous_index * 8;
+			let previous = WireHandle::decode(&input[previous_start..previous_start + 8])?;
+			if handle == previous {
+				return Err(ProtocolError::DuplicateFrontierHandle(handle));
+			}
+		}
+	}
+	handles.clear();
+	handles.reserve(count as usize);
+	for index in 0..count as usize {
+		let start = FRONTIER_APPEND_HEADER_LEN + index * 8;
+		handles.push(WireHandle::decode(&input[start..start + 8])?);
+	}
+	Ok(FrontierAppendHeader {
+		epoch: read_u64(input, 0),
+		offset: read_u32(input, 8),
+		count,
+	})
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierAppendResponse {
+	pub accepted_count: u32,
+}
+
+impl FrontierAppendResponse {
+	pub fn encode(self) -> [u8; FRONTIER_APPEND_RESPONSE_LEN] {
+		self.accepted_count.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, FRONTIER_APPEND_RESPONSE_LEN)?;
+		Ok(Self {
+			accepted_count: read_u32(input, 0),
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierCommitRequest {
+	pub epoch: u64,
+}
+
+impl FrontierCommitRequest {
+	pub fn encode(self) -> [u8; FRONTIER_COMMIT_REQUEST_LEN] {
+		self.epoch.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, FRONTIER_COMMIT_REQUEST_LEN)?;
+		Ok(Self {
+			epoch: read_u64(input, 0),
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierCommitResponse {
+	pub epoch: u64,
+	pub count: u32,
+}
+
+impl FrontierCommitResponse {
+	pub fn encode(self) -> [u8; FRONTIER_COMMIT_RESPONSE_LEN] {
+		let mut output = [0_u8; FRONTIER_COMMIT_RESPONSE_LEN];
+		output[0..8].copy_from_slice(&self.epoch.to_le_bytes());
+		output[8..12].copy_from_slice(&self.count.to_le_bytes());
+		output
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, FRONTIER_COMMIT_RESPONSE_LEN)?;
+		let reserved = read_u32(input, 12);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedFrontierField(reserved));
+		}
+		Ok(Self {
+			epoch: read_u64(input, 0),
+			count: read_u32(input, 8),
+		})
+	}
+}
+
+fn validate_frontier_handles(handles: &[WireHandle]) -> Result<(), ProtocolError> {
+	let count = u32::try_from(handles.len()).unwrap_or(u32::MAX);
+	if handles.is_empty() || handles.len() > MAX_FRONTIER_APPEND_HANDLES {
+		return Err(ProtocolError::InvalidFrontierAppendCount(count));
+	}
+	let mut seen = BTreeSet::new();
+	for handle in handles {
+		if !seen.insert((handle.slot, handle.generation)) {
+			return Err(ProtocolError::DuplicateFrontierHandle(*handle));
+		}
+	}
+	Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -614,6 +855,25 @@ impl TryFrom<u16> for CallbackEventKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum CallbackScope {
+	General = 1,
+	Reaction = 2,
+}
+
+impl TryFrom<u16> for CallbackScope {
+	type Error = ProtocolError;
+
+	fn try_from(value: u16) -> Result<Self, Self::Error> {
+		match value {
+			1 => Ok(Self::General),
+			2 => Ok(Self::Reaction),
+			actual => Err(ProtocolError::UnknownCallbackScope(actual)),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ReactionKind {
 	Plasma = 1,
@@ -661,7 +921,9 @@ impl TryFrom<u32> for TurfDestructionReason {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CallbackEvent {
-	pub sequence: u64,
+	pub scope_sequence: u64,
+	pub transaction_id: u64,
+	pub scope: CallbackScope,
 	pub kind: CallbackEventKind,
 	pub flags: u16,
 	pub subject: WireHandle,
@@ -673,6 +935,7 @@ pub struct CallbackEvent {
 
 impl CallbackEvent {
 	pub fn encode(self) -> Result<[u8; CALLBACK_EVENT_LEN], ProtocolError> {
+		validate_callback_transaction(self.scope, self.transaction_id)?;
 		if self.flags != 0 {
 			return Err(ProtocolError::UnknownCallbackFlags(self.flags));
 		}
@@ -686,35 +949,50 @@ impl CallbackEvent {
 			(_, None) => {}
 		}
 		let mut output = [0_u8; CALLBACK_EVENT_LEN];
-		output[0..8].copy_from_slice(&self.sequence.to_le_bytes());
-		output[8..10].copy_from_slice(&(self.kind as u16).to_le_bytes());
-		output[10..12].copy_from_slice(&self.flags.to_le_bytes());
-		output[12..20].copy_from_slice(&self.subject.encode());
-		output[20..28].copy_from_slice(&self.target.encode());
+		output[0..8].copy_from_slice(&self.scope_sequence.to_le_bytes());
+		output[8..16].copy_from_slice(&self.transaction_id.to_le_bytes());
+		output[16..18].copy_from_slice(&(self.scope as u16).to_le_bytes());
+		output[18..20].copy_from_slice(&(self.kind as u16).to_le_bytes());
+		output[20..22].copy_from_slice(&self.flags.to_le_bytes());
+		output[24..32].copy_from_slice(&self.subject.encode());
+		output[32..40].copy_from_slice(&self.target.encode());
 		for (index, value) in self.values.into_iter().enumerate() {
-			let offset = 28 + index * 8;
+			let offset = 40 + index * 8;
 			output[offset..offset + 8].copy_from_slice(&value.encode()?);
 		}
-		output[60..64].copy_from_slice(&self.aux.to_le_bytes());
+		output[72..76].copy_from_slice(&self.aux.to_le_bytes());
 		if let Some(continuation) = self.continuation {
-			output[64..88].copy_from_slice(&continuation.encode()?);
+			output[80..104].copy_from_slice(&continuation.encode()?);
 		}
 		Ok(output)
 	}
 
 	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
 		require_exact_len(input, CALLBACK_EVENT_LEN)?;
-		let flags = read_u16(input, 10);
+		let scope = CallbackScope::try_from(read_u16(input, 16))?;
+		let transaction_id = read_u64(input, 8);
+		validate_callback_transaction(scope, transaction_id)?;
+		let flags = read_u16(input, 20);
 		if flags != 0 {
 			return Err(ProtocolError::UnknownCallbackFlags(flags));
 		}
-		let kind = CallbackEventKind::try_from(read_u16(input, 8))?;
-		let aux = read_u32(input, 60);
+		let reserved_short = read_u16(input, 22);
+		if reserved_short != 0 {
+			return Err(ProtocolError::ReservedCallbackEventField(
+				reserved_short as u32,
+			));
+		}
+		let reserved = read_u32(input, 76);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedCallbackEventField(reserved));
+		}
+		let kind = CallbackEventKind::try_from(read_u16(input, 18))?;
+		let aux = read_u32(input, 72);
 		validate_callback_aux(kind, aux)?;
-		let continuation_present = input[64..88].iter().any(|byte| *byte != 0);
+		let continuation_present = input[80..104].iter().any(|byte| *byte != 0);
 		let continuation = match (kind, continuation_present) {
 			(CallbackEventKind::RunDmReaction, true) => {
-				Some(ContinuationToken::decode(&input[64..88])?)
+				Some(ContinuationToken::decode(&input[80..104])?)
 			}
 			(CallbackEventKind::RunDmReaction, false) => {
 				return Err(ProtocolError::MissingContinuationToken);
@@ -723,22 +1001,41 @@ impl CallbackEvent {
 			(_, false) => None,
 		};
 		let event = Self {
-			sequence: read_u64(input, 0),
+			scope_sequence: read_u64(input, 0),
+			transaction_id,
+			scope,
 			kind,
 			flags,
-			subject: WireHandle::decode(&input[12..20])?,
-			target: WireHandle::decode(&input[20..28])?,
+			subject: WireHandle::decode(&input[24..32])?,
+			target: WireHandle::decode(&input[32..40])?,
 			values: [
-				ScalarValue::decode(&input[28..36])?,
-				ScalarValue::decode(&input[36..44])?,
-				ScalarValue::decode(&input[44..52])?,
-				ScalarValue::decode(&input[52..60])?,
+				ScalarValue::decode(&input[40..48])?,
+				ScalarValue::decode(&input[48..56])?,
+				ScalarValue::decode(&input[56..64])?,
+				ScalarValue::decode(&input[64..72])?,
 			],
 			aux,
 			continuation,
 		};
 		Ok(event)
 	}
+}
+
+fn validate_callback_transaction(
+	scope: CallbackScope,
+	transaction_id: u64,
+) -> Result<(), ProtocolError> {
+	let valid = match scope {
+		CallbackScope::General => transaction_id == 0,
+		CallbackScope::Reaction => transaction_id != 0,
+	};
+	if !valid {
+		return Err(ProtocolError::InvalidCallbackTransaction {
+			scope: scope as u16,
+			transaction_id,
+		});
+	}
+	Ok(())
 }
 
 fn validate_callback_aux(kind: CallbackEventKind, aux: u32) -> Result<(), ProtocolError> {
@@ -768,18 +1065,33 @@ fn validate_callback_aux(kind: CallbackEventKind, aux: u32) -> Result<(), Protoc
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallbackBatchRequest {
 	pub max_events: u32,
+	pub scope: CallbackScope,
+	pub transaction_id: u64,
 }
 
 impl CallbackBatchRequest {
-	pub fn encode(self) -> [u8; CALLBACK_BATCH_REQUEST_LEN] {
-		self.max_events.to_le_bytes()
+	pub fn encode(self) -> Result<[u8; CALLBACK_BATCH_REQUEST_LEN], ProtocolError> {
+		validate_callback_transaction(self.scope, self.transaction_id)?;
+		let mut output = [0_u8; CALLBACK_BATCH_REQUEST_LEN];
+		output[0..4].copy_from_slice(&self.max_events.to_le_bytes());
+		output[4..6].copy_from_slice(&(self.scope as u16).to_le_bytes());
+		output[8..16].copy_from_slice(&self.transaction_id.to_le_bytes());
+		Ok(output)
 	}
 
 	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
 		require_exact_len(input, CALLBACK_BATCH_REQUEST_LEN)?;
-		Ok(Self {
+		let reserved = read_u16(input, 6);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedCallbackBatchField(reserved));
+		}
+		let request = Self {
 			max_events: read_u32(input, 0),
-		})
+			scope: CallbackScope::try_from(read_u16(input, 4))?,
+			transaction_id: read_u64(input, 8),
+		};
+		validate_callback_transaction(request.scope, request.transaction_id)?;
+		Ok(request)
 	}
 }
 
@@ -840,6 +1152,9 @@ pub struct MixtureSnapshot {
 	pub temperature: ScalarValue,
 	pub volume: ScalarValue,
 	pub minimum_heat_capacity: ScalarValue,
+	pub total_moles: ScalarValue,
+	pub pressure: ScalarValue,
+	pub heat_capacity: ScalarValue,
 	pub immutable: bool,
 	pub gases: [ScalarValue; MAX_GAS_SLOTS],
 }
@@ -854,8 +1169,11 @@ impl MixtureSnapshot {
 		output[16..24].copy_from_slice(&self.volume.encode()?);
 		output[24..32].copy_from_slice(&self.minimum_heat_capacity.encode()?);
 		output[32..36].copy_from_slice(&u32::from(self.immutable).to_le_bytes());
+		output[40..48].copy_from_slice(&self.total_moles.encode()?);
+		output[48..56].copy_from_slice(&self.pressure.encode()?);
+		output[56..64].copy_from_slice(&self.heat_capacity.encode()?);
 		for (index, value) in self.gases.into_iter().enumerate() {
-			let offset = 40 + index * 8;
+			let offset = 64 + index * 8;
 			output[offset..offset + 8].copy_from_slice(&value.encode()?);
 		}
 		Ok(output)
@@ -875,7 +1193,7 @@ impl MixtureSnapshot {
 		}
 		let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
 		for (index, value) in gases.iter_mut().enumerate() {
-			let offset = 40 + index * 8;
+			let offset = 64 + index * 8;
 			*value = ScalarValue::decode(&input[offset..offset + 8])?;
 		}
 		Ok(Self {
@@ -884,6 +1202,9 @@ impl MixtureSnapshot {
 			temperature: ScalarValue::decode(&input[8..16])?,
 			volume: ScalarValue::decode(&input[16..24])?,
 			minimum_heat_capacity: ScalarValue::decode(&input[24..32])?,
+			total_moles: ScalarValue::decode(&input[40..48])?,
+			pressure: ScalarValue::decode(&input[48..56])?,
+			heat_capacity: ScalarValue::decode(&input[56..64])?,
 			immutable: flags & 1 != 0,
 			gases,
 		})
@@ -1980,6 +2301,7 @@ pub enum MixtureCommandResponse {
 		flags: u32,
 		work_items: u32,
 		pending: bool,
+		transaction_id: u64,
 	},
 }
 
@@ -2003,6 +2325,7 @@ impl MixtureCommandResponse {
 				flags,
 				work_items,
 				pending,
+				transaction_id,
 			} => {
 				if flags & !REACTION_FLAGS != 0 {
 					return Err(ProtocolError::InvalidReactionFlags(flags));
@@ -2010,6 +2333,7 @@ impl MixtureCommandResponse {
 				let mut payload = [0_u8; 16];
 				payload[..4].copy_from_slice(&work_items.to_le_bytes());
 				payload[4..8].copy_from_slice(&u32::from(pending).to_le_bytes());
+				payload[8..16].copy_from_slice(&transaction_id.to_le_bytes());
 				(5, flags, payload)
 			}
 		};
@@ -2024,27 +2348,27 @@ impl MixtureCommandResponse {
 		require_exact_len(input, MIXTURE_COMMAND_RESPONSE_LEN)?;
 		let kind = read_u32(input, 0);
 		let value = read_u32(input, 4);
-		let scalars = [
-			ScalarValue::decode(&input[8..16])?,
-			ScalarValue::decode(&input[16..24])?,
-		];
 		match kind {
 			1 if input[8..24].iter().all(|byte| *byte == 0) => Ok(Self::Applied { updated: value }),
 			2 if value == 0 && input[16..24].iter().all(|byte| *byte == 0) => {
-				Ok(Self::Scalar(scalars[0]))
+				Ok(Self::Scalar(ScalarValue::decode(&input[8..16])?))
 			}
-			3 if value == 0 => Ok(Self::Scalars(scalars)),
+			3 if value == 0 => Ok(Self::Scalars([
+				ScalarValue::decode(&input[8..16])?,
+				ScalarValue::decode(&input[16..24])?,
+			])),
 			4 if input[8..24].iter().all(|byte| *byte == 0) => {
 				Ok(Self::Boolean(decode_boolean(value)?))
 			}
 			5 => {
-				if value & !REACTION_FLAGS != 0 || input[16..24].iter().any(|byte| *byte != 0) {
+				if value & !REACTION_FLAGS != 0 {
 					return Err(ProtocolError::InvalidReactionFlags(value));
 				}
 				Ok(Self::ReactionProgress {
 					flags: value,
 					work_items: read_u32(input, 8),
 					pending: decode_boolean(read_u32(input, 12))?,
+					transaction_id: read_u64(input, 16),
 				})
 			}
 			actual => Err(ProtocolError::UnknownMixtureCommandResponse(actual)),
@@ -2131,6 +2455,9 @@ impl TryFrom<u32> for SimulationStage {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SimulationStageRequest {
 	pub stage: SimulationStage,
+	pub frontier_epoch: u64,
+	pub stage_epoch: u64,
+	pub work_limit: u32,
 	pub seconds_per_tick: ScalarValue,
 }
 
@@ -2138,15 +2465,35 @@ impl SimulationStageRequest {
 	pub fn encode(self) -> Result<[u8; SIMULATION_STAGE_REQUEST_LEN], ProtocolError> {
 		let mut output = [0_u8; SIMULATION_STAGE_REQUEST_LEN];
 		output[0..4].copy_from_slice(&(self.stage as u32).to_le_bytes());
-		output[4..12].copy_from_slice(&self.seconds_per_tick.encode()?);
+		if self.work_limit == 0 || self.work_limit > MAX_STAGE_WORK_ITEMS {
+			return Err(ProtocolError::InvalidStageWorkLimit(self.work_limit));
+		}
+		output[8..16].copy_from_slice(&self.frontier_epoch.to_le_bytes());
+		output[16..24].copy_from_slice(&self.stage_epoch.to_le_bytes());
+		output[24..28].copy_from_slice(&self.work_limit.to_le_bytes());
+		output[32..40].copy_from_slice(&self.seconds_per_tick.encode()?);
 		Ok(output)
 	}
 
 	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
 		require_exact_len(input, SIMULATION_STAGE_REQUEST_LEN)?;
+		let first_reserved = read_u32(input, 4);
+		let second_reserved = read_u32(input, 28);
+		if first_reserved != 0 || second_reserved != 0 {
+			return Err(ProtocolError::ReservedSimulationStageField(
+				first_reserved | second_reserved,
+			));
+		}
+		let work_limit = read_u32(input, 24);
+		if work_limit == 0 || work_limit > MAX_STAGE_WORK_ITEMS {
+			return Err(ProtocolError::InvalidStageWorkLimit(work_limit));
+		}
 		Ok(Self {
 			stage: SimulationStage::try_from(read_u32(input, 0))?,
-			seconds_per_tick: ScalarValue::decode(&input[4..12])?,
+			frontier_epoch: read_u64(input, 8),
+			stage_epoch: read_u64(input, 16),
+			work_limit,
+			seconds_per_tick: ScalarValue::decode(&input[32..40])?,
 		})
 	}
 }
@@ -2155,6 +2502,11 @@ impl SimulationStageRequest {
 pub struct SimulationStageResponse {
 	pub work_items: u32,
 	pub callback_events: u32,
+	pub pending: bool,
+	pub remaining_estimate: u32,
+	pub produced_equalize_seeds: u32,
+	pub produced_group_seeds: u32,
+	pub produced_heat_seeds: u32,
 }
 
 impl SimulationStageResponse {
@@ -2162,14 +2514,32 @@ impl SimulationStageResponse {
 		let mut output = [0_u8; SIMULATION_STAGE_RESPONSE_LEN];
 		output[0..4].copy_from_slice(&self.work_items.to_le_bytes());
 		output[4..8].copy_from_slice(&self.callback_events.to_le_bytes());
+		output[8..12].copy_from_slice(&u32::from(self.pending).to_le_bytes());
+		output[12..16].copy_from_slice(&self.remaining_estimate.to_le_bytes());
+		output[16..20].copy_from_slice(&self.produced_equalize_seeds.to_le_bytes());
+		output[20..24].copy_from_slice(&self.produced_group_seeds.to_le_bytes());
+		output[24..28].copy_from_slice(&self.produced_heat_seeds.to_le_bytes());
 		output
 	}
 
 	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
 		require_exact_len(input, SIMULATION_STAGE_RESPONSE_LEN)?;
+		let flags = read_u32(input, 8);
+		if flags & !1 != 0 {
+			return Err(ProtocolError::UnknownSimulationStageFlags(flags));
+		}
+		let reserved = read_u32(input, 28);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedSimulationStageField(reserved));
+		}
 		Ok(Self {
 			work_items: read_u32(input, 0),
 			callback_events: read_u32(input, 4),
+			pending: flags & 1 != 0,
+			remaining_estimate: read_u32(input, 12),
+			produced_equalize_seeds: read_u32(input, 16),
+			produced_group_seeds: read_u32(input, 20),
+			produced_heat_seeds: read_u32(input, 24),
 		})
 	}
 }
@@ -2226,6 +2596,8 @@ pub enum ProtocolError {
 		actual: u32,
 		maximum: u32,
 	},
+	InvalidCapacityLimit(&'static str),
+	ReservedCapacityField(u32),
 	AuthenticationFailed,
 	BuildIdentityMismatch,
 	CapacityMismatch,
@@ -2264,6 +2636,19 @@ pub enum ProtocolError {
 	UnknownLifecycleAction(u32),
 	ReservedMixtureStateField(u32),
 	UnknownSimulationStage(u32),
+	InvalidStageWorkLimit(u32),
+	UnknownSimulationStageFlags(u32),
+	ReservedSimulationStageField(u32),
+	InvalidFrontierAppendCount(u32),
+	DuplicateFrontierHandle(WireHandle),
+	ReservedFrontierField(u32),
+	UnknownCallbackScope(u16),
+	InvalidCallbackTransaction {
+		scope: u16,
+		transaction_id: u64,
+	},
+	ReservedCallbackBatchField(u16),
+	ReservedCallbackEventField(u32),
 	UnknownCallbackEventKind(u16),
 	UnknownCallbackFlags(u16),
 	UnknownCallbackAux {

@@ -140,6 +140,50 @@ fn scalar_queries_match_legacy_formulas_and_minimum_heat_capacity() {
 }
 
 #[test]
+fn snapshots_include_atomic_service_derived_scalars() {
+	let mut world = world_with_two_mixtures();
+	world
+		.apply_command(Command::SetMoles {
+			handle: handle(0),
+			gas: GasId(0),
+			amount: 2.0,
+		})
+		.unwrap();
+	world
+		.apply_command(Command::SetMoles {
+			handle: handle(0),
+			gas: GasId(1),
+			amount: 3.0,
+		})
+		.unwrap();
+	world
+		.apply_command(Command::SetTemperature {
+			handle: handle(0),
+			temperature: 400.0,
+		})
+		.unwrap();
+	world
+		.apply_command(Command::SetVolume {
+			handle: handle(0),
+			volume: 100.0,
+		})
+		.unwrap();
+
+	let snapshot = world.snapshot(handle(0)).unwrap();
+	assert_eq!(snapshot.total_moles, 5.0);
+	assert_eq!(snapshot.heat_capacity, 70.0);
+	assert_eq!(
+		snapshot.pressure,
+		scalar(&mut world, Command::Pressure { handle: handle(0) })
+	);
+
+	let empty = world.snapshot(handle(1)).unwrap();
+	assert_eq!(empty.total_moles, 0.0);
+	assert_eq!(empty.pressure, 0.0);
+	assert_eq!(empty.heat_capacity, empty.minimum_heat_capacity);
+}
+
+#[test]
 fn elementary_mutations_match_legacy_and_fail_before_mutation() {
 	let mut world = world_with_two_mixtures();
 	for (gas, amount) in [(GasId(0), 1.0), (GasId(1), 2.0)] {

@@ -6,6 +6,9 @@ fn generated_bindings_include_the_production_mixture_command_family() {
 	let source = fs::read_to_string(crate_root.join("src/lib.rs")).unwrap();
 	let bindings = fs::read_to_string(crate_root.join("bindings.dm")).unwrap();
 	for binding in [
+		"/proc/dogmos_frontier_append",
+		"/proc/dogmos_frontier_begin",
+		"/proc/dogmos_frontier_commit",
 		"/proc/dogmos_gas_metadata_install",
 		"/proc/dogmos_mixture_adjust_multiple",
 		"/proc/dogmos_mixture_command",
