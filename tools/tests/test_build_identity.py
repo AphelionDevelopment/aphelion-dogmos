@@ -61,6 +61,13 @@ class BuildIdentityTests(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
 
         self.assertEqual(identity["source_revision"], head)
         self.assertIsNotNone(identity["feature_fingerprint"], result.stdout)
@@ -68,7 +75,7 @@ class BuildIdentityTests(unittest.TestCase):
             identity["feature_fingerprint"],
             hashlib.sha256(MANIFEST_PATH.read_bytes()).hexdigest(),
         )
-        self.assertTrue(identity["dirty"])
+        self.assertEqual(identity["dirty"], bool(status.strip()))
 
     def test_ipc_entrypoint_tools_export_the_compiled_identity(self):
         for relative_path in (

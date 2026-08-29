@@ -1,8 +1,8 @@
 schema_version = 1
 
 [protocol]
-abi_version = 1
-protocol_version = 8
+abi_version = 2
+protocol_version = 9
 
 [toolchain]
 byond = "516.1687"
