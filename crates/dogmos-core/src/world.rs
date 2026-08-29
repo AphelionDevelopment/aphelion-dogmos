@@ -1194,7 +1194,8 @@ impl DogmosWorld {
 		if self.stage_cursor.is_some() {
 			return Err(WorldError::StageConflict);
 		}
-		let mut candidate_topology = self.topology.clone();
+		// See apply_turf_adjacency() above for why this mutates self.topology directly instead of
+		// cloning it into a candidate first.
 		for mutation in mutations {
 			let left = self.require_turf_handle(mutation.left)?;
 			let right = self.require_turf_handle(mutation.right)?;
@@ -1208,14 +1209,13 @@ impl DogmosWorld {
 				return Err(WorldError::SelfTurfHeatAdjacency(mutation.left));
 			}
 			if mutation.connected {
-				candidate_topology
+				self.topology
 					.connect_heat(mutation.left, mutation.right)
 					.map_err(map_topology_error)?;
 			} else {
-				candidate_topology.disconnect_heat(mutation.left, mutation.right);
+				self.topology.disconnect_heat(mutation.left, mutation.right);
 			}
 		}
-		self.topology = candidate_topology;
 		Ok(mutations.len() as u32)
 	}
 
@@ -1226,7 +1226,14 @@ impl DogmosWorld {
 		if self.stage_cursor.is_some() {
 			return Err(WorldError::StageConflict);
 		}
-		let mut candidate_topology = self.topology.clone();
+		// Mutates self.topology directly rather than cloning it into a candidate first: the clone
+		// was a full copy of every turf slot in the world, paid on every call regardless of batch
+		// size (down to a single edge), to get all-or-nothing rollback on a mid-batch failure. That
+		// rollback isn't load-bearing - every caller (the DM dispatcher and the service's own
+		// wire handler) already treats a rejected batch as fatal and halts, so a partially-applied
+		// topology on failure is no worse than what already happens. The clone was unnoticeable on
+		// a handful of test turfs and minutes of wall time on a real map's turf count.
+		let revision_before = self.topology.revision();
 		for mutation in mutations {
 			let left = self.require_turf_handle(mutation.left)?;
 			let right = self.require_turf_handle(mutation.right)?;
@@ -1240,19 +1247,20 @@ impl DogmosWorld {
 				return Err(WorldError::SelfTurfAdjacency(mutation.left));
 			}
 			if mutation.connected {
-				candidate_topology
+				self.topology
 					.connect_gas(mutation.left, mutation.right)
 					.map_err(map_topology_error)?;
 			} else {
-				candidate_topology.disconnect_gas(mutation.left, mutation.right);
+				self.topology.disconnect_gas(mutation.left, mutation.right);
 			}
 		}
-		if candidate_topology.revision() == self.topology.revision() {
+		if self.topology.revision() == revision_before {
 			return Ok(mutations.len() as u32);
 		}
-		let graph = self.build_turf_graph(&candidate_topology)?;
-		self.topology = candidate_topology;
-		self.turf_graph = Some(graph);
+		// Invalidate rather than eagerly rebuild: process_turf_diffusion already rebuilds
+		// self.turf_graph lazily from self.topology the first time it is actually needed (the
+		// only other reader of this field).
+		self.turf_graph = None;
 		Ok(mutations.len() as u32)
 	}
 
@@ -1263,18 +1271,18 @@ impl DogmosWorld {
 		if self.stage_cursor.is_some() {
 			return Err(WorldError::StageConflict);
 		}
-		let mut candidate_topology = self.topology.clone();
+		// See apply_turf_adjacency() above for why this mutates self.topology directly instead of
+		// cloning it into a candidate first.
 		for mutation in mutations {
 			self.require_turf_handle(mutation.left)?;
 			self.require_turf_handle(mutation.right)?;
 			if mutation.left.slot == mutation.right.slot {
 				return Err(WorldError::SelfTurfAdjacency(mutation.left));
 			}
-			candidate_topology
+			self.topology
 				.set_firelock(mutation.left, mutation.right, mutation.firelock)
 				.map_err(map_topology_error)?;
 		}
-		self.topology = candidate_topology;
 		Ok(mutations.len() as u32)
 	}
 
@@ -4922,36 +4930,50 @@ impl DogmosWorld {
 		self.turf_graph = None;
 	}
 
+	/// Removes this slot's gas edges while preserving its heat edges (topology.remove_slot()
+	/// clears both, so heat edges are captured first and reconnected after).
+	///
+	/// Looks up this slot's own neighbors via topology.heat_neighbors() (an O(its own degree,
+	/// <=6) direct slot lookup) rather than topology.heat_slot_edges() (an O(total heat edges in
+	/// the world) scan filtered down to this slot). apply_turf_lifecycle calls this for every
+	/// turf whose registration declares no mixture (heat-only turfs), and does so on every
+	/// re-registration, not just the first - unnoticeable at unit-test scale, this scan cost
+	/// multiplying against a real map's edge count and re-registration frequency was minutes.
 	fn remove_incident_gas_edges(&mut self, slot: u32) {
-		let heat_edges = self
-			.topology
-			.heat_slot_edges()
-			.filter(|(left, right)| *left == slot || *right == slot)
-			.collect::<Vec<_>>();
+		let heat_partners = self
+			.current_turf_handle(slot)
+			.map(|handle| {
+				self.topology
+					.heat_neighbors(handle)
+					.map(|neighbor| neighbor.handle)
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_default();
 		self.topology.remove_slot(slot);
-		for (left, right) in heat_edges {
-			let left = self.current_turf_handle(left).ok();
-			let right = self.current_turf_handle(right).ok();
-			if let (Some(left), Some(right)) = (left, right) {
-				let _ = self.topology.connect_heat(left, right);
+		if let Ok(this) = self.current_turf_handle(slot) {
+			for other in heat_partners {
+				let _ = self.topology.connect_heat(this, other);
 			}
 		}
 		self.turf_graph = None;
 	}
 
+	/// Removes this slot's heat edges while preserving its gas edges and their firelock flags.
+	/// See remove_incident_gas_edges() above for why this looks up neighbors via
+	/// topology.gas_neighbors() (this slot's own degree) instead of topology.gas_slot_edges()
+	/// (the whole world's edge count).
 	fn remove_incident_heat_edges(&mut self, slot: u32) {
-		let gas_edges = self
-			.topology
-			.gas_slot_edges()
-			.filter(|(left, right, _)| *left == slot || *right == slot)
-			.collect::<Vec<_>>();
+		let gas_partners = self
+			.current_turf_handle(slot)
+			.map(|handle| self.topology.gas_neighbors(handle).collect::<Vec<_>>())
+			.unwrap_or_default();
 		self.topology.remove_slot(slot);
-		for (left, right, firelock) in gas_edges {
-			let left = self.current_turf_handle(left).ok();
-			let right = self.current_turf_handle(right).ok();
-			if let (Some(left), Some(right)) = (left, right) {
-				let _ = self.topology.connect_gas(left, right);
-				let _ = self.topology.set_firelock(left, right, firelock);
+		if let Ok(this) = self.current_turf_handle(slot) {
+			for other in gas_partners {
+				let _ = self.topology.connect_gas(this, other.handle);
+				let _ = self
+					.topology
+					.set_firelock(this, other.handle, other.firelock);
 			}
 		}
 	}
@@ -5002,6 +5024,10 @@ impl DogmosWorld {
 		validate_graph(&nodes, &directed).map_err(|error| WorldError::Graph(error.to_string()))
 	}
 
+	// Only used by the debug-only process_turf_diffusion fallback below. The production
+	// process_stage_chunk_cancellable diffusion path never read self.turf_graph even before
+	// apply_turf_adjacency stopped eagerly rebuilding it.
+	#[cfg(debug_assertions)]
 	fn build_turf_graph(&self, topology: &PackedTopology) -> Result<DiffusionGraph, WorldError> {
 		let nodes = self
 			.turfs
