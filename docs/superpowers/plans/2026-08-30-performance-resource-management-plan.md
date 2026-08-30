@@ -84,7 +84,7 @@ Extract `test_gas_metadata(count)` next to the fixture's existing setup helpers;
 
 - [ ] **Step 3: Regenerate bindings with the maintained generator**
 
-Run from the repository root:
+Run from `crates/dogmos-byond` because the maintained generator writes `bindings.dm` relative to its current directory:
 
 ```powershell
 cargo +1.98.0 run --quiet --locked --target i686-pc-windows-msvc -p dogmos-byond --example generate_bindings

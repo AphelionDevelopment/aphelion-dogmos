@@ -2,14 +2,15 @@
 
 use dogmos_byond::{ClientError, DogmosClient};
 use dogmos_protocol::{
-	encode_adjacency_batch, encode_lifecycle_batch, encode_mixture_state_batch,
-	encode_turf_heat_batch, encode_turf_lifecycle_batch, read_frame_into, write_frame,
-	AdjacencyMutation, BuildIdentity, CallbackBatchHeader, CallbackBatchRequest, CallbackEvent,
-	CallbackScope, CapacityLimits, FrontierBeginRequest, FrontierCommitRequest, HandshakePayload,
-	LifecycleAction, LifecycleMutation, MixtureSnapshot, MixtureSnapshotRequest,
-	MixtureStateMutation, OperationKind, ProtocolHeader, ScalarValue, ServiceErrorCode,
-	ServiceTelemetry, SimulationStage, SimulationStageRequest, TurfHeatMutation, TurfHeatSnapshot,
-	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireHandle,
+	encode_adjacency_batch, encode_gas_metadata_batch, encode_lifecycle_batch,
+	encode_mixture_state_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
+	read_frame_into, write_frame, AdjacencyMutation, BuildIdentity, CallbackBatchHeader,
+	CallbackBatchRequest, CallbackEvent, CallbackScope, CapacityLimits, FrontierBeginRequest,
+	FrontierCommitRequest, GasMetadataRegistration, HandshakePayload, LifecycleAction,
+	LifecycleMutation, MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind,
+	ProtocolHeader, ScalarValue, ServiceErrorCode, ServiceTelemetry, SimulationStage,
+	SimulationStageRequest, TurfHeatMutation, TurfHeatSnapshot, TurfHeatSnapshotRequest,
+	TurfHeatState, TurfLifecycleMutation, WireGasFireRole, WireHandle,
 	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
 	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
 	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_HEAT_SNAPSHOT_LEN,
@@ -55,6 +56,24 @@ fn handshake(service_path: &std::path::Path) -> HandshakePayload {
 		world_generation: 1,
 		world_nonce: 0x1234_5678_90ab_cdef,
 	}
+}
+
+fn gas_metadata(count: usize) -> Vec<GasMetadataRegistration> {
+	(0..count)
+		.map(|id| GasMetadataRegistration {
+			id: id as u16,
+			key: format!("gas_{id}"),
+			name: format!("Gas {id}"),
+			flags: 0,
+			specific_heat: ScalarValue(20.0 + id as f64),
+			fusion_power: ScalarValue(0.0),
+			moles_visible: None,
+			enthalpy: ScalarValue(0.0),
+			fire_radiation_released: ScalarValue(0.0),
+			fire_role: WireGasFireRole::None,
+			fire_products: None,
+		})
+		.collect()
 }
 
 fn connect_raw(endpoint: &str, timeout: Duration) -> Stream {
@@ -310,6 +329,17 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 		1024 * 1024
 	);
 	assert_eq!(client.allocate_diagnostic(0).unwrap(), 0);
+	let mut gas_metadata_request = Vec::new();
+	encode_gas_metadata_batch(&gas_metadata(MAX_GAS_SLOTS), &mut gas_metadata_request).unwrap();
+	let mut processed = [0_u8; 4];
+	client
+		.round_trip_into(
+			OperationKind::GasMetadataInstall,
+			&gas_metadata_request,
+			&mut processed,
+		)
+		.unwrap();
+	assert_eq!(u32::from_le_bytes(processed), MAX_GAS_SLOTS as u32);
 
 	let lifecycle = (0..64)
 		.map(|slot| LifecycleMutation {
@@ -322,7 +352,6 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 		.collect::<Vec<_>>();
 	let mut lifecycle_request = Vec::new();
 	encode_lifecycle_batch(&lifecycle, &mut lifecycle_request).unwrap();
-	let mut processed = [0_u8; 4];
 	client
 		.round_trip_into(
 			OperationKind::MixtureLifecycleBatch,

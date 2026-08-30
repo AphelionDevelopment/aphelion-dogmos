@@ -24,6 +24,9 @@
 /proc/dogmos_feature_fingerprint()
 	return call_ext(DOGMOS, "byond:dogmos_feature_fingerprint_ffi")()
 
+/proc/dogmos_frontier_add(records)
+	return call_ext(DOGMOS, "byond:dogmos_frontier_add_ffi")(records)
+
 /proc/dogmos_frontier_append(records)
 	return call_ext(DOGMOS, "byond:dogmos_frontier_append_ffi")(records)
 
@@ -32,6 +35,9 @@
 
 /proc/dogmos_frontier_commit(fields)
 	return call_ext(DOGMOS, "byond:dogmos_frontier_commit_ffi")(fields)
+
+/proc/dogmos_frontier_remove(records)
+	return call_ext(DOGMOS, "byond:dogmos_frontier_remove_ffi")(records)
 
 /proc/dogmos_gas_metadata_install(numeric_records, keys, names, product_records)
 	return call_ext(DOGMOS, "byond:dogmos_gas_metadata_install_ffi")(numeric_records, keys, names, product_records)

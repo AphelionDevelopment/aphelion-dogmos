@@ -324,7 +324,7 @@ fn mixture_state_batch_round_trips_exact_fixed_records() {
 }
 
 #[test]
-fn mixture_state_batch_matches_complete_protocol_v9_golden_bytes() {
+fn mixture_state_batch_matches_complete_protocol_v10_golden_bytes() {
 	const GOLDEN_HEX: &str = concat!(
 		"01000000070000000b0000000400000000000000000000000000104000000000",
 		"00002040000000000000f03f0000000000000000000000000000000000000000",
