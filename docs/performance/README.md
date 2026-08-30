@@ -60,3 +60,10 @@ Every transcript hash matched the preceding candidate. At 100,000 turfs, equaliz
 107,222-107,556 allocations and 1,952,016-2,082,224 allocated bytes, while excited-groups removed
 116,667 allocations and 7,961,600 allocated bytes for every topology. These reductions exceed the
 zero-noise allocation controls and retain sorted packed-topology traversal order.
+
+Stage-state recycling and server translation scratch were reviewed but not implemented. Retaining
+stage vectors would pin large buffers while leaving the measured per-entry tree/set and transaction
+allocations intact. In the legal IPC control, increasing a lifecycle batch from 1 to 1,024 records
+raised p50 round-trip latency from 31.4 microseconds to 54.7 microseconds; this whole-path delta is
+small beside the 739.5 microsecond p50 1,024-turf service stage and does not justify persistent
+per-family translation buffers without more granular profile evidence.

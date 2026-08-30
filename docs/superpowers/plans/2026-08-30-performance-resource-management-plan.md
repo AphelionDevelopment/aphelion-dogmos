@@ -522,6 +522,11 @@ git commit -m "perf: traverse packed component topology directly"
 
 ### Task 9: Recycle service stage state only if profiling justifies it
 
+**Status:** Skipped after the Step 1 gate. After Tasks 7-8, the measured counts remain dominated by
+per-entry maps/sets and transactional record copies. Retaining vector capacities would remove only
+their logarithmic growth reallocations while pinning large buffers in `dogmosd`; that trade does not
+meet the materiality threshold without a broader transaction-scratch design.
+
 **Files:**
 - Modify: `crates/dogmos-core/src/world.rs`
 - Test: `crates/dogmos-core/tests/frontier_processing.rs`
@@ -532,23 +537,23 @@ git commit -m "perf: traverse packed component topology directly"
 - Consumes: completed/cancelled stage state.
 - Produces: cleared scratch pools whose capacities are retained in `dogmosd`, never exposed to the shim.
 
-- [ ] **Step 1: Gate on measured service churn**
+- [x] **Step 1: Gate on measured service churn**
 
 Proceed only if Task 3 shows recurring stage allocation counts or service CPU impact after Tasks 6-8. Do not justify this task with DreamDaemon memory.
 
-- [ ] **Step 2: Add reuse and rollback tests**
+- [x] **Step 2: Add reuse and rollback tests (not applicable; gate rejected)**
 
 Run two identical stages and assert the second does not increase vector capacity or allocation count. Inject cancellation and event overflow between them; assert state remains retryable and no partial records/events commit.
 
-- [ ] **Step 3: Add one scratch owner per stage family**
+- [x] **Step 3: Add one scratch owner per stage family (not applicable; gate rejected)**
 
 Keep completed state objects in `DogmosWorld`, clear logical contents/cursors, and move them into the active slot on the next stage. Never clear the only rollback copy before commit succeeds. Maps/sets may initially remain recreated if safe capacity-preserving reset is not clear; optimize vectors first.
 
-- [ ] **Step 4: Verify and measure separately**
+- [x] **Step 4: Verify and measure separately (not applicable; gate rejected)**
 
 Run core/server suites on x64 and the i686 workspace gate. Report `dogmosd` allocation/latency changes separately. Reject increased persistent service memory if the latency/allocation benefit is negligible.
 
-- [ ] **Step 5: Suggested commit boundary**
+- [x] **Step 5: Suggested commit boundary (decision recorded with Task 10)**
 
 ```powershell
 git add crates/dogmos-core/src/world.rs crates/dogmos-core/tests/frontier_processing.rs crates/dogmos-core/tests/reaction_execution.rs crates/dogmos-core/tests/world_state.rs
@@ -556,6 +561,12 @@ git commit -m "perf: recycle measured service stage scratch"
 ```
 
 ### Task 10: Optimize server translation scratch only if it remains visible
+
+**Status:** Skipped after the Step 1 gate. In the legal IPC control, a 1,024-record lifecycle batch
+had 54.7 microsecond p50 round-trip latency versus 31.4 microseconds for one record. The complete
+1,023-record translation, validation, world mutation, and transport delta is only 23.3 microseconds,
+well below the 739.5 microsecond p50 measured service stage. Persistent per-family buffers are not
+justified without a profile showing translation itself above noise.
 
 **Files:**
 - Modify: `crates/dogmos-server/src/state.rs`
@@ -565,26 +576,26 @@ git commit -m "perf: recycle measured service stage scratch"
 - Consumes: validated wire slices.
 - Produces: reusable core mutation vectors cleared on every success/error path.
 
-- [ ] **Step 1: Profile after stage/core changes**
+- [x] **Step 1: Profile after stage/core changes**
 
 Measure `apply_lifecycle`, adjacency, turf lifecycle, turf heat, heat adjacency, mixture state, and frontier mutations. Skip this task if translation allocation is below the agreed noise/materiality threshold.
 
-- [ ] **Step 2: Add capacity-reuse and atomic-error tests**
+- [x] **Step 2: Add capacity-reuse and atomic-error tests (not applicable; gate rejected)**
 
 For each selected family, apply two same-sized valid batches and one invalid batch. Assert capacity does not grow on the second valid batch and the invalid batch neither mutates world state nor leaves stale entries for the next call.
 
-- [ ] **Step 3: Introduce focused scratch fields**
+- [x] **Step 3: Introduce focused scratch fields (not applicable; gate rejected)**
 
 Add only scratch vectors demonstrated useful by the profile. Clear them before translation, reserve fallibly where the service budget requires it, and pass slices to core. Keep duplicate-edge validation before world mutation.
 
-- [ ] **Step 4: Verify service behavior**
+- [x] **Step 4: Verify service behavior (not applicable; gate rejected)**
 
 ```powershell
 cargo +1.98.0 test -p dogmos-server --locked --target x86_64-pc-windows-msvc
 cargo +1.98.0 test -p dogmos-server --locked --target i686-pc-windows-msvc
 ```
 
-- [ ] **Step 5: Suggested commit boundary**
+- [x] **Step 5: Suggested commit boundary (decision-only commit)**
 
 ```powershell
 git add crates/dogmos-server/src/state.rs
