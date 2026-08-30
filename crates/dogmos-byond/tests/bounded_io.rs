@@ -124,7 +124,7 @@ fn bounded_worker_preserves_a_successful_round_trip() {
 }
 
 #[test]
-fn bounded_worker_reuses_fixed_transport_buffers() {
+fn response_decoder_reads_from_the_retained_transport_buffer() {
 	let unique = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.unwrap()
@@ -162,24 +162,33 @@ fn bounded_worker_reuses_fixed_transport_buffers() {
 		bounded.retained_buffer_capacities(),
 		(MAX_CONTROL_PAYLOAD as usize, MAX_CONTROL_PAYLOAD as usize)
 	);
-	let first_pointer = bounded
-		.round_trip(
-			OperationKind::Echo,
-			b"first",
-			MAX_CONTROL_PAYLOAD as usize,
-			Duration::from_secs(1),
+	let decode = |response: &[u8]| {
+		(
+			u64::from_le_bytes(response.try_into().unwrap()),
+			response.as_ptr(),
 		)
-		.unwrap()
-		.as_ptr();
-	let second_pointer = bounded
-		.round_trip(
-			OperationKind::Echo,
-			b"second",
-			MAX_CONTROL_PAYLOAD as usize,
-			Duration::from_secs(1),
-		)
-		.unwrap()
-		.as_ptr();
+	};
+	let (first_value, first_pointer) = decode(
+		bounded
+			.round_trip(
+				OperationKind::Echo,
+				&1_u64.to_le_bytes(),
+				8,
+				Duration::from_secs(1),
+			)
+			.unwrap(),
+	);
+	let (second_value, second_pointer) = decode(
+		bounded
+			.round_trip(
+				OperationKind::Echo,
+				&2_u64.to_le_bytes(),
+				8,
+				Duration::from_secs(1),
+			)
+			.unwrap(),
+	);
+	assert_eq!((first_value, second_value), (1, 2));
 	assert_eq!(first_pointer, second_pointer);
 }
 

@@ -274,8 +274,12 @@ fn dogmos_service_shutdown() -> eyre::Result<ByondValue> {
 
 #[auxmacros::bind("/proc/dogmos_service_telemetry")]
 fn dogmos_service_telemetry() -> eyre::Result<ByondValue> {
-	let response = production_request(OperationKind::ServiceTelemetry, &[], SERVICE_TELEMETRY_LEN)?;
-	let fields = decode_production_service_telemetry(&response)?;
+	let fields = production_request_with_response(
+		OperationKind::ServiceTelemetry,
+		&[],
+		SERVICE_TELEMETRY_LEN,
+		decode_production_service_telemetry,
+	)?;
 	let mut output = ByondValue::new_list()?;
 	for field in fields {
 		output.push_list(field.into())?;
@@ -285,8 +289,13 @@ fn dogmos_service_telemetry() -> eyre::Result<ByondValue> {
 
 #[auxmacros::bind("/proc/dogmos_process_metrics")]
 fn dogmos_process_metrics() -> eyre::Result<ByondValue> {
-	let response = production_request(OperationKind::ServiceTelemetry, &[], SERVICE_TELEMETRY_LEN)?;
-	let fields = encode_production_process_metrics(sample_current_process(), &response)?;
+	let metrics = sample_current_process();
+	let fields = production_request_with_response(
+		OperationKind::ServiceTelemetry,
+		&[],
+		SERVICE_TELEMETRY_LEN,
+		|response| encode_production_process_metrics(metrics, response),
+	)?;
 	let mut output = ByondValue::new_list()?;
 	for field in fields {
 		output.push_list(field.into())?;
@@ -444,8 +453,12 @@ fn dogmos_callback_drain(fields: ByondValue) -> eyre::Result<ByondValue> {
 	}
 	.encode()?;
 	let response_capacity = CALLBACK_BATCH_HEADER_LEN + max_events as usize * CALLBACK_EVENT_LEN;
-	let response = production_request(OperationKind::CallbackBatch, &request, response_capacity)?;
-	let fields = decode_production_callback_batch(&response, max_events, scope, transaction_id)?;
+	let fields = production_request_with_response(
+		OperationKind::CallbackBatch,
+		&request,
+		response_capacity,
+		|response| decode_production_callback_batch(response, max_events, scope, transaction_id),
+	)?;
 	let mut output = ByondValue::new_list()?;
 	for field in fields {
 		output.push_list(field.into())?;
@@ -547,12 +560,13 @@ fn dogmos_continuation_command(fields: ByondValue) -> eyre::Result<ByondValue> {
 		PRODUCTION_CONTINUATION_TOKEN_FIELDS + 11,
 	)?;
 	let request = encode_production_continuation_command(&fields)?;
-	let response = production_request(
+	let response = production_request_with_response(
 		OperationKind::ContinuationCommand,
 		&request,
 		MIXTURE_COMMAND_RESPONSE_LEN,
+		|response| Ok(MixtureCommandResponse::decode(response)?),
 	)?;
-	mixture_command_response_value(MixtureCommandResponse::decode(&response)?)
+	mixture_command_response_value(response)
 }
 
 #[doc(hidden)]
@@ -582,12 +596,13 @@ fn dogmos_continuation_adjust_multiple(fields: ByondValue) -> eyre::Result<Byond
 		PRODUCTION_CONTINUATION_TOKEN_FIELDS + 2 + PRODUCTION_MAX_MIXTURE_ADJUSTMENTS * 2,
 	)?;
 	let request = encode_production_continuation_adjust_multiple(&fields)?;
-	let response = production_request(
+	let response = production_request_with_response(
 		OperationKind::ContinuationAdjustMultiple,
 		&request,
 		MIXTURE_COMMAND_RESPONSE_LEN,
+		|response| Ok(MixtureCommandResponse::decode(response)?),
 	)?;
-	mixture_command_response_value(MixtureCommandResponse::decode(&response)?)
+	mixture_command_response_value(response)
 }
 
 #[doc(hidden)]
@@ -615,12 +630,13 @@ fn dogmos_continuation_resume(fields: ByondValue) -> eyre::Result<ByondValue> {
 		PRODUCTION_CONTINUATION_TOKEN_FIELDS + 1,
 	)?;
 	let request = encode_production_continuation_resume(&fields)?;
-	let response = production_request(
+	let response = production_request_with_response(
 		OperationKind::ContinuationResume,
 		&request,
 		MIXTURE_COMMAND_RESPONSE_LEN,
+		|response| Ok(MixtureCommandResponse::decode(response)?),
 	)?;
-	mixture_command_response_value(MixtureCommandResponse::decode(&response)?)
+	mixture_command_response_value(response)
 }
 
 #[doc(hidden)]
@@ -652,12 +668,20 @@ fn dogmos_continuation_cancel(fields: ByondValue) -> eyre::Result<ByondValue> {
 		PRODUCTION_CONTINUATION_TOKEN_FIELDS,
 	)?;
 	let token = decode_production_continuation_token(&fields)?;
-	let response = production_request(OperationKind::ContinuationCancel, &token.encode()?, 0)?;
-	if !response.is_empty() {
-		return Err(eyre::eyre!(
-			"Dogmos continuation cancel response was not empty"
-		));
-	}
+	production_request_with_response(
+		OperationKind::ContinuationCancel,
+		&token.encode()?,
+		0,
+		|response| {
+			if response.is_empty() {
+				Ok(())
+			} else {
+				Err(eyre::eyre!(
+					"Dogmos continuation cancel response was not empty"
+				))
+			}
+		},
+	)?;
 	Ok(true.into())
 }
 
@@ -691,18 +715,21 @@ fn dogmos_mixture_command(fields: ByondValue) -> eyre::Result<ByondValue> {
 		));
 	}
 	let request = encode_production_mixture_command(fields.try_into().unwrap())?;
-	let response = production_request(
+	let response = production_request_with_response(
 		OperationKind::MixtureCommand,
 		&request,
 		MIXTURE_COMMAND_RESPONSE_LEN,
+		|response| {
+			if response.len() != MIXTURE_COMMAND_RESPONSE_LEN {
+				return Err(eyre::eyre!(
+					"Dogmos mixture command response was {} bytes, expected {MIXTURE_COMMAND_RESPONSE_LEN}",
+					response.len()
+				));
+			}
+			Ok(MixtureCommandResponse::decode(response)?)
+		},
 	)?;
-	if response.len() != MIXTURE_COMMAND_RESPONSE_LEN {
-		return Err(eyre::eyre!(
-			"Dogmos mixture command response was {} bytes, expected {MIXTURE_COMMAND_RESPONSE_LEN}",
-			response.len()
-		));
-	}
-	mixture_command_response_value(MixtureCommandResponse::decode(&response)?)
+	mixture_command_response_value(response)
 }
 
 #[doc(hidden)]
@@ -734,18 +761,21 @@ fn dogmos_mixture_adjust_multiple(fields: ByondValue) -> eyre::Result<ByondValue
 		2 + PRODUCTION_MAX_MIXTURE_ADJUSTMENTS * 2,
 	)?;
 	let request = encode_production_mixture_adjust_multiple(&fields)?;
-	let response = production_request(
+	let response = production_request_with_response(
 		OperationKind::MixtureAdjustMultiple,
 		&request,
 		MIXTURE_COMMAND_RESPONSE_LEN,
+		|response| {
+			if response.len() != MIXTURE_COMMAND_RESPONSE_LEN {
+				return Err(eyre::eyre!(
+					"Dogmos mixture multi-adjust response was {} bytes, expected {MIXTURE_COMMAND_RESPONSE_LEN}",
+					response.len()
+				));
+			}
+			Ok(MixtureCommandResponse::decode(response)?)
+		},
 	)?;
-	if response.len() != MIXTURE_COMMAND_RESPONSE_LEN {
-		return Err(eyre::eyre!(
-			"Dogmos mixture multi-adjust response was {} bytes, expected {MIXTURE_COMMAND_RESPONSE_LEN}",
-			response.len()
-		));
-	}
-	mixture_command_response_value(MixtureCommandResponse::decode(&response)?)
+	mixture_command_response_value(response)
 }
 
 #[doc(hidden)]
@@ -799,14 +829,13 @@ fn dogmos_mixture_lifecycle_batch(entries: ByondValue) -> eyre::Result<ByondValu
 		PRODUCTION_MAX_BATCH_OPERATIONS * 3,
 	)?;
 	let request = encode_production_mixture_lifecycle_batch(&values)?;
-	let response = production_request(OperationKind::MixtureLifecycleBatch, &request, 4)?;
-	let response: [u8; 4] = response.try_into().map_err(|response: Vec<u8>| {
-		eyre::eyre!(
-			"Dogmos mixture lifecycle response was {} bytes, expected 4",
-			response.len()
-		)
-	})?;
-	Ok((u32::from_le_bytes(response) as f32).into())
+	let count = production_request_with_response(
+		OperationKind::MixtureLifecycleBatch,
+		&request,
+		4,
+		|response| decode_counted_response(response, "mixture lifecycle"),
+	)?;
+	Ok((count as f32).into())
 }
 
 #[auxmacros::bind("/proc/dogmos_mixture_snapshot")]
@@ -824,12 +853,12 @@ fn dogmos_mixture_snapshot(fields: ByondValue) -> eyre::Result<ByondValue> {
 		},
 	}
 	.encode();
-	let response = production_request(
+	let fields = production_request_with_response(
 		OperationKind::MixtureSnapshot,
 		&request,
 		MIXTURE_SNAPSHOT_LEN,
+		decode_production_mixture_snapshot,
 	)?;
-	let fields = decode_production_mixture_snapshot(&response)?;
 	let mut output = ByondValue::new_list()?;
 	for field in fields {
 		output.push_list(field.into())?;
@@ -874,14 +903,13 @@ fn dogmos_mixture_state_batch(entries: ByondValue) -> eyre::Result<ByondValue> {
 		PRODUCTION_MAX_MIXTURE_STATE_MUTATIONS * PRODUCTION_MIXTURE_STATE_FIELDS,
 	)?;
 	let request = encode_production_mixture_state_batch(&values)?;
-	let response = production_request(OperationKind::MixtureStateBatch, &request, 4)?;
-	let response: [u8; 4] = response.try_into().map_err(|response: Vec<u8>| {
-		eyre::eyre!(
-			"Dogmos mixture state response was {} bytes, expected 4",
-			response.len()
-		)
-	})?;
-	Ok((u32::from_le_bytes(response) as f32).into())
+	let count = production_request_with_response(
+		OperationKind::MixtureStateBatch,
+		&request,
+		4,
+		|response| decode_counted_response(response, "mixture state"),
+	)?;
+	Ok((count as f32).into())
 }
 
 #[doc(hidden)]
@@ -1457,12 +1485,12 @@ fn dogmos_turf_heat_snapshot(fields: ByondValue) -> eyre::Result<ByondValue> {
 		},
 	}
 	.encode();
-	let response = production_request(
+	let fields = production_request_with_response(
 		OperationKind::TurfHeatSnapshot,
 		&request,
 		TURF_HEAT_SNAPSHOT_LEN,
+		decode_production_turf_heat_snapshot,
 	)?;
-	let fields = decode_production_turf_heat_snapshot(&response)?;
 	let mut output = ByondValue::new_list()?;
 	for field in fields {
 		output.push_list(field.into())?;
@@ -1554,8 +1582,10 @@ pub fn encode_production_turf_heat_adjacency_batch(values: &[f32]) -> eyre::Resu
 fn dogmos_frontier_begin(fields: ByondValue) -> eyre::Result<ByondValue> {
 	let fields = bounded_number_list(fields, "frontier begin", 6)?;
 	let request = encode_production_frontier_begin(&fields)?;
-	let response = production_request(OperationKind::FrontierBegin, &request, 8)?;
-	let epoch = FrontierBeginResponse::decode(&response)?.epoch;
+	let epoch =
+		production_request_with_response(OperationKind::FrontierBegin, &request, 8, |response| {
+			Ok(FrontierBeginResponse::decode(response)?.epoch)
+		})?;
 	let mut output = ByondValue::new_list()?;
 	for word in split_u64_words(epoch) {
 		output.push_list(f32::from(word).into())?;
@@ -1588,8 +1618,10 @@ fn dogmos_frontier_append(records: ByondValue) -> eyre::Result<ByondValue> {
 		6 + MAX_FRONTIER_APPEND_HANDLES * 4,
 	)?;
 	let request = encode_production_frontier_append(&records)?;
-	let response = production_request(OperationKind::FrontierAppend, &request, 4)?;
-	let accepted = FrontierAppendResponse::decode(&response)?.accepted_count;
+	let accepted =
+		production_request_with_response(OperationKind::FrontierAppend, &request, 4, |response| {
+			Ok(FrontierAppendResponse::decode(response)?.accepted_count)
+		})?;
 	let mut output = ByondValue::new_list()?;
 	for word in split_u32_words(accepted) {
 		output.push_list(f32::from(word).into())?;
@@ -1650,8 +1682,10 @@ fn dogmos_frontier_add(records: ByondValue) -> eyre::Result<ByondValue> {
 	let records =
 		bounded_number_list(records, "frontier add", 4 + MAX_FRONTIER_APPEND_HANDLES * 4)?;
 	let request = encode_production_frontier_mutate(&records, "frontier add")?;
-	let response = production_request(OperationKind::FrontierAdd, &request, 4)?;
-	let count = FrontierMutateResponse::decode(&response)?.count;
+	let count =
+		production_request_with_response(OperationKind::FrontierAdd, &request, 4, |response| {
+			Ok(FrontierMutateResponse::decode(response)?.count)
+		})?;
 	let mut output = ByondValue::new_list()?;
 	for word in split_u32_words(count) {
 		output.push_list(f32::from(word).into())?;
@@ -1667,8 +1701,10 @@ fn dogmos_frontier_remove(records: ByondValue) -> eyre::Result<ByondValue> {
 		4 + MAX_FRONTIER_APPEND_HANDLES * 4,
 	)?;
 	let request = encode_production_frontier_mutate(&records, "frontier remove")?;
-	let response = production_request(OperationKind::FrontierRemove, &request, 4)?;
-	let count = FrontierMutateResponse::decode(&response)?.count;
+	let count =
+		production_request_with_response(OperationKind::FrontierRemove, &request, 4, |response| {
+			Ok(FrontierMutateResponse::decode(response)?.count)
+		})?;
 	let mut output = ByondValue::new_list()?;
 	for word in split_u32_words(count) {
 		output.push_list(f32::from(word).into())?;
@@ -1730,8 +1766,12 @@ fn dogmos_frontier_commit(fields: ByondValue) -> eyre::Result<ByondValue> {
 		epoch: join_u64_words(exact_words4(&fields, "frontier epoch")?),
 	}
 	.encode();
-	let response = production_request(OperationKind::FrontierCommit, &request, 16)?;
-	let response = FrontierCommitResponse::decode(&response)?;
+	let response = production_request_with_response(
+		OperationKind::FrontierCommit,
+		&request,
+		16,
+		|response| Ok(FrontierCommitResponse::decode(response)?),
+	)?;
 	let mut output_fields = Vec::with_capacity(6);
 	append_u64_words(&mut output_fields, response.epoch);
 	append_u32_words(&mut output_fields, response.count);
@@ -1751,12 +1791,12 @@ fn dogmos_simulation_stage(fields: ByondValue) -> eyre::Result<ByondValue> {
 		));
 	}
 	let request = encode_production_simulation_stage(fields.try_into().unwrap())?;
-	let response = production_request(
+	let fields = production_request_with_response(
 		OperationKind::SimulationStage,
 		&request,
 		SIMULATION_STAGE_RESPONSE_LEN,
+		decode_production_simulation_stage,
 	)?;
-	let fields = decode_production_simulation_stage(&response)?;
 	let mut output = ByondValue::new_list()?;
 	for field in fields {
 		output.push_list(field.into())?;
@@ -1802,28 +1842,35 @@ fn production_counted_request(
 	payload: &[u8],
 	label: &str,
 ) -> eyre::Result<ByondValue> {
-	let response = production_request(operation, payload, 4)?;
-	let response: [u8; 4] = response.try_into().map_err(|response: Vec<u8>| {
+	let count = production_request_with_response(operation, payload, 4, |response| {
+		decode_counted_response(response, label)
+	})?;
+	Ok((count as f32).into())
+}
+
+fn decode_counted_response(response: &[u8], label: &str) -> eyre::Result<u32> {
+	let response: [u8; 4] = response.try_into().map_err(|_| {
 		eyre::eyre!(
 			"Dogmos {label} response was {} bytes, expected 4",
 			response.len()
 		)
 	})?;
-	Ok((u32::from_le_bytes(response) as f32).into())
+	Ok(u32::from_le_bytes(response))
 }
 
-fn production_request(
+fn production_request_with_response<T>(
 	operation: OperationKind,
 	payload: &[u8],
 	response_capacity: usize,
-) -> eyre::Result<Vec<u8>> {
+	decode: impl FnOnce(&[u8]) -> eyre::Result<T>,
+) -> eyre::Result<T> {
 	let mut session = SERVICE_SESSION
 		.lock()
 		.map_err(|_| eyre::eyre!("Dogmos production service session lock is poisoned"))?;
 	let session = session
 		.as_mut()
 		.ok_or_else(|| eyre::eyre!("Dogmos production service session is not running"))?;
-	Ok(session.request(operation, payload, response_capacity)?)
+	session.request_with_response(operation, payload, response_capacity, decode)
 }
 
 #[cfg(feature = "diagnostic-bindings")]
@@ -1851,8 +1898,9 @@ fn dogmos_ipc_benchmark_scalar_get() -> eyre::Result<ByondValue> {
 	let session = session
 		.as_mut()
 		.ok_or_else(|| eyre::eyre!("Dogmos IPC benchmark session is not running"))?;
-	let response = session.request(OperationKind::ScalarGet, &[0; 8], 8)?;
-	Ok(scalar_response_value(&response, response.len())?.into())
+	session.request_with_response(OperationKind::ScalarGet, &[0; 8], 8, |response| {
+		Ok(scalar_response_value(response, response.len())?.into())
+	})
 }
 
 #[cfg(feature = "diagnostic-bindings")]
@@ -1871,18 +1919,20 @@ fn dogmos_ipc_benchmark_snapshot() -> eyre::Result<ByondValue> {
 		},
 	}
 	.encode();
-	let response = session.request(
+	session.request_with_response(
 		OperationKind::MixtureSnapshot,
 		&request,
 		MIXTURE_SNAPSHOT_LEN,
-	)?;
-	if response.len() != MIXTURE_SNAPSHOT_LEN {
-		return Err(eyre::eyre!(
-			"Dogmos snapshot response was {} bytes, expected {MIXTURE_SNAPSHOT_LEN}",
-			response.len(),
-		));
-	}
-	Ok((MixtureSnapshot::decode(&response)?.gas_count as f32).into())
+		|response| {
+			if response.len() != MIXTURE_SNAPSHOT_LEN {
+				return Err(eyre::eyre!(
+					"Dogmos snapshot response was {} bytes, expected {MIXTURE_SNAPSHOT_LEN}",
+					response.len(),
+				));
+			}
+			Ok((MixtureSnapshot::decode(response)?.gas_count as f32).into())
+		},
+	)
 }
 
 #[cfg(feature = "diagnostic-bindings")]
@@ -1923,18 +1973,20 @@ fn dogmos_ipc_benchmark_simulation_stage() -> eyre::Result<ByondValue> {
 	let session = session
 		.as_mut()
 		.ok_or_else(|| eyre::eyre!("Dogmos IPC benchmark session is not running"))?;
-	let response = session.request(
+	session.request_with_response(
 		OperationKind::SimulationStage,
 		&request,
 		SIMULATION_STAGE_RESPONSE_LEN,
-	)?;
-	if response.len() != SIMULATION_STAGE_RESPONSE_LEN {
-		return Err(eyre::eyre!(
-			"Dogmos stage response was {} bytes, expected {SIMULATION_STAGE_RESPONSE_LEN}",
-			response.len(),
-		));
-	}
-	Ok((SimulationStageResponse::decode(&response)?.work_items as f32).into())
+		|response| {
+			if response.len() != SIMULATION_STAGE_RESPONSE_LEN {
+				return Err(eyre::eyre!(
+					"Dogmos stage response was {} bytes, expected {SIMULATION_STAGE_RESPONSE_LEN}",
+					response.len(),
+				));
+			}
+			Ok((SimulationStageResponse::decode(response)?.work_items as f32).into())
+		},
+	)
 }
 
 #[cfg(feature = "diagnostic-bindings")]
@@ -1952,14 +2004,22 @@ fn dogmos_ipc_benchmark_callback_enqueue(count: ByondValue) -> eyre::Result<Byon
 	let session = session
 		.as_mut()
 		.ok_or_else(|| eyre::eyre!("Dogmos IPC benchmark session is not running"))?;
-	match session.request(OperationKind::DiagnosticCallbackEnqueue, &request, 4) {
-		Ok(response) if response.len() == 4 => {
-			Ok((u32::from_le_bytes(response.try_into().unwrap()) as f32).into())
-		}
-		Ok(response) => Err(eyre::eyre!(
-			"Dogmos callback enqueue response was {} bytes, expected 4",
-			response.len(),
-		)),
+	match session.request_with_response(
+		OperationKind::DiagnosticCallbackEnqueue,
+		&request,
+		4,
+		|response| {
+			Ok::<_, ClientError>(if response.len() == 4 {
+				Ok((u32::from_le_bytes(response.try_into().unwrap()) as f32).into())
+			} else {
+				Err(eyre::eyre!(
+					"Dogmos callback enqueue response was {} bytes, expected 4",
+					response.len(),
+				))
+			})
+		},
+	) {
+		Ok(result) => result,
 		Err(ClientError::Server(ServiceErrorCode::CallbackBackpressure)) => Ok((-1.0_f32).into()),
 		Err(error) => Err(error.into()),
 	}
@@ -1980,11 +2040,16 @@ fn dogmos_ipc_benchmark_callback_drain(max_events: ByondValue) -> eyre::Result<B
 	let session = session
 		.as_mut()
 		.ok_or_else(|| eyre::eyre!("Dogmos IPC benchmark session is not running"))?;
-	let response = session.request(
+	session.request_with_response(
 		OperationKind::CallbackBatch,
 		&request,
 		BENCHMARK_CONTROL_PAYLOAD,
-	)?;
+		decode_benchmark_callback_drain,
+	)
+}
+
+#[cfg(feature = "diagnostic-bindings")]
+fn decode_benchmark_callback_drain(response: &[u8]) -> eyre::Result<ByondValue> {
 	let response_len = response.len();
 	if response_len < CALLBACK_BATCH_HEADER_LEN {
 		return Err(eyre::eyre!(
@@ -2011,19 +2076,19 @@ fn dogmos_ipc_benchmark_callback_drain(max_events: ByondValue) -> eyre::Result<B
 	{
 		let event = CallbackEvent::decode(event_bytes)?;
 		if index == 0 {
-			first_sequence = event.sequence;
+			first_sequence = event.scope_sequence;
 		} else {
 			let expected = last_sequence.checked_add(1).ok_or_else(|| {
 				eyre::eyre!("Dogmos callback sequence overflowed after {last_sequence}")
 			})?;
-			if event.sequence != expected {
+			if event.scope_sequence != expected {
 				return Err(eyre::eyre!(
 					"Dogmos callback sequence skipped from {last_sequence} to {}",
-					event.sequence
+					event.scope_sequence
 				));
 			}
 		}
-		last_sequence = event.sequence;
+		last_sequence = event.scope_sequence;
 	}
 	let summary: ByondValue = format!(
 		"{},{},{},{},{},{},{}",
@@ -2047,14 +2112,15 @@ fn benchmark_counted_command(operation: OperationKind, request: &[u8]) -> eyre::
 	let session = session
 		.as_mut()
 		.ok_or_else(|| eyre::eyre!("Dogmos IPC benchmark session is not running"))?;
-	let response = session.request(operation, request, 4)?;
-	if response.len() != 4 {
-		return Err(eyre::eyre!(
-			"Dogmos counted response was {} bytes, expected 4",
-			response.len(),
-		));
-	}
-	Ok((u32::from_le_bytes(response.try_into().unwrap()) as f32).into())
+	session.request_with_response(operation, request, 4, |response| {
+		if response.len() != 4 {
+			return Err(eyre::eyre!(
+				"Dogmos counted response was {} bytes, expected 4",
+				response.len(),
+			));
+		}
+		Ok((u32::from_le_bytes(response.try_into().unwrap()) as f32).into())
+	})
 }
 
 #[cfg(feature = "diagnostic-bindings")]
@@ -2148,14 +2214,20 @@ fn dogmos_ipc_benchmark_allocate(bytes: ByondValue) -> eyre::Result<ByondValue> 
 	let session = session
 		.as_mut()
 		.ok_or_else(|| eyre::eyre!("Dogmos IPC benchmark session is not running"))?;
-	let response = session.request(OperationKind::AllocateDiagnostic, &bytes.to_le_bytes(), 8)?;
-	let response: [u8; 8] = response.try_into().map_err(|response: Vec<u8>| {
-		eyre::eyre!(
-			"Dogmos allocation response was {} bytes, expected 8",
-			response.len(),
-		)
-	})?;
-	Ok((u64::from_le_bytes(response) as f32).into())
+	session.request_with_response(
+		OperationKind::AllocateDiagnostic,
+		&bytes.to_le_bytes(),
+		8,
+		|response| {
+			let response: [u8; 8] = response.try_into().map_err(|_| {
+				eyre::eyre!(
+					"Dogmos allocation response was {} bytes, expected 8",
+					response.len(),
+				)
+			})?;
+			Ok((u64::from_le_bytes(response) as f32).into())
+		},
+	)
 }
 
 #[cfg(feature = "diagnostic-bindings")]
@@ -2167,7 +2239,12 @@ fn dogmos_ipc_benchmark_stop() -> eyre::Result<ByondValue> {
 	let mut active = session
 		.take()
 		.ok_or_else(|| eyre::eyre!("Dogmos IPC benchmark session is not running"))?;
-	active.request(OperationKind::AllocateDiagnostic, &0_u64.to_le_bytes(), 8)?;
+	active.request_with_response(
+		OperationKind::AllocateDiagnostic,
+		&0_u64.to_le_bytes(),
+		8,
+		|_| Ok::<(), eyre::Report>(()),
+	)?;
 	active.shutdown()?;
 	Ok(true.into())
 }

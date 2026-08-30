@@ -186,7 +186,7 @@ git commit -m "test: restore legal IPC performance workloads"
 
 ### Task 3: Correct workset telemetry and add allocation-count evidence
 
-**Status:** Complete; commit boundary pending.
+**Status:** Complete in `b1f88c5`.
 
 **Files:**
 - Modify: `crates/dogmos-core/src/world.rs`
@@ -240,6 +240,9 @@ git commit -m "test: measure core stage allocation churn"
 ```
 
 ### Task 4: Remove the per-response 32-bit shim allocation
+
+**Status:** Source and i686 gates complete; paired DreamDaemon candidate capture remains an external
+game-repository acceptance gate under the global constraints.
 
 **Files:**
 - Modify: `crates/dogmos-byond/src/session.rs`

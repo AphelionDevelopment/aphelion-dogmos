@@ -22,28 +22,37 @@ pub(crate) struct ServiceSession {
 }
 
 impl ServiceSession {
-	pub(crate) fn request(
+	pub(crate) fn request_with_response<T, E>(
 		&mut self,
 		operation: OperationKind,
 		payload: &[u8],
 		response_capacity: usize,
-	) -> Result<Vec<u8>, ClientError> {
-		let result = self
-			.client
-			.round_trip(
-				operation,
-				payload,
-				response_capacity,
-				BENCHMARK_REQUEST_TIMEOUT,
-			)
-			.map(<[u8]>::to_vec);
-		if matches!(
-			result,
-			Err(ClientError::RequestTimeout | ClientError::WorkerStopped)
+		decode: impl FnOnce(&[u8]) -> Result<T, E>,
+	) -> Result<T, E>
+	where
+		E: From<ClientError>,
+	{
+		match self.client.round_trip(
+			operation,
+			payload,
+			response_capacity,
+			BENCHMARK_REQUEST_TIMEOUT,
 		) {
-			self.terminate_service();
+			Ok(response) => decode(response),
+			Err(error @ (ClientError::RequestTimeout | ClientError::WorkerStopped)) => {
+				self.terminate_service();
+				Err(error.into())
+			}
+			Err(error) => Err(error.into()),
 		}
-		result
+	}
+
+	pub(crate) fn request_without_response(
+		&mut self,
+		operation: OperationKind,
+		payload: &[u8],
+	) -> Result<(), ClientError> {
+		self.request_with_response(operation, payload, 0, |_| Ok(()))
 	}
 
 	fn terminate_service(&mut self) {
@@ -68,7 +77,7 @@ impl ServiceSession {
 	}
 
 	pub(crate) fn shutdown(&mut self) -> eyre::Result<()> {
-		self.request(OperationKind::Shutdown, &[], 0)?;
+		self.request_without_response(OperationKind::Shutdown, &[])?;
 		if !self.service.wait()?.success() {
 			self.reaped = true;
 			return Err(eyre::eyre!("dogmosd did not shut down cleanly"));
