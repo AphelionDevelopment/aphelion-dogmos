@@ -33,7 +33,7 @@ try {
 		$statusPath = Join-Path $outputDirectory "ipc-round-trip-$run.status.json"
 		Remove-Item -LiteralPath $outputPath, $memoryPath, $statusPath -Force -ErrorAction SilentlyContinue
 		'role,process_id,private_bytes,virtual_bytes,working_set_bytes' | Set-Content -LiteralPath $memoryPath
-		& cargo "+$rustToolchain" bench -p dogmos-perf --bench ipc_round_trip --target $shimTarget --locked --offline 2>&1 |
+		& cargo "+$rustToolchain" bench -p dogmos-perf --bench ipc_round_trip --features ipc-benchmark --target $shimTarget --locked --offline 2>&1 |
 			Tee-Object -FilePath $outputPath |
 			ForEach-Object {
 				Write-Output $_

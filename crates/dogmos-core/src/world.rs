@@ -591,6 +591,8 @@ struct StageDiffusionState {
 	next_node: usize,
 }
 
+type HeatEdge = (u32, u32, f32, f32);
+
 struct StageHeatState {
 	nodes: Vec<(TurfHandle, TurfHeatState, Option<MixtureHandle>)>,
 	index_by_slot: BTreeMap<u32, u32>,
@@ -606,7 +608,7 @@ struct StageHeatState {
 	/// (first slot, second slot, first's unscaled weight, second's unscaled weight) - the weights
 	/// are computed once at discovery (see advance_stage_heat_topology()) since they don't change
 	/// across conduction substeps.
-	edges: Vec<(u32, u32, f32, f32)>,
+	edges: Vec<HeatEdge>,
 	row_sums: Vec<f32>,
 	conduction_substeps: Option<u32>,
 	conduction_substep: u32,
@@ -880,35 +882,54 @@ impl DogmosWorld {
 		})
 	}
 
+	/// Returns a lower bound for active reusable vector capacity in bytes.
+	///
+	/// The value excludes maps, sets, and allocator metadata. Per-stage state contributes only
+	/// while that stage is active because committed stages currently drop their state.
 	pub fn reusable_workset_bytes(&self) -> u64 {
-		let mut bytes = self.input.capacity() * std::mem::size_of::<f32>()
+		let mut active_vec_capacity_bytes_lower_bound = self.input.capacity()
+			* std::mem::size_of::<f32>()
 			+ self.output.capacity() * std::mem::size_of::<f32>()
 			+ self.events.capacity() * std::mem::size_of::<WorldEvent>();
 		if let Some(state) = &self.stage_diffusion {
-			bytes += state.turfs.capacity() * std::mem::size_of::<TurfHandle>();
-			bytes += state.mixtures.capacity() * std::mem::size_of::<MixtureHandle>();
-			bytes += state.input.capacity() * std::mem::size_of::<[f32; MAX_GAS_SLOTS]>();
-			bytes += state.output.capacity() * std::mem::size_of::<[f32; MAX_GAS_SLOTS]>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.turfs.capacity() * std::mem::size_of::<TurfHandle>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.mixtures.capacity() * std::mem::size_of::<MixtureHandle>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.input.capacity() * std::mem::size_of::<[f32; MAX_GAS_SLOTS]>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.output.capacity() * std::mem::size_of::<[f32; MAX_GAS_SLOTS]>();
 		}
 		if let Some(state) = &self.stage_heat {
-			bytes += state.nodes.capacity()
+			active_vec_capacity_bytes_lower_bound += state.nodes.capacity()
 				* std::mem::size_of::<(TurfHandle, TurfHeatState, Option<MixtureHandle>)>();
-			bytes += state.temperatures.capacity() * std::mem::size_of::<f32>();
-			bytes += state.conductivities.capacity() * std::mem::size_of::<f32>();
-			bytes += state.heat_capacities.capacity() * std::mem::size_of::<f32>();
-			bytes += state.edges.capacity() * std::mem::size_of::<(u32, u32)>();
-			bytes += state.row_sums.capacity() * std::mem::size_of::<f32>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.temperatures.capacity() * std::mem::size_of::<f32>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.conductivities.capacity() * std::mem::size_of::<f32>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.heat_capacities.capacity() * std::mem::size_of::<f32>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.edges.capacity() * std::mem::size_of::<HeatEdge>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.row_sums.capacity() * std::mem::size_of::<f32>();
 		}
 		if let Some(state) = &self.stage_reactions {
-			bytes += state.targets.capacity() * std::mem::size_of::<(TurfHandle, MixtureHandle)>();
-			bytes += state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.targets.capacity() * std::mem::size_of::<(TurfHandle, MixtureHandle)>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
 		}
 		if let Some(state) = &self.stage_components {
-			bytes += state.targets.capacity() * std::mem::size_of::<TurfHandle>();
-			bytes += state.queue.capacity() * std::mem::size_of::<TurfHandle>();
-			bytes += state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.targets.capacity() * std::mem::size_of::<TurfHandle>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.queue.capacity() * std::mem::size_of::<TurfHandle>();
+			active_vec_capacity_bytes_lower_bound +=
+				state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
 		}
-		bytes as u64
+		active_vec_capacity_bytes_lower_bound as u64
 	}
 
 	pub fn install_gases(&mut self, gases: Vec<GasMetadata>) -> Result<u32, WorldError> {
@@ -5415,5 +5436,20 @@ mod tests {
 		);
 		assert_eq!(world.snapshot(handle(0)).unwrap().revision, u32::MAX);
 		assert_eq!(world.snapshot(handle(1)).unwrap().revision, 7);
+	}
+
+	#[test]
+	fn reusable_workset_counts_the_complete_heat_edge_tuple_capacity() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		world.stage_heat = Some(StageHeatState::new());
+		let before = world.reusable_workset_bytes();
+		let state = world.stage_heat.as_mut().unwrap();
+		state.edges.push((0, 1, 0.25, 0.5));
+		let expected_edge_bytes = state.edges.capacity() * std::mem::size_of::<HeatEdge>();
+
+		assert_eq!(
+			world.reusable_workset_bytes() - before,
+			expected_edge_bytes as u64
+		);
 	}
 }

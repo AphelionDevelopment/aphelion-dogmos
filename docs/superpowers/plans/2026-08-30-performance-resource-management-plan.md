@@ -44,6 +44,8 @@
 
 ### Task 1: Restore protocol, generated-binding, and i686 baseline gates
 
+**Status:** Complete in `7e7b513`.
+
 **Files:**
 - Modify: `tools/tests/test_dogmos_contract.py`
 - Modify by generator: `crates/dogmos-byond/bindings.dm`
@@ -116,6 +118,8 @@ git commit -m "fix: restore protocol 10 contract gates"
 
 ### Task 2: Repair and separate IPC transport and service-compute benchmarks
 
+**Status:** Complete in `df35f9a`.
+
 **Files:**
 - Modify: `crates/dogmos-perf/benches/ipc_round_trip.rs`
 - Modify: `tools/benchmark_ipc.ps1`
@@ -182,9 +186,12 @@ git commit -m "test: restore legal IPC performance workloads"
 
 ### Task 3: Correct workset telemetry and add allocation-count evidence
 
+**Status:** Complete; commit boundary pending.
+
 **Files:**
 - Modify: `crates/dogmos-core/src/world.rs`
 - Test: `crates/dogmos-core/tests/frontier_processing.rs`
+- Modify: `crates/dogmos-perf/Cargo.toml`
 - Create: `crates/dogmos-perf/examples/core_stage_allocations.rs`
 - Modify: `docs/performance/README.md`
 

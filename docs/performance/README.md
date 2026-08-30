@@ -17,3 +17,32 @@ DreamMaker source discovery and Tracy capture must go through Meridian-MCP after
 
 The live workload profiles require explicit in-game markers. A profile is not accepted merely
 because DreamDaemon remained alive: every listed marker and correctness assertion must be recorded.
+
+## Core stage allocation probe
+
+Run the native core-only allocation probe in a fresh process:
+
+```powershell
+cargo +1.98.0 run --release --locked -p dogmos-perf --example core_stage_allocations -- --output "tmp/dogmos-perf/core-control.csv"
+```
+
+The probe constructs corridor, grid, and three-layer multiz fixtures at 1,000, 10,000, and 100,000
+turfs. It resets an atomic `System` allocator wrapper after each fixture is built and measures one
+complete process-turfs, turf-heat, equalize, or excited-groups stage. The CSV reports allocations,
+deallocations, allocated and deallocated bytes, charged work items, a final-state and ordered-event
+transcript hash, and the active reusable-vector capacity lower bound. Allocation counts rank
+allocation-removal work; they are not wall-time acceptance evidence.
+
+`reusable_workset_bytes` is a lower bound over active vector capacities. It includes the complete
+four-field heat-edge tuple and excludes maps, sets, and allocator metadata. Stage-owned state is
+dropped when that stage commits; retained event capacity can remain visible until events are
+drained.
+
+Three fresh release processes on 2026-08-30 produced byte-identical 36-row controls with SHA-256
+`9C28A0C6D019941F66237EB99B221DCF8BA9C29D2E68852829938C1B520EFE30`. At 100,000 turfs,
+process-turfs made 133,396 allocations and allocated 79,892,176 bytes for every topology.
+Turf-heat made 133,425-133,428 allocations and allocated 24,949,008-29,142,704 bytes. Equalize was
+the largest byte allocator at 197,006,624-198,765,028 bytes and 264,873-269,491 allocations;
+excited-groups made 330,967-359,948 allocations and allocated 157,116,200-158,375,520 bytes. These
+controls prioritize component traversal and per-turf diffusion churn while preserving distinct
+transcript hashes for each topology and stage.

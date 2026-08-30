@@ -3,14 +3,18 @@ name = "dogmos-perf"
 version = "2.3.0"
 edition = "2021"
 
+[features]
+ipc-benchmark = ["dep:dogmos-byond"]
+
 [dependencies]
+dogmos-byond = { path = "../dogmos-byond", optional = true }
 dogmos-core = { path = "../dogmos-core" }
 dogmos-protocol = { path = "../dogmos-protocol" }
 
 [dev-dependencies]
-dogmos-byond = { path = "../dogmos-byond" }
 dogmos-identity = { path = "../dogmos-identity" }
 
 [[bench]]
 name = "ipc_round_trip"
 harness = false
+required-features = ["ipc-benchmark"]
