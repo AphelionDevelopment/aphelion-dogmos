@@ -310,6 +310,9 @@ git commit -m "perf: decode service responses from retained buffers"
 
 ### Task 5: Make shim validation context lazy and pre-size fixed batches
 
+**Status:** Source and i686 gates complete; paired DreamDaemon allocation/private-byte comparison
+remains an external game-repository acceptance gate under the global constraints.
+
 **Files:**
 - Modify: `crates/dogmos-byond/src/lib.rs`
 - Test: existing `crates/dogmos-byond/src/lib.rs` tests

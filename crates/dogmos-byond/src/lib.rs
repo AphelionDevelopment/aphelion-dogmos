@@ -30,12 +30,12 @@ use dogmos_protocol::{
 	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
 	WireGasFireRole, WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution,
 	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
-	GAS_METADATA_RECORD_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_ADJUSTMENT_LEN,
-	MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN,
-	MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, REACTION_METADATA_RECORD_LEN,
-	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN,
-	TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN,
-	TURF_LIFECYCLE_MUTATION_LEN,
+	GAS_METADATA_RECORD_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS,
+	MIXTURE_ADJUSTMENT_LEN, MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN,
+	MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN,
+	REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN,
+	TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
 };
 use std::{fs, path::Path, sync::Mutex, time::Duration};
 
@@ -692,11 +692,15 @@ pub fn decode_production_continuation_token(fields: &[f32]) -> eyre::Result<Cont
 			"continuation token requires exactly {PRODUCTION_CONTINUATION_TOKEN_FIELDS} fields"
 		));
 	}
-	let words = fields
-		.iter()
-		.enumerate()
-		.map(|(index, value)| exact_u16(*value, &format!("continuation token word {index}")))
-		.collect::<eyre::Result<Vec<_>>>()?;
+	let labels = [
+		"word 0", "word 1", "word 2", "word 3", "word 4", "word 5", "word 6", "word 7", "word 8",
+		"word 9",
+	];
+	let mut words = [0_u16; PRODUCTION_CONTINUATION_TOKEN_FIELDS];
+	for (index, value) in fields.iter().enumerate() {
+		words[index] = exact_u16(*value, labels[index])
+			.map_err(|error| eyre::eyre!("continuation token {error}"))?;
+	}
 	let token = ContinuationToken {
 		world_generation: join_u32_words(words[0], words[1]),
 		id: join_u64_words(words[2..6].try_into().unwrap()),
@@ -937,20 +941,19 @@ pub fn encode_production_mixture_state_batch(values: &[f32]) -> eyre::Result<Vec
 			}
 			Ok(MixtureStateMutation {
 				handle: WireHandle {
-					slot: exact_u32(entry[0], &format!("mixture state entry {index} slot"))?,
-					generation: exact_u32(
-						entry[1],
-						&format!("mixture state entry {index} generation"),
-					)?,
+					slot: indexed(exact_u32(entry[0], "slot"), "mixture state", index)?,
+					generation: indexed(exact_u32(entry[1], "generation"), "mixture state", index)?,
 				},
 				expected_revision: join_u32_words(
-					exact_u16(
-						entry[2],
-						&format!("mixture state entry {index} revision low word"),
+					indexed(
+						exact_u16(entry[2], "revision low word"),
+						"mixture state",
+						index,
 					)?,
-					exact_u16(
-						entry[3],
-						&format!("mixture state entry {index} revision high word"),
+					indexed(
+						exact_u16(entry[3], "revision high word"),
+						"mixture state",
+						index,
 					)?,
 				),
 				temperature: ScalarValue(f64::from(entry[4])),
@@ -959,8 +962,14 @@ pub fn encode_production_mixture_state_batch(values: &[f32]) -> eyre::Result<Vec
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::new();
+	let capacity = fixed_batch_capacity(
+		mutations.len(),
+		MIXTURE_STATE_MUTATION_LEN,
+		"mixture state batch",
+	)?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_mixture_state_batch(&mutations, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -1026,8 +1035,7 @@ pub fn encode_production_gas_metadata(
 		.iter()
 		.enumerate()
 	{
-		let owner =
-			exact_u32(entry[0], &format!("gas product entry {index} owner index"))? as usize;
+		let owner = indexed(exact_u32(entry[0], "owner index"), "gas product", index)? as usize;
 		let owner_products = products
 			.get_mut(owner)
 			.ok_or_else(|| eyre::eyre!("gas product entry {index} owner index is out of range"))?;
@@ -1037,7 +1045,7 @@ pub fn encode_production_gas_metadata(
 			));
 		}
 		owner_products.push(WireGasProduct {
-			gas_id: exact_u16(entry[1], &format!("gas product entry {index} gas id"))?,
+			gas_id: indexed(exact_u16(entry[1], "gas id"), "gas product", index)?,
 			ratio: ScalarValue(f64::from(entry[2])),
 		});
 	}
@@ -1047,58 +1055,59 @@ pub fn encode_production_gas_metadata(
 		.iter()
 		.enumerate()
 		.map(|(index, fields)| {
-			let moles_visible_present = exact_bool(
-				fields[5],
-				&format!("gas metadata entry {index} moles-visible flag"),
+			let moles_visible_present = indexed(
+				exact_bool(fields[5], "moles-visible flag"),
+				"gas metadata",
+				index,
 			)?;
 			if !moles_visible_present && fields[6] != 0.0 {
 				return Err(eyre::eyre!(
 					"gas metadata entry {index} has moles-visible data while the flag is false"
 				));
 			}
-			let fire_role =
-				match exact_u32(fields[9], &format!("gas metadata entry {index} fire role"))? {
-					0 if fields[10] == 0.0 && fields[11] == 0.0 => WireGasFireRole::None,
-					0 => {
-						return Err(eyre::eyre!(
-							"gas metadata entry {index} has fire-role values for role none"
-						));
-					}
-					1 => WireGasFireRole::Oxidizer {
-						minimum_temperature: ScalarValue(f64::from(fields[10])),
-						power: ScalarValue(f64::from(fields[11])),
-					},
-					2 => WireGasFireRole::Fuel {
-						minimum_temperature: ScalarValue(f64::from(fields[10])),
-						burn_rate: ScalarValue(f64::from(fields[11])),
-					},
-					actual => return Err(eyre::eyre!("unknown gas fire role {actual}")),
-				};
-			let fire_products = match exact_u32(
-				fields[12],
-				&format!("gas metadata entry {index} product kind"),
-			)? {
-				0 if products[index].is_empty() => None,
-				1 => Some(WireFireProducts::Generic(products[index].clone())),
-				2 if products[index].is_empty() => Some(WireFireProducts::Plasma),
-				actual => {
+			let fire_role = match indexed(exact_u32(fields[9], "fire role"), "gas metadata", index)?
+			{
+				0 if fields[10] == 0.0 && fields[11] == 0.0 => WireGasFireRole::None,
+				0 => {
 					return Err(eyre::eyre!(
-						"gas metadata entry {index} has invalid product kind or unexpected product records: {actual}"
+						"gas metadata entry {index} has fire-role values for role none"
 					));
 				}
+				1 => WireGasFireRole::Oxidizer {
+					minimum_temperature: ScalarValue(f64::from(fields[10])),
+					power: ScalarValue(f64::from(fields[11])),
+				},
+				2 => WireGasFireRole::Fuel {
+					minimum_temperature: ScalarValue(f64::from(fields[10])),
+					burn_rate: ScalarValue(f64::from(fields[11])),
+				},
+				actual => return Err(eyre::eyre!("unknown gas fire role {actual}")),
 			};
+			let fire_products =
+				match indexed(exact_u32(fields[12], "product kind"), "gas metadata", index)? {
+					0 if products[index].is_empty() => None,
+					1 => Some(WireFireProducts::Generic(products[index].clone())),
+					2 if products[index].is_empty() => Some(WireFireProducts::Plasma),
+					actual => {
+						return Err(eyre::eyre!(
+						"gas metadata entry {index} has invalid product kind or unexpected product records: {actual}"
+					));
+					}
+				};
 			Ok(GasMetadataRegistration {
-				id: exact_u16(fields[0], &format!("gas metadata entry {index} id"))?,
+				id: indexed(exact_u16(fields[0], "id"), "gas metadata", index)?,
 				key: keys[index].clone(),
 				name: names[index].clone(),
 				flags: join_u32_words(
-					exact_u16(
-						fields[1],
-						&format!("gas metadata entry {index} flags low word"),
+					indexed(
+						exact_u16(fields[1], "flags low word"),
+						"gas metadata",
+						index,
 					)?,
-					exact_u16(
-						fields[2],
-						&format!("gas metadata entry {index} flags high word"),
+					indexed(
+						exact_u16(fields[2], "flags high word"),
+						"gas metadata",
+						index,
 					)?,
 				),
 				specific_heat: ScalarValue(f64::from(fields[3])),
@@ -1111,8 +1120,11 @@ pub fn encode_production_gas_metadata(
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::with_capacity(4 + entries.len() * GAS_METADATA_RECORD_LEN);
+	let capacity =
+		fixed_batch_capacity(entries.len(), GAS_METADATA_RECORD_LEN, "gas metadata batch")?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_gas_metadata_batch(&entries, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -1183,9 +1195,10 @@ pub fn encode_production_reaction_metadata(
 		.iter()
 		.enumerate()
 	{
-		let owner = exact_u32(
-			entry[0],
-			&format!("reaction requirement entry {index} owner index"),
+		let owner = indexed(
+			exact_u32(entry[0], "owner index"),
+			"reaction requirement",
+			index,
 		)? as usize;
 		let owner_requirements = requirements.get_mut(owner).ok_or_else(|| {
 			eyre::eyre!("reaction requirement entry {index} owner index is out of range")
@@ -1196,10 +1209,7 @@ pub fn encode_production_reaction_metadata(
 			));
 		}
 		owner_requirements.push(WireGasRequirement {
-			gas_id: exact_u16(
-				entry[1],
-				&format!("reaction requirement entry {index} gas id"),
-			)?,
+			gas_id: indexed(exact_u16(entry[1], "gas id"), "reaction requirement", index)?,
 			minimum_moles: ScalarValue(f64::from(entry[2])),
 		});
 	}
@@ -1209,9 +1219,10 @@ pub fn encode_production_reaction_metadata(
 		.iter()
 		.enumerate()
 		.map(|(index, fields)| {
-			let execution = match exact_u32(
-				fields[2],
-				&format!("reaction metadata entry {index} execution"),
+			let execution = match indexed(
+				exact_u32(fields[2], "execution"),
+				"reaction metadata",
+				index,
 			)? {
 				0 => WireReactionExecution::Dm,
 				1 => WireReactionExecution::NativePlasma,
@@ -1229,44 +1240,52 @@ pub fn encode_production_reaction_metadata(
 			};
 			Ok(ReactionMetadataRegistration {
 				id: join_u32_words(
-					exact_u16(
-						fields[0],
-						&format!("reaction metadata entry {index} id low word"),
+					indexed(
+						exact_u16(fields[0], "id low word"),
+						"reaction metadata",
+						index,
 					)?,
-					exact_u16(
-						fields[1],
-						&format!("reaction metadata entry {index} id high word"),
+					indexed(
+						exact_u16(fields[1], "id high word"),
+						"reaction metadata",
+						index,
 					)?,
 				),
 				key: keys[index].clone(),
 				priority: ScalarValue(f64::from(fields[3])),
-				minimum_temperature: option(
-					fields[4],
-					fields[5],
-					&format!("reaction metadata entry {index} minimum-temperature"),
+				minimum_temperature: indexed(
+					option(fields[4], fields[5], "minimum-temperature"),
+					"reaction metadata",
+					index,
 				)?,
-				maximum_temperature: option(
-					fields[6],
-					fields[7],
-					&format!("reaction metadata entry {index} maximum-temperature"),
+				maximum_temperature: indexed(
+					option(fields[6], fields[7], "maximum-temperature"),
+					"reaction metadata",
+					index,
 				)?,
-				minimum_energy: option(
-					fields[8],
-					fields[9],
-					&format!("reaction metadata entry {index} minimum-energy"),
+				minimum_energy: indexed(
+					option(fields[8], fields[9], "minimum-energy"),
+					"reaction metadata",
+					index,
 				)?,
-				minimum_fire_reagents: option(
-					fields[10],
-					fields[11],
-					&format!("reaction metadata entry {index} minimum-fire-reagents"),
+				minimum_fire_reagents: indexed(
+					option(fields[10], fields[11], "minimum-fire-reagents"),
+					"reaction metadata",
+					index,
 				)?,
 				gas_requirements: requirements[index].clone(),
 				execution,
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::with_capacity(4 + entries.len() * REACTION_METADATA_RECORD_LEN);
+	let capacity = fixed_batch_capacity(
+		entries.len(),
+		REACTION_METADATA_RECORD_LEN,
+		"reaction metadata batch",
+	)?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_reaction_metadata_batch(&entries, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -1299,22 +1318,22 @@ pub fn encode_production_turf_lifecycle_batch(values: &[f32]) -> eyre::Result<Ve
 		.iter()
 		.enumerate()
 		.map(|(index, entry)| {
-			let action = LifecycleAction::try_from(exact_u32(
-				entry[0],
-				&format!("turf lifecycle entry {index} action"),
+			let action = LifecycleAction::try_from(indexed(
+				exact_u32(entry[0], "action"),
+				"turf lifecycle",
+				index,
 			)?)?;
-			let mixture_present = exact_bool(
-				entry[3],
-				&format!("turf lifecycle entry {index} mixture-present flag"),
+			let mixture_present = indexed(
+				exact_bool(entry[3], "mixture-present flag"),
+				"turf lifecycle",
+				index,
 			)?;
 			let mixture = WireHandle {
-				slot: exact_u32(
-					entry[4],
-					&format!("turf lifecycle entry {index} mixture slot"),
-				)?,
-				generation: exact_u32(
-					entry[5],
-					&format!("turf lifecycle entry {index} mixture generation"),
+				slot: indexed(exact_u32(entry[4], "mixture slot"), "turf lifecycle", index)?,
+				generation: indexed(
+					exact_u32(entry[5], "mixture generation"),
+					"turf lifecycle",
+					index,
 				)?,
 			};
 			if !mixture_present
@@ -1330,18 +1349,25 @@ pub fn encode_production_turf_lifecycle_batch(values: &[f32]) -> eyre::Result<Ve
 			Ok(TurfLifecycleMutation {
 				action,
 				turf: WireHandle {
-					slot: exact_u32(entry[1], &format!("turf lifecycle entry {index} slot"))?,
-					generation: exact_u32(
-						entry[2],
-						&format!("turf lifecycle entry {index} generation"),
+					slot: indexed(exact_u32(entry[1], "slot"), "turf lifecycle", index)?,
+					generation: indexed(
+						exact_u32(entry[2], "generation"),
+						"turf lifecycle",
+						index,
 					)?,
 				},
 				mixture: mixture_present.then_some(mixture),
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::new();
+	let capacity = fixed_batch_capacity(
+		mutations.len(),
+		TURF_LIFECYCLE_MUTATION_LEN,
+		"turf lifecycle batch",
+	)?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_turf_lifecycle_batch(&mutations, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -1376,35 +1402,42 @@ pub fn encode_production_turf_adjacency_batch(values: &[f32]) -> eyre::Result<Ve
 		.map(|(index, entry)| {
 			Ok(TurfAdjacencyMutation {
 				left: WireHandle {
-					slot: exact_u32(entry[0], &format!("turf adjacency entry {index} left slot"))?,
-					generation: exact_u32(
-						entry[1],
-						&format!("turf adjacency entry {index} left generation"),
+					slot: indexed(exact_u32(entry[0], "left slot"), "turf adjacency", index)?,
+					generation: indexed(
+						exact_u32(entry[1], "left generation"),
+						"turf adjacency",
+						index,
 					)?,
 				},
 				right: WireHandle {
-					slot: exact_u32(
-						entry[2],
-						&format!("turf adjacency entry {index} right slot"),
-					)?,
-					generation: exact_u32(
-						entry[3],
-						&format!("turf adjacency entry {index} right generation"),
+					slot: indexed(exact_u32(entry[2], "right slot"), "turf adjacency", index)?,
+					generation: indexed(
+						exact_u32(entry[3], "right generation"),
+						"turf adjacency",
+						index,
 					)?,
 				},
-				connected: exact_bool(
-					entry[4],
-					&format!("turf adjacency entry {index} connected flag"),
+				connected: indexed(
+					exact_bool(entry[4], "connected flag"),
+					"turf adjacency",
+					index,
 				)?,
-				firelock: exact_bool(
-					entry[5],
-					&format!("turf adjacency entry {index} firelock flag"),
+				firelock: indexed(
+					exact_bool(entry[5], "firelock flag"),
+					"turf adjacency",
+					index,
 				)?,
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::new();
+	let capacity = fixed_batch_capacity(
+		mutations.len(),
+		TURF_ADJACENCY_MUTATION_LEN,
+		"turf adjacency batch",
+	)?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_turf_adjacency_batch(&mutations, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -1433,13 +1466,15 @@ pub fn encode_production_turf_heat_batch(values: &[f32]) -> eyre::Result<Vec<u8>
 		.iter()
 		.enumerate()
 		.map(|(index, entry)| {
-			let state_present = exact_bool(
-				entry[2],
-				&format!("turf heat entry {index} state-present flag"),
+			let state_present = indexed(
+				exact_bool(entry[2], "state-present flag"),
+				"turf heat",
+				index,
 			)?;
-			let adjacent_to_space = exact_bool(
-				entry[6],
-				&format!("turf heat entry {index} adjacent-to-space flag"),
+			let adjacent_to_space = indexed(
+				exact_bool(entry[6], "adjacent-to-space flag"),
+				"turf heat",
+				index,
 			)?;
 			if !state_present
 				&& (entry[3] != 0.0 || entry[4] != 0.0 || entry[5] != 0.0 || adjacent_to_space)
@@ -1450,11 +1485,8 @@ pub fn encode_production_turf_heat_batch(values: &[f32]) -> eyre::Result<Vec<u8>
 			}
 			Ok(TurfHeatMutation {
 				turf: WireHandle {
-					slot: exact_u32(entry[0], &format!("turf heat entry {index} slot"))?,
-					generation: exact_u32(
-						entry[1],
-						&format!("turf heat entry {index} generation"),
-					)?,
+					slot: indexed(exact_u32(entry[0], "slot"), "turf heat", index)?,
+					generation: indexed(exact_u32(entry[1], "generation"), "turf heat", index)?,
 				},
 				state: state_present.then_some(TurfHeatState {
 					temperature: ScalarValue(f64::from(entry[3])),
@@ -1465,8 +1497,11 @@ pub fn encode_production_turf_heat_batch(values: &[f32]) -> eyre::Result<Vec<u8>
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::new();
+	let capacity =
+		fixed_batch_capacity(mutations.len(), TURF_HEAT_MUTATION_LEN, "turf heat batch")?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_turf_heat_batch(&mutations, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -1547,34 +1582,45 @@ pub fn encode_production_turf_heat_adjacency_batch(values: &[f32]) -> eyre::Resu
 		.map(|(index, entry)| {
 			Ok(TurfHeatAdjacencyMutation {
 				left: WireHandle {
-					slot: exact_u32(
-						entry[0],
-						&format!("turf heat adjacency entry {index} left slot"),
+					slot: indexed(
+						exact_u32(entry[0], "left slot"),
+						"turf heat adjacency",
+						index,
 					)?,
-					generation: exact_u32(
-						entry[1],
-						&format!("turf heat adjacency entry {index} left generation"),
+					generation: indexed(
+						exact_u32(entry[1], "left generation"),
+						"turf heat adjacency",
+						index,
 					)?,
 				},
 				right: WireHandle {
-					slot: exact_u32(
-						entry[2],
-						&format!("turf heat adjacency entry {index} right slot"),
+					slot: indexed(
+						exact_u32(entry[2], "right slot"),
+						"turf heat adjacency",
+						index,
 					)?,
-					generation: exact_u32(
-						entry[3],
-						&format!("turf heat adjacency entry {index} right generation"),
+					generation: indexed(
+						exact_u32(entry[3], "right generation"),
+						"turf heat adjacency",
+						index,
 					)?,
 				},
-				connected: exact_bool(
-					entry[4],
-					&format!("turf heat adjacency entry {index} connected flag"),
+				connected: indexed(
+					exact_bool(entry[4], "connected flag"),
+					"turf heat adjacency",
+					index,
 				)?,
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::new();
+	let capacity = fixed_batch_capacity(
+		mutations.len(),
+		TURF_HEAT_ADJACENCY_MUTATION_LEN,
+		"turf heat adjacency batch",
+	)?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_turf_heat_adjacency_batch(&mutations, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -1650,17 +1696,19 @@ pub fn encode_production_frontier_append(fields: &[f32]) -> eyre::Result<Vec<u8>
 		.map(|(index, words)| {
 			Ok(WireHandle {
 				slot: join_u32_words(
-					exact_u16(words[0], &format!("frontier handle {index} slot word 0"))?,
-					exact_u16(words[1], &format!("frontier handle {index} slot word 1"))?,
+					numbered(exact_u16(words[0], "slot word 0"), "frontier handle", index)?,
+					numbered(exact_u16(words[1], "slot word 1"), "frontier handle", index)?,
 				),
 				generation: join_u32_words(
-					exact_u16(
-						words[2],
-						&format!("frontier handle {index} generation word 0"),
+					numbered(
+						exact_u16(words[2], "generation word 0"),
+						"frontier handle",
+						index,
 					)?,
-					exact_u16(
-						words[3],
-						&format!("frontier handle {index} generation word 1"),
+					numbered(
+						exact_u16(words[3], "generation word 1"),
+						"frontier handle",
+						index,
 					)?,
 				),
 			})
@@ -1733,18 +1781,12 @@ pub fn encode_production_frontier_mutate(fields: &[f32], label: &str) -> eyre::R
 		.map(|(index, words)| {
 			Ok(WireHandle {
 				slot: join_u32_words(
-					exact_u16(words[0], &format!("{label} handle {index} slot word 0"))?,
-					exact_u16(words[1], &format!("{label} handle {index} slot word 1"))?,
+					labeled_handle(exact_u16(words[0], "slot word 0"), label, index)?,
+					labeled_handle(exact_u16(words[1], "slot word 1"), label, index)?,
 				),
 				generation: join_u32_words(
-					exact_u16(
-						words[2],
-						&format!("{label} handle {index} generation word 0"),
-					)?,
-					exact_u16(
-						words[3],
-						&format!("{label} handle {index} generation word 1"),
-					)?,
+					labeled_handle(exact_u16(words[2], "generation word 0"), label, index)?,
+					labeled_handle(exact_u16(words[3], "generation word 1"), label, index)?,
 				),
 			})
 		})
@@ -2310,6 +2352,18 @@ fn exact_bool(number: f32, field: &str) -> eyre::Result<bool> {
 	}
 }
 
+fn indexed<T>(result: eyre::Result<T>, family: &str, index: usize) -> eyre::Result<T> {
+	result.map_err(|error| eyre::eyre!("{family} entry {index} {error}"))
+}
+
+fn numbered<T>(result: eyre::Result<T>, family: &str, index: usize) -> eyre::Result<T> {
+	result.map_err(|error| eyre::eyre!("{family} {index} {error}"))
+}
+
+fn labeled_handle<T>(result: eyre::Result<T>, label: &str, index: usize) -> eyre::Result<T> {
+	result.map_err(|error| eyre::eyre!("{label} handle {index} {error}"))
+}
+
 fn validate_fixed_records(
 	values: &[f32],
 	record_fields: usize,
@@ -2328,6 +2382,20 @@ fn validate_fixed_records(
 		));
 	}
 	Ok(())
+}
+
+fn fixed_batch_capacity(
+	record_count: usize,
+	record_len: usize,
+	label: &str,
+) -> eyre::Result<usize> {
+	4_usize
+		.checked_add(
+			record_count
+				.checked_mul(record_len)
+				.ok_or_else(|| eyre::eyre!("{label} is too large"))?,
+		)
+		.ok_or_else(|| eyre::eyre!("{label} is too large"))
 }
 
 fn split_u32_words(value: u32) -> [u16; 2] {
@@ -2367,10 +2435,10 @@ fn exact_words4(words: &[f32], field: &str) -> eyre::Result<[u16; 4]> {
 		return Err(eyre::eyre!("{field} requires four 16-bit words"));
 	}
 	Ok([
-		exact_u16(words[0], &format!("{field} word 0"))?,
-		exact_u16(words[1], &format!("{field} word 1"))?,
-		exact_u16(words[2], &format!("{field} word 2"))?,
-		exact_u16(words[3], &format!("{field} word 3"))?,
+		exact_u16(words[0], "word 0").map_err(|error| eyre::eyre!("{field} {error}"))?,
+		exact_u16(words[1], "word 1").map_err(|error| eyre::eyre!("{field} {error}"))?,
+		exact_u16(words[2], "word 2").map_err(|error| eyre::eyre!("{field} {error}"))?,
+		exact_u16(words[3], "word 3").map_err(|error| eyre::eyre!("{field} {error}"))?,
 	])
 }
 
@@ -2478,24 +2546,32 @@ pub fn encode_production_mixture_lifecycle_batch(values: &[f32]) -> eyre::Result
 		.iter()
 		.enumerate()
 		.map(|(index, entry)| {
-			let action = LifecycleAction::try_from(exact_u32(
-				entry[0],
-				&format!("mixture lifecycle entry {index} action"),
+			let action = LifecycleAction::try_from(indexed(
+				exact_u32(entry[0], "action"),
+				"mixture lifecycle",
+				index,
 			)?)?;
 			Ok(LifecycleMutation {
 				action,
 				handle: WireHandle {
-					slot: exact_u32(entry[1], &format!("mixture lifecycle entry {index} slot"))?,
-					generation: exact_u32(
-						entry[2],
-						&format!("mixture lifecycle entry {index} generation"),
+					slot: indexed(exact_u32(entry[1], "slot"), "mixture lifecycle", index)?,
+					generation: indexed(
+						exact_u32(entry[2], "generation"),
+						"mixture lifecycle",
+						index,
 					)?,
 				},
 			})
 		})
 		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::new();
+	let capacity = fixed_batch_capacity(
+		mutations.len(),
+		LIFECYCLE_MUTATION_LEN,
+		"mixture lifecycle batch",
+	)?;
+	let mut output = Vec::with_capacity(capacity);
 	encode_lifecycle_batch(&mutations, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
 	Ok(output)
 }
 
@@ -2610,6 +2686,150 @@ mod tests {
 
 	fn handle(slot: u32, generation: u32) -> WireHandle {
 		WireHandle { slot, generation }
+	}
+
+	fn error_text<T>(result: eyre::Result<T>) -> String {
+		match result {
+			Ok(_) => panic!("expected an error"),
+			Err(error) => error.to_string(),
+		}
+	}
+
+	#[test]
+	fn indexed_decoder_errors_preserve_complete_context() {
+		let mut continuation = [0.0; 10];
+		continuation[3] = 65_536.0;
+		assert_eq!(
+			error_text(decode_production_continuation_token(&continuation)),
+			"continuation token word 3 exceeds the u16 wire range"
+		);
+		assert_eq!(
+			error_text(encode_production_mixture_lifecycle_batch(&[
+				1.0,
+				0.0,
+				f32::NAN,
+			])),
+			"mixture lifecycle entry 0 generation must be an exact non-negative BYOND integer"
+		);
+
+		let mut mixture_state = vec![0.0; 6 + MAX_GAS_SLOTS];
+		mixture_state[1] = f32::NAN;
+		assert_eq!(
+			error_text(encode_production_mixture_state_batch(&mixture_state)),
+			"mixture state entry 0 generation must be an exact non-negative BYOND integer"
+		);
+
+		let mut gas = [0.0; 13];
+		gas[0] = 65_536.0;
+		assert_eq!(
+			error_text(encode_production_gas_metadata(
+				&gas,
+				&["gas".to_owned()],
+				&["Gas".to_owned()],
+				&[],
+			)),
+			"gas metadata entry 0 id exceeds the u16 wire range"
+		);
+
+		let mut reaction = [0.0; 12];
+		reaction[0] = 65_536.0;
+		assert_eq!(
+			error_text(encode_production_reaction_metadata(
+				&reaction,
+				&["reaction".to_owned()],
+				&[],
+			)),
+			"reaction metadata entry 0 id low word exceeds the u16 wire range"
+		);
+
+		assert_eq!(
+			error_text(encode_production_turf_lifecycle_batch(&[
+				1.0,
+				0.0,
+				f32::NAN,
+				0.0,
+				0.0,
+				0.0,
+			])),
+			"turf lifecycle entry 0 generation must be an exact non-negative BYOND integer"
+		);
+		assert_eq!(
+			error_text(encode_production_turf_adjacency_batch(&[
+				0.0,
+				0.0,
+				1.0,
+				f32::NAN,
+				0.0,
+				0.0,
+			])),
+			"turf adjacency entry 0 right generation must be an exact non-negative BYOND integer"
+		);
+		assert_eq!(
+			error_text(encode_production_turf_heat_batch(&[
+				0.0,
+				f32::NAN,
+				0.0,
+				0.0,
+				0.0,
+				0.0,
+				0.0,
+			])),
+			"turf heat entry 0 generation must be an exact non-negative BYOND integer"
+		);
+		assert_eq!(
+			error_text(encode_production_turf_heat_adjacency_batch(&[
+				0.0,
+				0.0,
+				1.0,
+				f32::NAN,
+				0.0,
+			])),
+			"turf heat adjacency entry 0 right generation must be an exact non-negative BYOND integer"
+		);
+
+		let mut frontier = vec![0.0; 10];
+		frontier[9] = 65_536.0;
+		assert_eq!(
+			error_text(encode_production_frontier_append(&frontier)),
+			"frontier handle 0 generation word 1 exceeds the u16 wire range"
+		);
+
+		let event = CallbackEvent {
+			scope_sequence: 1,
+			transaction_id: 0,
+			scope: CallbackScope::General,
+			kind: CallbackEventKind::Diagnostic,
+			flags: 0,
+			subject: handle(0, 1),
+			target: handle(0, 1),
+			values: [
+				ScalarValue(f64::MAX),
+				ScalarValue(0.0),
+				ScalarValue(0.0),
+				ScalarValue(0.0),
+			],
+			aux: 0,
+			continuation: None,
+		};
+		let mut callback = CallbackBatchHeader {
+			returned: 1,
+			remaining: 0,
+			capacity: 1,
+			high_water: 1,
+			rejected: 0,
+		}
+		.encode()
+		.to_vec();
+		callback.extend(event.encode().unwrap());
+		assert_eq!(
+			error_text(decode_production_callback_batch(
+				&callback,
+				1,
+				CallbackScope::General,
+				0,
+			)),
+			"callback value 0 is outside the finite BYOND number range"
+		);
 	}
 
 	#[test]
