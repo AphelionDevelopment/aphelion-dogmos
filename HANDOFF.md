@@ -1,141 +1,118 @@
-# Handoff — performance and resource management audit
+# Handoff — DM-side Dogmos improvements
 
 Date: `2026-08-30`
-Branch: `master`
-HEAD at audit time: `ea4e0cebacf186d98831012ca81873500e161fcf` ("Fix O(n) blowups in turf topology mutation during bulk registration")
 
-## Status in one line
+This handoff supersedes the original read-only performance audit that previously occupied this
+file. That audit is preserved in Git history, but its implementation priorities are stale.
 
-An audit was performed by reading code. **No measurements were taken and no files were changed.** The plan below is unstarted, and its phase ordering is by inspection, not evidence.
+## Assignment
 
-## Repository state you are inheriting
+Continue in the existing Meridian-Rift `dogmos` checkout and specialize in the DreamMaker side of
+Dogmos: SSair scheduling, lifecycle and topology synchronization, the DM compatibility API, typed
+gameplay-event dispatch, recovery, diagnostics, Kennel behavior, and player/admin-visible effects.
 
-13 files were already modified and uncommitted when the audit began, and they were left untouched:
+Read [DM_SIDE_AGENT_INSTRUCTIONS.md](DM_SIDE_AGENT_INSTRUCTIONS.md) before taking any action in the
+game repository. It is the operating sheet for this assignment.
 
-```
-crates/dogmos-byond/src/lib.rs
-crates/dogmos-core/src/frontier.rs
-crates/dogmos-core/src/topology.rs
-crates/dogmos-core/src/world.rs
-crates/dogmos-core/tests/frontier_processing.rs
-crates/dogmos-protocol/src/lib.rs
-crates/dogmos-protocol/tests/compound_commands.rs
-crates/dogmos-protocol/tests/cross_bitness.rs
-crates/dogmos-protocol/tests/telemetry.rs
-crates/dogmos-server/src/lib.rs
-crates/dogmos-server/src/state.rs
-dogmos-build-manifest.toml
-tools/tests/test_dogmos_contract.py
-```
+## Repositories and inspected state
 
-That work is the incremental-frontier-sync feature (`add_frontier`/`remove_frontier`, `FrontierState::add`/`remove`, protocol `FrontierMutate`) plus several optimizations already landed in the working tree. **All line numbers below refer to the working tree, not to `HEAD`.** Re-verify anchors before editing; they will drift.
+| Repository | Branch | Inspected revision | State at handoff inspection |
+| --- | --- | --- | --- |
+| `aphelion-dogmos` | `master` | `c471ff482d4927378457a8075c2f9a954b6b5354` | Clean before these handoff documents |
+| `Meridian-Rift` | `dogmos` | `dfd461a55f500ef20bab641b4908456ebd0ab7cf` | Clean |
 
-`HANDOFF.md` (this file) is the only file the audit session created. It is untracked and is not validated by `tools/check_agent_docs.py` (that gate only scans `AGENTS.md` and a fixed allowlist under `docs/agent/`).
+Do not create another checkout or generated worktree. Do not mix standalone Rust qualification with
+game-integration claims. Preserve unrelated changes if either checkout is no longer clean.
 
-## Constraints that bind the next session
+## What the standalone session completed
 
-From `AGENTS.md` — read it in full before touching anything:
+The standalone audit and implementation plans were carried through locally on `aphelion-dogmos`:
 
-- The audited crate is a **32-bit in-process BYOND DLL**. Rust allocations in `dogmos-byond` consume DreamDaemon address space. This is the memory that matters.
-- Report `dogmosd` (64-bit) memory **separately**. Do not combine it with DreamDaemon, and do not optimize harmless 64-bit service RSS.
-- Every behavioral change is **test-first**: prove the focused failure, make the smallest correction, rerun focused then wider gates.
-- Accept performance changes **only** from repeated identical workloads with numerical/event equivalence.
-- Preserve public DM proc paths and caller-legible errors. No panic may unwind across the FFI boundary.
-- Protected files needing explicit approval naming exact files: root/workspace `Cargo.toml`, `Cargo.lock`, `.cargo/`, `rust-toolchain.toml`, `.github/workflows/`, dependency/transport choices, artifact/sync/release tooling, Docker, deploy scripts. Broad plan approval does **not** cover these.
-- Generated bindings and release manifests are never hand-edited.
-- Build BYOND-facing code for `i686-pc-windows-msvc` and `i686-unknown-linux-gnu`. Host-only Cargo success is not authoritative.
+- direct packed-topology traversal replaced avoidable component adjacency reconstruction;
+- process-turfs removed its per-turf neighbor-vector allocation;
+- lifecycle invalidation performs one mixture-edge retain per batch;
+- equalize and excited-groups now use a bounded indexed transaction arena;
+- the arena keeps authoritative mixtures untouched until validated commit, revalidates revisions,
+  preserves ordered events, and rejects mutable mixtures shared across disconnected components;
+- pinned i686 and x64 Rust gates, the feature matrix, Python contracts, and legal IPC benchmark
+  completed successfully.
 
-## Findings
+The transaction result is in
+[`docs/performance/2026-08-30-transaction-scratch-arena-results.md`](docs/performance/2026-08-30-transaction-scratch-arena-results.md).
+At 100,000 turfs, allocated bytes fell 69.19-69.22% for equalize and 71.56-72.02% for
+excited-groups with exact transcript hashes. These are core-process results, not DreamDaemon
+production acceptance.
 
-All findings are from reading code. None are measured. Severity is a judgment call about allocation volume on hot paths, not an observation.
+The remaining architecture gate is the matched game workload: three clean DreamDaemon controls and
+candidates, separate DreamDaemon and `dogmosd` memory series, exact workload identity,
+numerical/event equivalence, latency percentiles, and SSair headroom.
 
-### P0 — DreamDaemon 32-bit heap
+## Confirmed Meridian-Rift integration surface
 
-**1. `ServiceSession::request` copies every response into a fresh `Vec`.**
-`crates/dogmos-byond/src/session.rs:39` — `.map(<[u8]>::to_vec)`. `BoundedDogmosClient::round_trip` (`client.rs:296`) deliberately returns a borrowed slice out of a preallocated `max_control_payload` buffer; this discards that with a malloc+copy on every call. Most callers immediately `try_into()` a fixed-size array and drop the `Vec` (e.g. `lib.rs:803`).
+Meridian-MCP parsed `tgstation.dme` successfully at the inspected revision. The main integration
+surfaces are:
 
-**2. `&format!(...)` field labels allocated on the success path, per field, per entry.**
-The fix exists in exactly one place — `crates/dogmos-byond/src/lib.rs:774`, with a comment explaining the reasoning. Every other decoder still allocates: turf lifecycle (1276–1308), turf adjacency (1351–1373), turf heat (1410–1428), heat adjacency (1524–1543), mixture state (912–925), gas metadata (1002–1073), reaction metadata (1160–1233), frontier handles (1621–1631, 1700–1710), and `exact_words4`. A 4,000-turf boot batch at ~6 fields/entry is roughly 24,000 `String` alloc/free pairs in DreamDaemon's heap, purely to name an error that is not occurring.
+- `modular_aphelion/modules/dogmos/code/dogmos.dm` — subsystem initialization and shutdown;
+- `modular_aphelion/modules/dogmos/code/service_backend.dm` — lifecycle batches, service-backed
+  mixture compatibility, frontier/stage dispatch, callback validation, and gameplay dispatch;
+- `modular_aphelion/modules/dogmos/code/service_backend_test.dm` — service lifecycle, callback
+  identity, topology barrier, and related focused tests;
+- `code/controllers/subsystem/air.dm` — SSair scheduling/recovery and Dogmos telemetry state;
+- `code/controllers/subsystem/dogmos_kennel.dm` and `dogmos_kennel_events.dm` — admin controls,
+  bounded histories, overlays, targets, and diagnostics;
+- `code/modules/atmospherics/gasmixtures/**` and
+  `code/modules/atmospherics/environmental/**` — the narrow fork-owned compatibility exception;
+- `code/modules/unit_tests/dogmos_*.dm` — DM-visible behavior and regression coverage;
+- `tgui/packages/tgui/interfaces/DogmosKennel*` — the admin-facing status and control UI;
+- `code/__DEFINES/dogmos_bindings.dm` and `dogmos_contract.dm` — generated, never hand-edited.
 
-**3. Batch encoders start from `Vec::new()` and grow by doubling.**
-`crates/dogmos-byond/src/lib.rs` lines 605, 789, 934, 1315, 1378, 1440, 1548, 2071. Final size is exactly `4 + entries.len() * RECORD_LEN` and known up front. Two encoders already do this correctly (1086, 1240); the rest fragment the 32-bit heap with a realloc chain per batch.
+Semantic inspection confirmed these current behaviors:
 
-### P1 — per-tick allocation in core simulation
+- `flush_turf_registration_batch()` enforces lifecycle-before-topology order and defers while a
+  committed frontier is active.
+- `process_turf_equalize_auxtools()` and `process_excited_groups_auxtools()` route through the
+  service stage API.
+- `dispatch_general_callback()` validates sequence and turf generations before applying pressure,
+  decompression, firelock, reaction, or destruction effects on the DM main thread.
+- direct reaction callbacks remain transaction-scoped; turf-stage reaction continuations return to
+  the bounded general queue.
+- recovery tests require the same service PID and world generation rather than a second world.
+- the Kennel keeps bounded histories and weak-reference-backed jump targets, and exposes separate
+  DreamDaemon and service process metrics.
 
-**4. `remove_incident_edges` is the un-fixed twin of the bug fixed in `ea4e0ce`.**
-`crates/dogmos-core/src/world.rs:4980` does `self.edges.retain(...)` — a full `BTreeMap` traversal — and is called *inside* the per-mutation loop at `world.rs:1047` and `world.rs:1054`. That is O(unregisters x total edges), the exact shape the batched `unregistering` set at `world.rs:1029` was introduced to eliminate for turfs. The turf half was hoisted; the mixture-edge half was not.
+The cached SpacemanDMM snapshot contained a large inherited diagnostic baseline. Parser success is
+not a clean DreamChecker result and is not a DreamMaker compile. Filter diagnostics to changed files
+and compare before/after instead of claiming the repository has zero diagnostics.
 
-**5. `compute_stage_diffusion_node` heap-allocates a <=6-element `Vec` per turf per tick.**
-`crates/dogmos-core/src/world.rs:2507`. Same shape as the `nth()` fixes at 2693 and 2967, but this one is `collect()`ed because it is iterated `MAX_GAS_SLOTS` times. It needs a buffer; it does not need a heap buffer. `[usize; MAX_TURF_NEIGHBORS]` plus a count is a stack array.
+## Recommended first objective
 
-**6. Equalize and excited-groups rebuild a `BTreeMap<u32, Vec<u32>>` adjacency map per component, per tick.**
-`crates/dogmos-core/src/world.rs:3739` and `world.rs:3873`. One `Vec` allocation per node plus a B-tree, reconstructing what `PackedTopology` already answers in O(<=6) via direct slot index. `process_ready_stage_component` calls these once per component.
+Perform a DM-side audit before broad changes, then write a separate implementation plan. Focus on
+the complete cost and correctness path from SSair frontier creation through service-stage chunks,
+bounded callback drains, gameplay effects, cache invalidation, recovery, and Kennel reporting.
 
-**7. `stage_equalization_transfer` clones two full `MixtureRecord`s per flow edge.**
-`crates/dogmos-core/src/world.rs:4176`–4180 — clone source, clone target, mutate, re-`insert` both into the `BTreeMap`. A component of N turfs produces ~N flows, so ~2N record clones (each carrying `[f32; MAX_GAS_SLOTS]`) plus 2N B-tree inserts, to work around not holding two disjoint `&mut` into a `BTreeMap`.
+Prioritize evidence in this order:
 
-**8. `stage_turf_handles()` clones the component vector on every call.**
-`crates/dogmos-core/src/world.rs:4935`. `process_ready_stage_component` already clones the queue into `stage_component_turfs` at `world.rs:3028`; each of `process_equalize` / `process_excited_groups` / `process_turf_heat` then clones it again on entry (3721, 3863, 4201).
+1. Establish the paired DreamDaemon control workload and current local gates.
+2. Audit SSair work budgeting, callback-drain budgeting, and topology deferral for starvation or
+   work that escapes the charged budget.
+3. Audit lifecycle/topology batching and recovery for ordering, stale state, duplicated work, and
+   full-world scans.
+4. Audit DM mixture snapshot/cache call sites for read-after-write barriers, invalidation gaps, and
+   avoidable BYOND list construction.
+5. Audit typed callback consumers for stale-target policy, exact order, bounded work, durable
+   diagnostics, and visible gameplay equivalence.
+6. Profile Kennel data production and overlays for producer-side bounding and DreamDaemon-only
+   memory savings. Do not optimize `dogmosd` RSS for appearance.
 
-**9. `process_ready_stage_component` does a three-pass clone-restore-restage.**
-`crates/dogmos-core/src/world.rs:3033`–3060: clone every mixture in the component (`before`), run, clone them all again (`after`), write `before` back, stage `after`. Three full record copies per mixture per component per tick. The staging semantics are load-bearing — this is a rework, not a deletion.
+Treat these as investigation lanes, not pre-confirmed bugs. Measure or prove each finding before
+implementing it.
 
-### P1 — server translation layer (64-bit RSS; churn, not a memory target)
+## Completion boundary
 
-**10. Every `apply_*` allocates a throwaway wire-to-core `Vec`.**
-`crates/dogmos-server/src/state.rs` lines 797, 825, 846, 889, 898, 920, 937, 962, plus `add_frontier`/`remove_frontier` at 369 and 384. The `dogmos-protocol` decoder already allocated a `Vec` per batch (`crates/dogmos-protocol/src/lib.rs` 1381, 1421, 1504, 1565, 1626, 1789, 1855, 2499), so each batched command allocates and frees two batch-sized vectors per request. `ServiceState` already has the right pattern in `pending_callback_scratch` / `pending_continuation_scratch`; it is simply not applied here. `apply_turf_adjacency` is worst at three (869, 889, 898).
+A DM-side change is not complete with parser output or a focused unit test alone. The expected
+ladder is semantic reparse, changed-file diagnostics, focused DM tests, contract drift verification,
+fresh DreamMaker compile, two-process boot, wider DM suite, and repeated matched performance runs
+when making a performance claim. Report every unrun gate explicitly.
 
-### P2
-
-**11. `FrontierState::remove` is O(committed) per incremental call.**
-`crates/dogmos-core/src/frontier.rs:247` — `committed.retain()` scans the whole frontier to drop a handful of handles. `add()` was built specifically so the steady-state path avoids full-frontier-sized work; `remove()` still does it. It also allocates a `HashSet` per call for a typically single-digit set.
-
-**12. `pending()` allocates a fresh `BTreeSet` over the whole staging vector.**
-`crates/dogmos-core/src/frontier.rs:161`. `commit_validated`'s doc comment notes the double pass was removed, but the remaining single pass is still O(n log n) with an allocation on a full-map bootstrap. Duplicate detection could ride the existing `received_bits` / `committed_set` machinery.
-
-**13. Double `BTreeSet` lookup in the equalize BFS.**
-`crates/dogmos-core/src/world.rs:3921` — `visited.contains(&neighbor)` then `visited.insert(neighbor)`. One `insert` returning `bool` does both. Innermost loop.
-
-## Resolution plan
-
-Unstarted. Sequenced so each step is independently verifiable.
-
-**Phase 1 — shim heap pressure (items 1, 2, 3).** Highest value per unit of risk, and the memory `AGENTS.md` names as the target.
-1. Change `ServiceSession::request` to return `Result<&[u8]>` or write into a caller-supplied buffer; update the ~20 call sites, most of which simplify. Fixed-size responses land in a stack array.
-2. Replace `&format!(...)` labels with the `.map_err(|e| eyre!("label {index}: {e}"))` shape already used at `lib.rs:777`. Mechanical, one decoder at a time. **Error text must stay caller-legible** — add an assertion test on one representative message per decoder so the wording is provably preserved.
-3. `Vec::with_capacity(4 + entries.len() * RECORD_LEN)` in the eight batch encoders.
-
-Evidence required: DreamDaemon private/committed bytes across an identical boot-storm workload, before vs after, reported separately from `dogmosd`.
-
-**Phase 2 — the O(n x m) survivor (item 4).** Hoist `remove_incident_edges` out of the mutation loop exactly as the turf half was hoisted: collect unregistered slots once, then one `edges.retain` for the whole batch. Self-contained. Should be measurable on the same bulk-registration workload as `ea4e0ce`.
-
-**Phase 3 — per-tick core allocations (items 5, 6, 8, 13).**
-- 5: stack array in `compute_stage_diffusion_node`.
-- 8: return `&[TurfHandle]` from `stage_turf_handles`, or split into a borrowed component path and an owning fallback.
-- 6: drop the adjacency `BTreeMap`; query `topology.gas_neighbors` directly against a component-membership set. **Caveat:** the current code sorts neighbor lists, so traversal order is deterministic. `PackedTopology` keeps neighbors sorted via `insert_sorted`, so order should be preserved — but confirm with the transcript-equivalence test rather than by argument.
-- 13: fold to a single `insert`.
-
-**Phase 4 — server scratch buffers (item 10).** Add reusable `Vec` fields on `ServiceState` following the `pending_callback_scratch` precedent. Do this *after* Phase 3 so core-side churn measurements are not confounded. The deeper fix — having `dogmos-protocol` decode straight into caller-provided storage, skipping the intermediate representation — is a larger protocol-layer change and should be its own decision, not folded in here.
-
-**Phase 5 — frontier incremental path (items 11, 12).** `remove()` should use `committed_set` plus a swap-remove index map, or accept an O(removed) tombstone with periodic compaction. **This changes frontier ordering, which stage cursors iterate.** It must be gated by the transcript-equivalence and frontier-processing tests, and order stability may forbid swap-remove outright. Investigate before committing to an approach.
-
-**Phase 6 — component staging rework (items 7, 9).** Largest change, real semantic risk. `process_ready_stage_component`'s save/run/capture/restore is a transactional guarantee, and `stage_equalization_transfer`'s clone-mutate-reinsert is how it avoids aliasing. Indexing into a `Vec<MixtureRecord>` with disjoint `split_at_mut` access is the right shape but touches equalize correctness directly. Do it last, or scope it to reusing scratch buffers (the cheap 80%) and leave the aliasing rework for a dedicated session.
-
-## Open decision — needs the user
-
-The audit ended on an unanswered question:
-
-> Start on Phase 1, or get measurements in place first so the phase ordering is evidence-backed?
-
-Nothing was decided. `crates/dogmos-perf` has an `ipc_round_trip` bench and there is a perf contract in `tools/tests/test_perf_contract.py`, but `AGENTS.md` requires repeated identical workloads with numerical/event equivalence plus the paired Meridian-Rift PowerShell DreamMaker/DreamDaemon gates. Phase 1 and Phase 2 are high-confidence from inspection; Phase 3's relative value is not.
-
-## Verification, when you do start
-
-Per `docs/agent/verification.md` and `AGENTS.md`, use the pinned toolchain and `--locked`. Run formatting, strict Clippy, tests, supported feature combinations, i686 shim builds, generated-binding drift, and paired artifact verification as applicable. Verify the paired Meridian-Rift integration through its PowerShell gates. Report Rust, DM compile, focused tests, boot, full suite, and performance evidence **separately**.
-
-## What was not examined
-
-- `crates/dogmos-core/src/reactions.rs`, `metadata.rs`, and the `numerics/` kernels were not audited for allocation behavior.
-- `crates/dogmos-perf` and the benchmark harness were only checked for existence, not reviewed.
-- The `examples/cross_bitness_probe.rs` path was not read.
-- No profiling, no benchmark runs, no build was performed in the audit session.
+No push is authorized by this handoff. Commit only when the user explicitly authorizes commits for
+the Meridian-Rift task.
