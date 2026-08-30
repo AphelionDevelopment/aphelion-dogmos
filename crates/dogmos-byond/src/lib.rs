@@ -21,16 +21,16 @@ use dogmos_protocol::{
 	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CallbackScope,
 	ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
 	FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
-	FrontierCommitRequest, FrontierCommitResponse, GasMetadataRegistration, LifecycleAction,
-	LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse,
-	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind,
-	ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
-	SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
-	TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatSnapshotRequest,
-	TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
-	WireGasRequirement, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
-	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, GAS_METADATA_RECORD_LEN,
-	MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_ADJUSTMENT_LEN,
+	FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest, FrontierMutateResponse,
+	GasMetadataRegistration, LifecycleAction, LifecycleMutation, MixtureAdjustment,
+	MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot, MixtureSnapshotRequest,
+	MixtureStateMutation, OperationKind, ReactionMetadataRegistration, ScalarValue,
+	ServiceTelemetry, SimulationStage, SimulationStageRequest, SimulationStageResponse,
+	TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot,
+	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
+	WireGasFireRole, WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution,
+	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
+	GAS_METADATA_RECORD_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_ADJUSTMENT_LEN,
 	MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN,
 	MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, REACTION_METADATA_RECORD_LEN,
 	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN,
@@ -771,8 +771,17 @@ pub fn encode_production_mixture_adjust_multiple(values: &[f32]) -> eyre::Result
 		.iter()
 		.enumerate()
 		.map(|(index, entry)| {
+			// Avoids a &format!(...) allocation per adjustment (this can run once per gas type in
+			// a batched multi-adjust call, which is the whole point of batching) - only format
+			// the "entry N" label if the value actually fails validation.
+			let gas_id = exact_u32(entry[0], "multi-adjust entry gas id")
+				.and_then(|value| {
+					u16::try_from(value)
+						.map_err(|_| eyre::eyre!("value exceeds the u16 wire range"))
+				})
+				.map_err(|error| eyre::eyre!("multi-adjust entry {index} gas id: {error}"))?;
 			Ok(MixtureAdjustment {
-				gas_id: exact_u16(entry[0], &format!("multi-adjust entry {index} gas id"))?,
+				gas_id,
 				delta: ScalarValue(f64::from(entry[1])),
 			})
 		})
@@ -1636,6 +1645,81 @@ pub fn encode_production_frontier_append(fields: &[f32]) -> eyre::Result<Vec<u8>
 	.encode()?)
 }
 
+#[auxmacros::bind("/proc/dogmos_frontier_add")]
+fn dogmos_frontier_add(records: ByondValue) -> eyre::Result<ByondValue> {
+	let records =
+		bounded_number_list(records, "frontier add", 4 + MAX_FRONTIER_APPEND_HANDLES * 4)?;
+	let request = encode_production_frontier_mutate(&records, "frontier add")?;
+	let response = production_request(OperationKind::FrontierAdd, &request, 4)?;
+	let count = FrontierMutateResponse::decode(&response)?.count;
+	let mut output = ByondValue::new_list()?;
+	for word in split_u32_words(count) {
+		output.push_list(f32::from(word).into())?;
+	}
+	Ok(output)
+}
+
+#[auxmacros::bind("/proc/dogmos_frontier_remove")]
+fn dogmos_frontier_remove(records: ByondValue) -> eyre::Result<ByondValue> {
+	let records = bounded_number_list(
+		records,
+		"frontier remove",
+		4 + MAX_FRONTIER_APPEND_HANDLES * 4,
+	)?;
+	let request = encode_production_frontier_mutate(&records, "frontier remove")?;
+	let response = production_request(OperationKind::FrontierRemove, &request, 4)?;
+	let count = FrontierMutateResponse::decode(&response)?.count;
+	let mut output = ByondValue::new_list()?;
+	for word in split_u32_words(count) {
+		output.push_list(f32::from(word).into())?;
+	}
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn encode_production_frontier_mutate(fields: &[f32], label: &str) -> eyre::Result<Vec<u8>> {
+	if fields.len() < 8 || !(fields.len() - 4).is_multiple_of(4) {
+		return Err(eyre::eyre!(
+			"{label} requires epoch and at least one fixed four-word handle"
+		));
+	}
+	let handle_count = (fields.len() - 4) / 4;
+	if handle_count > MAX_FRONTIER_APPEND_HANDLES {
+		return Err(eyre::eyre!(
+			"{label} contains {handle_count} handles, maximum {MAX_FRONTIER_APPEND_HANDLES}"
+		));
+	}
+	let handles = fields[4..]
+		.as_chunks::<4>()
+		.0
+		.iter()
+		.enumerate()
+		.map(|(index, words)| {
+			Ok(WireHandle {
+				slot: join_u32_words(
+					exact_u16(words[0], &format!("{label} handle {index} slot word 0"))?,
+					exact_u16(words[1], &format!("{label} handle {index} slot word 1"))?,
+				),
+				generation: join_u32_words(
+					exact_u16(
+						words[2],
+						&format!("{label} handle {index} generation word 0"),
+					)?,
+					exact_u16(
+						words[3],
+						&format!("{label} handle {index} generation word 1"),
+					)?,
+				),
+			})
+		})
+		.collect::<eyre::Result<Vec<_>>>()?;
+	Ok(FrontierMutateRequest {
+		epoch: join_u64_words(exact_words4(&fields[..4], "frontier epoch")?),
+		handles,
+	}
+	.encode()?)
+}
+
 #[auxmacros::bind("/proc/dogmos_frontier_commit")]
 fn dogmos_frontier_commit(fields: ByondValue) -> eyre::Result<ByondValue> {
 	let fields = bounded_number_list(fields, "frontier commit", 4)?;
@@ -2234,6 +2318,22 @@ fn finite_byond_scalar(value: f64, field: &str) -> eyre::Result<f32> {
 	Ok(value)
 }
 
+/// Inlines exact_u32()'s check instead of calling it with a &format!(...) label: that label was
+/// built unconditionally on every call to bounded_number_list()/bounded_string_list() - both on
+/// the hot decode path for every DM proc call - even though it's only read in the error branch.
+fn checked_declared_length(number: f32, field: &str) -> eyre::Result<usize> {
+	if !number.is_finite()
+		|| number < 0.0
+		|| number > MAX_EXACT_BYOND_INTEGER
+		|| number.fract() != 0.0
+	{
+		return Err(eyre::eyre!(
+			"{field} length must be an exact non-negative BYOND integer"
+		));
+	}
+	Ok(number as u32 as usize)
+}
+
 fn bounded_number_list(
 	value: ByondValue,
 	field: &str,
@@ -2242,10 +2342,7 @@ fn bounded_number_list(
 	if !value.is_list() {
 		return Err(eyre::eyre!("{field} must be a BYOND list"));
 	}
-	let declared_length = exact_u32(
-		value.builtin_length()?.get_number()?,
-		&format!("{field} length"),
-	)? as usize;
+	let declared_length = checked_declared_length(value.builtin_length()?.get_number()?, field)?;
 	if declared_length > maximum_values {
 		return Err(eyre::eyre!(
 			"{field} contains {declared_length} values, maximum {maximum_values}"
@@ -2269,10 +2366,7 @@ fn bounded_string_list(
 	if !value.is_list() {
 		return Err(eyre::eyre!("{field} must be a BYOND list"));
 	}
-	let declared_length = exact_u32(
-		value.builtin_length()?.get_number()?,
-		&format!("{field} length"),
-	)? as usize;
+	let declared_length = checked_declared_length(value.builtin_length()?.get_number()?, field)?;
 	if declared_length > maximum_values {
 		return Err(eyre::eyre!(
 			"{field} contains {declared_length} values, maximum {maximum_values}"

@@ -186,7 +186,7 @@ pub struct ServiceState {
 	callback_rejected_by_kind: [u64; CALLBACK_EVENT_KIND_COUNT],
 	next_callback_sequence: u64,
 	world_events: Vec<WorldEvent>,
-	pending_callback_scratch: Vec<PendingCallbackEvent>,
+	pending_callback_scratch: Vec<CallbackEvent>,
 	pending_continuation_scratch: Vec<(u64, PendingContinuation)>,
 	expired_continuation_scratch: Vec<(u64, CoreContinuationToken)>,
 	pending_continuations: BTreeMap<u64, PendingContinuation>,
@@ -376,6 +376,32 @@ impl ServiceState {
 		self.world.commit_frontier(epoch).map_err(map_world_error)
 	}
 
+	pub fn add_frontier(&mut self, epoch: u64, handles: &[WireHandle]) -> Result<u32, StateError> {
+		let handles = handles
+			.iter()
+			.copied()
+			.map(core_turf_handle)
+			.collect::<Vec<_>>();
+		self.world
+			.add_frontier(epoch, &handles)
+			.map_err(map_world_error)
+	}
+
+	pub fn remove_frontier(
+		&mut self,
+		epoch: u64,
+		handles: &[WireHandle],
+	) -> Result<u32, StateError> {
+		let handles = handles
+			.iter()
+			.copied()
+			.map(core_turf_handle)
+			.collect::<Vec<_>>();
+		self.world
+			.remove_frontier(epoch, &handles)
+			.map_err(map_world_error)
+	}
+
 	pub fn enqueue_diagnostic_callbacks(&mut self, count: u32) -> Result<u32, StateError> {
 		let now_ticks = self.current_ticks();
 		self.enqueue_diagnostic_callbacks_at(count, now_ticks)
@@ -513,12 +539,6 @@ impl ServiceState {
 		*counter = counter.saturating_add(u64::from(count));
 	}
 
-	fn record_callback_drained(&mut self, kind: CallbackEventKind) {
-		self.callback_drained = self.callback_drained.saturating_add(1);
-		let counter = &mut self.callback_drained_by_kind[callback_kind_index(kind)];
-		*counter = counter.saturating_add(1);
-	}
-
 	fn record_callback_rejected(&mut self, kind: CallbackEventKind, count: u32) {
 		self.callback_rejected = self.callback_rejected.saturating_add(u64::from(count));
 		let counter = &mut self.callback_rejected_by_kind[callback_kind_index(kind)];
@@ -573,7 +593,10 @@ impl ServiceState {
 			.len()
 			.min(max_events as usize)
 			.min(output_event_capacity);
-		let mut drained_kinds = Vec::with_capacity(returned);
+		// Kind count is a compile-time constant, so tally into a stack array while `queue` is
+		// borrowed and fold it into the real counters afterward - no Vec allocation just to work
+		// around the borrow, on a path that runs at least once per tick.
+		let mut drained_tally = [0_u32; CALLBACK_EVENT_KIND_COUNT];
 		for index in 0..returned {
 			let callback = queue
 				.pop_front()
@@ -585,12 +608,17 @@ impl ServiceState {
 					.encode()
 					.map_err(|error| StateError::State(error.to_string()))?,
 			);
-			drained_kinds.push(callback.event.kind);
+			drained_tally[callback_kind_index(callback.event.kind)] += 1;
 		}
 		let remaining = queue.len() as u32;
 		self.pending_callback_count -= returned as u32;
-		for kind in drained_kinds {
-			self.record_callback_drained(kind);
+		for (index, count) in drained_tally.into_iter().enumerate() {
+			if count == 0 {
+				continue;
+			}
+			self.callback_drained = self.callback_drained.saturating_add(u64::from(count));
+			self.callback_drained_by_kind[index] =
+				self.callback_drained_by_kind[index].saturating_add(u64::from(count));
 		}
 		let remove_transaction = scope == CallbackScope::Reaction
 			&& self
@@ -621,6 +649,13 @@ impl ServiceState {
 				self.expired_continuation_scratch
 					.push((*id, continuation.core_token));
 			}
+		}
+		// Nothing can become orphaned unless a continuation was actually removed, and this is the
+		// overwhelmingly common case (called on every callback drain, at least once per tick).
+		// Skip the callback-queue retains, the full recount, and the reaction-transaction sweep
+		// entirely when the scan above found nothing to expire.
+		if self.expired_continuation_scratch.is_empty() {
+			return Ok(());
 		}
 		for (id, core_token) in self.expired_continuation_scratch.drain(..) {
 			self.world
@@ -764,11 +799,16 @@ impl ServiceState {
 			.world
 			.apply_lifecycle(&core_mutations)
 			.map_err(map_world_error)?;
+		// Was a linear scan of the mutation slice inside a retain over the continuation map -
+		// O(continuations x mutations) per batch, on the boot path where mutation batches run to
+		// thousands. Build the unregistered-slot set once instead.
+		let unregistered_mixture_slots: std::collections::HashSet<u32> = mutations
+			.iter()
+			.filter(|mutation| mutation.action == LifecycleAction::Unregister)
+			.map(|mutation| mutation.handle.slot)
+			.collect();
 		self.pending_continuations.retain(|_, continuation| {
-			!mutations.iter().any(|mutation| {
-				mutation.action == LifecycleAction::Unregister
-					&& mutation.handle.slot == continuation.mixture.slot
-			})
+			!unregistered_mixture_slots.contains(&continuation.mixture.slot)
 		});
 		self.remove_orphaned_continuation_callbacks();
 		Ok(applied)
@@ -808,13 +848,15 @@ impl ServiceState {
 			.world
 			.apply_turf_lifecycle(&core_mutations)
 			.map_err(map_world_error)?;
+		let unregistered_turf_slots: std::collections::HashSet<u32> = mutations
+			.iter()
+			.filter(|mutation| mutation.action == LifecycleAction::Unregister)
+			.map(|mutation| mutation.turf.slot)
+			.collect();
 		self.pending_continuations.retain(|_, continuation| {
-			!mutations.iter().any(|mutation| {
-				mutation.action == LifecycleAction::Unregister
-					&& continuation
-						.turf
-						.is_some_and(|turf| mutation.turf.slot == turf.slot)
-			})
+			!continuation
+				.turf
+				.is_some_and(|turf| unregistered_turf_slots.contains(&turf.slot))
 		});
 		self.remove_orphaned_continuation_callbacks();
 		Ok(applied)
@@ -1696,9 +1738,15 @@ impl ServiceState {
 				}
 				_ => None,
 			};
-			let callback = pending_callback_from_world_event(event, continuation);
+			// Build the scoped value once here, validate it, and push that same value - it used
+			// to be scoped, encoded purely to validate, and discarded here, then scoped again
+			// with identical arguments when actually enqueued below.
+			let callback = pending_callback_from_world_event(event, continuation).scoped(
+				scope,
+				transaction_id,
+				first_sequence + index as u64,
+			);
 			callback
-				.scoped(scope, transaction_id, first_sequence + index as u64)
 				.encode()
 				.map_err(|error| StateError::State(error.to_string()))?;
 			self.pending_callback_scratch.push(callback);
@@ -1713,13 +1761,9 @@ impl ServiceState {
 				self.general_callbacks
 					.try_reserve_exact(event_count as usize)
 					.map_err(|_| StateError::AllocationFailed)?;
-				for (index, callback) in self.pending_callback_scratch.iter().copied().enumerate() {
+				for callback in self.pending_callback_scratch.iter().copied() {
 					self.general_callbacks.push_back(QueuedCallback {
-						event: callback.scoped(
-							scope,
-							transaction_id,
-							first_sequence + index as u64,
-						),
+						event: callback,
 						enqueued_ticks: now_ticks,
 					});
 				}
@@ -1734,13 +1778,9 @@ impl ServiceState {
 					.callbacks
 					.try_reserve_exact(event_count as usize)
 					.map_err(|_| StateError::AllocationFailed)?;
-				for (index, callback) in self.pending_callback_scratch.iter().copied().enumerate() {
+				for callback in self.pending_callback_scratch.iter().copied() {
 					queue.callbacks.push_back(QueuedCallback {
-						event: callback.scoped(
-							scope,
-							transaction_id,
-							first_sequence + index as u64,
-						),
+						event: callback,
 						enqueued_ticks: now_ticks,
 					});
 				}

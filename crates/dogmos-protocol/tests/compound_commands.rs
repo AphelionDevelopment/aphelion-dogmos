@@ -1,15 +1,17 @@
 use dogmos_protocol::{
-	decode_adjacency_batch, decode_frontier_append_into, decode_lifecycle_batch,
-	decode_mixture_state_batch, encode_mixture_state_batch, AdjacencyMutation,
-	FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
-	FrontierCommitRequest, FrontierCommitResponse, LifecycleAction, LifecycleMutation,
-	MixtureCommandResponse, MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation,
-	OperationKind, ProtocolError, ScalarValue, SimulationStage, SimulationStageRequest,
-	SimulationStageResponse, WireHandle, ADJACENCY_MUTATION_LEN, DOGMOS_PROTOCOL_VERSION,
-	FRONTIER_APPEND_HEADER_LEN, FRONTIER_APPEND_RESPONSE_LEN, FRONTIER_BEGIN_REQUEST_LEN,
-	FRONTIER_BEGIN_RESPONSE_LEN, FRONTIER_COMMIT_REQUEST_LEN, FRONTIER_COMMIT_RESPONSE_LEN,
-	LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
-	MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	decode_adjacency_batch, decode_frontier_append_into, decode_frontier_mutate_into,
+	decode_lifecycle_batch, decode_mixture_state_batch, encode_mixture_state_batch,
+	AdjacencyMutation, FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest,
+	FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest,
+	FrontierMutateResponse, LifecycleAction, LifecycleMutation, MixtureCommandResponse,
+	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolError,
+	ScalarValue, SimulationStage, SimulationStageRequest, SimulationStageResponse, WireHandle,
+	ADJACENCY_MUTATION_LEN, DOGMOS_PROTOCOL_VERSION, FRONTIER_APPEND_HEADER_LEN,
+	FRONTIER_APPEND_RESPONSE_LEN, FRONTIER_BEGIN_REQUEST_LEN, FRONTIER_BEGIN_RESPONSE_LEN,
+	FRONTIER_COMMIT_REQUEST_LEN, FRONTIER_COMMIT_RESPONSE_LEN, FRONTIER_MUTATE_HEADER_LEN,
+	FRONTIER_MUTATE_RESPONSE_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES,
+	MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN,
+	SIMULATION_STAGE_RESPONSE_LEN,
 };
 
 fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -38,7 +40,7 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 #[test]
 fn compound_operation_ids_are_stable() {
-	assert_eq!(DOGMOS_PROTOCOL_VERSION, 9);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 10);
 	assert_eq!(OperationKind::MixtureSnapshot as u16, 18);
 	assert_eq!(OperationKind::MixtureLifecycleBatch as u16, 19);
 	assert_eq!(OperationKind::AdjacencyBatch as u16, 20);
@@ -52,6 +54,8 @@ fn compound_operation_ids_are_stable() {
 	assert_eq!(OperationKind::FrontierBegin as u16, 38);
 	assert_eq!(OperationKind::FrontierAppend as u16, 39);
 	assert_eq!(OperationKind::FrontierCommit as u16, 40);
+	assert_eq!(OperationKind::FrontierAdd as u16, 41);
+	assert_eq!(OperationKind::FrontierRemove as u16, 42);
 	assert_eq!(OperationKind::MixtureCommand as u16, 28);
 	assert_eq!(OperationKind::GasMetadataInstall as u16, 29);
 	assert_eq!(OperationKind::ReactionMetadataInstall as u16, 30);
@@ -177,6 +181,80 @@ fn frontier_append_rejects_zero_oversized_duplicate_and_inexact_records() {
 	trailing.push(0);
 	assert!(matches!(
 		decode_frontier_append_into(&trailing, &mut Vec::new()),
+		Err(ProtocolError::InvalidPayloadLength { .. })
+	));
+}
+
+#[test]
+fn frontier_mutate_layout_round_trips_and_rejects_zero_oversized_duplicate_and_inexact_records() {
+	let handles = vec![handle(7, 11), handle(13, 17)];
+	let add = FrontierMutateRequest {
+		epoch: 0x0102_0304_0506_0708,
+		handles: handles.clone(),
+	};
+	let add_bytes = add.encode().unwrap();
+	assert_eq!(add_bytes.len(), FRONTIER_MUTATE_HEADER_LEN + 16);
+	assert_eq!(&add_bytes[0..8], &add.epoch.to_le_bytes());
+	assert_eq!(&add_bytes[8..12], &2_u32.to_le_bytes());
+	assert_eq!(&add_bytes[12..20], &handles[0].encode());
+	assert_eq!(&add_bytes[20..28], &handles[1].encode());
+	let mut decoded_handles = vec![handle(99, 99)];
+	let decoded_header = decode_frontier_mutate_into(&add_bytes, &mut decoded_handles).unwrap();
+	assert_eq!(decoded_header.epoch, add.epoch);
+	assert_eq!(decoded_header.count, 2);
+	assert_eq!(decoded_handles, handles);
+
+	let response = FrontierMutateResponse { count: 2 };
+	let response_bytes = response.encode();
+	assert_eq!(response_bytes.len(), FRONTIER_MUTATE_RESPONSE_LEN);
+	assert_eq!(
+		FrontierMutateResponse::decode(&response_bytes),
+		Ok(response)
+	);
+
+	let zero = FrontierMutateRequest {
+		epoch: 1,
+		handles: Vec::new(),
+	};
+	assert_eq!(
+		zero.encode(),
+		Err(ProtocolError::InvalidFrontierAppendCount(0))
+	);
+
+	let oversized = FrontierMutateRequest {
+		epoch: 1,
+		handles: vec![handle(1, 1); MAX_FRONTIER_APPEND_HANDLES + 1],
+	};
+	assert_eq!(
+		oversized.encode(),
+		Err(ProtocolError::InvalidFrontierAppendCount(
+			(MAX_FRONTIER_APPEND_HANDLES + 1) as u32
+		))
+	);
+
+	let duplicate = FrontierMutateRequest {
+		epoch: 1,
+		handles: vec![handle(1, 2), handle(1, 2)],
+	};
+	assert_eq!(
+		duplicate.encode(),
+		Err(ProtocolError::DuplicateFrontierHandle(handle(1, 2)))
+	);
+
+	let valid = FrontierMutateRequest {
+		epoch: 1,
+		handles: vec![handle(1, 2)],
+	}
+	.encode()
+	.unwrap();
+	assert!(matches!(
+		decode_frontier_mutate_into(&valid[..valid.len() - 1], &mut Vec::new()),
+		Err(ProtocolError::InvalidPayloadLength { .. })
+	));
+	let mut trailing = valid;
+	trailing.push(0);
+	assert!(matches!(
+		decode_frontier_mutate_into(&trailing, &mut Vec::new()),
 		Err(ProtocolError::InvalidPayloadLength { .. })
 	));
 }

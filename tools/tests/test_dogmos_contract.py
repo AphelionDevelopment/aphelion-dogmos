@@ -117,7 +117,7 @@ class DogmosContractTests(unittest.TestCase):
             hashlib.sha256(self.bindings.read_bytes()).hexdigest(),
         )
 
-    def test_protocol_8_capability_manifest_is_rejected_for_protocol_9_source(self) -> None:
+    def test_protocol_9_capability_manifest_is_rejected_for_protocol_10_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
             for relative_path in (
@@ -135,7 +135,7 @@ class DogmosContractTests(unittest.TestCase):
             capability = repository / "dogmos-build-manifest.toml"
             capability.write_text(
                 capability.read_text(encoding="utf-8").replace(
-                    "protocol_version = 9", "protocol_version = 8"
+                    "protocol_version = 10", "protocol_version = 9"
                 ),
                 encoding="utf-8",
             )

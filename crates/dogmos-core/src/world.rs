@@ -603,7 +603,10 @@ struct StageHeatState {
 	next_node: usize,
 	next_topology_node: usize,
 	next_topology_neighbor: usize,
-	edges: Vec<(u32, u32)>,
+	/// (first slot, second slot, first's unscaled weight, second's unscaled weight) - the weights
+	/// are computed once at discovery (see advance_stage_heat_topology()) since they don't change
+	/// across conduction substeps.
+	edges: Vec<(u32, u32, f32, f32)>,
 	row_sums: Vec<f32>,
 	conduction_substeps: Option<u32>,
 	conduction_substep: u32,
@@ -632,6 +635,7 @@ struct StageComponentState {
 	component_ready: bool,
 	staged_records: BTreeMap<MixtureHandle, MixtureRecord>,
 	staged_events: Vec<WorldEvent>,
+	components_processed: u32,
 }
 
 impl StageComponentState {
@@ -647,6 +651,7 @@ impl StageComponentState {
 			component_ready: false,
 			staged_records: BTreeMap::new(),
 			staged_events: Vec::new(),
+			components_processed: 0,
 		}
 	}
 }
@@ -808,7 +813,39 @@ impl DogmosWorld {
 		for handle in self.frontier.pending(epoch).map_err(WorldError::Frontier)? {
 			require_turf_handle_in(&self.turfs, *handle)?;
 		}
-		self.frontier.commit(epoch).map_err(WorldError::Frontier)
+		self.frontier
+			.commit_validated(epoch)
+			.map_err(WorldError::Frontier)
+	}
+
+	/// Adds handles directly to the committed frontier - the incremental-sync counterpart to
+	/// begin/append/commit. See `FrontierState::add` for the rationale.
+	pub fn add_frontier(&mut self, epoch: u64, handles: &[TurfHandle]) -> Result<u32, WorldError> {
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
+		for handle in handles {
+			require_turf_handle_in(&self.turfs, *handle)?;
+		}
+		let maximum = u32::try_from(self.turfs.len()).unwrap_or(u32::MAX);
+		self.frontier
+			.add(epoch, handles, maximum)
+			.map_err(WorldError::Frontier)
+	}
+
+	/// Removes handles directly from the committed frontier - the incremental-sync counterpart
+	/// to begin/append/commit. See `FrontierState::remove` for the rationale.
+	pub fn remove_frontier(
+		&mut self,
+		epoch: u64,
+		handles: &[TurfHandle],
+	) -> Result<u32, WorldError> {
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict);
+		}
+		self.frontier
+			.remove(epoch, handles)
+			.map_err(WorldError::Frontier)
 	}
 
 	pub fn committed_frontier_epoch(&self) -> Option<u64> {
@@ -987,6 +1024,17 @@ impl DogmosWorld {
 				.map_err(|_| WorldError::AllocationFailed)?;
 		}
 
+		// Unregistering N mixtures used to scan the entire turf slot table N times (once per
+		// mutation) to find turfs pointing at each departing mixture - O(unregisters × total
+		// turfs), worst case exactly when mass mixture teardown makes the batch large. Collect
+		// every handle being unregistered in this batch first, then do one pass over self.turfs
+		// for the whole batch below instead.
+		let unregistering: std::collections::BTreeSet<MixtureHandle> = mutations
+			.iter()
+			.filter(|mutation| matches!(mutation.action, LifecycleAction::Unregister))
+			.map(|mutation| mutation.handle)
+			.collect();
+
 		for mutation in mutations {
 			let slot = mutation.handle.slot as usize;
 			match mutation.action {
@@ -1005,27 +1053,31 @@ impl DogmosWorld {
 				LifecycleAction::Unregister => {
 					self.invalidate_continuations_for_mixture_slot(mutation.handle.slot);
 					self.mixtures[slot].mixture = None;
-					let mut detached_turfs = Vec::new();
-					for (turf_slot, turf) in
-						self.turfs
-							.iter_mut()
-							.enumerate()
-							.filter_map(|(slot, turf_slot)| {
-								turf_slot.turf.as_mut().map(|turf| (slot, turf))
-							}) {
-						if turf.mixture == Some(mutation.handle) {
-							turf.mixture = None;
-							detached_turfs.push(turf_slot as u32);
-						}
-					}
-					for turf_slot in detached_turfs {
-						self.remove_incident_turf_edges(turf_slot);
-					}
-					self.turf_graph = None;
 					self.remove_incident_edges(mutation.handle.slot);
 					changed = true;
 				}
 			}
+		}
+		if !unregistering.is_empty() {
+			let mut detached_turfs = Vec::new();
+			for (turf_slot, turf) in self
+				.turfs
+				.iter_mut()
+				.enumerate()
+				.filter_map(|(slot, turf_slot)| turf_slot.turf.as_mut().map(|turf| (slot, turf)))
+			{
+				if turf
+					.mixture
+					.is_some_and(|handle| unregistering.contains(&handle))
+				{
+					turf.mixture = None;
+					detached_turfs.push(turf_slot as u32);
+				}
+			}
+			for turf_slot in detached_turfs {
+				self.remove_incident_turf_edges(turf_slot);
+			}
+			self.turf_graph = None;
 		}
 		if changed {
 			self.graph = None;
@@ -1287,7 +1339,11 @@ impl DogmosWorld {
 	}
 
 	pub fn apply_adjacency(&mut self, mutations: &[AdjacencyMutation]) -> Result<u32, WorldError> {
-		let mut candidate = self.edges.clone();
+		// Mirrors apply_turf_adjacency(): mutate self.edges directly and invalidate self.graph
+		// lazily instead of cloning the entire edge map every call regardless of batch size. The
+		// rollback guarantee a clone-and-compare gives isn't load-bearing here for the same
+		// reason apply_turf_adjacency()'s doc comment gives - this just wasn't updated with it.
+		let mut changed = false;
 		for mutation in mutations {
 			self.require_handle(mutation.left)?;
 			self.require_handle(mutation.right)?;
@@ -1296,16 +1352,17 @@ impl DogmosWorld {
 			}
 			let key = EdgeKey::new(mutation.left.slot, mutation.right.slot)?;
 			if mutation.conductivity == 0.0 {
-				candidate.remove(&key);
-			} else {
-				candidate.insert(key, mutation.conductivity);
+				if self.edges.remove(&key).is_some() {
+					changed = true;
+				}
+			} else if self.edges.insert(key, mutation.conductivity) != Some(mutation.conductivity) {
+				changed = true;
 			}
 		}
-		if candidate == self.edges {
+		if !changed {
 			return Ok(mutations.len() as u32);
 		}
-		let graph = self.build_graph(&candidate)?;
-		self.edges = candidate;
+		let graph = self.build_graph(&self.edges)?;
 		self.graph = Some(graph);
 		Ok(mutations.len() as u32)
 	}
@@ -2235,13 +2292,15 @@ impl DogmosWorld {
 					..StageChunkResult::default()
 				});
 			}
-			let completed = self.commit_stage_diffusion()?;
+			// commit_stage_diffusion()'s return is a count of committed FDM turf mixtures, not an
+			// equalize count - it used to be misreported here as produced_equalize_seeds, which
+			// would have collided with the real count now returned by the Equalize stage below.
+			self.commit_stage_diffusion()?;
 			self.stage_cursor = None;
 			return Ok(StageChunkResult {
 				work_items,
 				pending: false,
 				remaining_estimate: 0,
-				produced_equalize_seeds: completed,
 				..StageChunkResult::default()
 			});
 		}
@@ -2400,13 +2459,23 @@ impl DogmosWorld {
 					..StageChunkResult::default()
 				});
 			}
-			let callback_events = self.commit_stage_components()?;
+			let (callback_events, components_processed) = self.commit_stage_components()?;
 			self.stage_cursor = None;
 			return Ok(StageChunkResult {
 				work_items,
 				callback_events,
 				pending: false,
 				remaining_estimate: 0,
+				produced_equalize_seeds: if request.stage == WorldStage::Equalize {
+					components_processed
+				} else {
+					0
+				},
+				produced_group_seeds: if request.stage == WorldStage::ExcitedGroups {
+					components_processed
+				} else {
+					0
+				},
 				..StageChunkResult::default()
 			});
 		}
@@ -2635,8 +2704,10 @@ impl DogmosWorld {
 			}) else {
 				return Ok(false);
 			};
-			let neighbors = self.topology.heat_neighbors(turf).collect::<Vec<_>>();
-			if neighbor_index >= neighbors.len() {
+			// nth() walks the same fixed-size (≤6-entry) neighbor iterator .collect() would have,
+			// but without allocating a Vec every single call - this runs once per neighbor step,
+			// so a degree-4 turf was allocating and filling the same 4-element vector 5 times.
+			let Some(neighbor) = self.topology.heat_neighbors(turf).nth(neighbor_index) else {
 				let state = self
 					.stage_heat
 					.as_mut()
@@ -2644,8 +2715,8 @@ impl DogmosWorld {
 				state.next_topology_node += 1;
 				state.next_topology_neighbor = 0;
 				continue;
-			}
-			let neighbor = neighbors[neighbor_index].handle;
+			};
+			let neighbor = neighbor.handle;
 			let state = self
 				.stage_heat
 				.as_mut()
@@ -2660,21 +2731,29 @@ impl DogmosWorld {
 			}
 			let first_index = first as usize;
 			let second_index = second as usize;
-			state.row_sums[first_index] += crate::numerics::conduction::heat_row_weight(
+			// Conductivities and heat capacities don't change across substeps, so these two
+			// weights are loop-invariant with respect to advance_stage_heat_conduction()'s
+			// per-substep loop - compute them once here (where row_sums already needs them) and
+			// carry them on the edge instead of recomputing from scratch every substep.
+			let first_weight = crate::numerics::conduction::heat_row_weight(
 				state.conductivities[first_index],
 				state.conductivities[second_index],
 				state.heat_capacities[first_index],
 				state.heat_capacities[second_index],
 			)
 			.map_err(|error| WorldError::State(error.to_string()))?;
-			state.row_sums[second_index] += crate::numerics::conduction::heat_row_weight(
+			let second_weight = crate::numerics::conduction::heat_row_weight(
 				state.conductivities[second_index],
 				state.conductivities[first_index],
 				state.heat_capacities[second_index],
 				state.heat_capacities[first_index],
 			)
 			.map_err(|error| WorldError::State(error.to_string()))?;
-			state.edges.push((first, second));
+			state.row_sums[first_index] += first_weight;
+			state.row_sums[second_index] += second_weight;
+			state
+				.edges
+				.push((first, second, first_weight, second_weight));
 			return Ok(true);
 		}
 	}
@@ -2721,26 +2800,12 @@ impl DogmosWorld {
 			state.conduction_substep = state.conduction_substeps.unwrap_or(1);
 			return Ok(false);
 		}
-		let (first, second) = state.edges[state.conduction_edge];
+		let (first, second, first_weight, second_weight) = state.edges[state.conduction_edge];
 		let first_index = first as usize;
 		let second_index = second as usize;
 		let difference = state.temperatures[second_index] - state.temperatures[first_index];
-		let first_weight = crate::numerics::conduction::heat_row_weight(
-			state.conductivities[first_index],
-			state.conductivities[second_index],
-			state.heat_capacities[first_index],
-			state.heat_capacities[second_index],
-		)
-		.map_err(|error| WorldError::State(error.to_string()))?
-			* state.conduction_scale;
-		let second_weight = crate::numerics::conduction::heat_row_weight(
-			state.conductivities[second_index],
-			state.conductivities[first_index],
-			state.heat_capacities[second_index],
-			state.heat_capacities[first_index],
-		)
-		.map_err(|error| WorldError::State(error.to_string()))?
-			* state.conduction_scale;
+		let first_weight = first_weight * state.conduction_scale;
+		let second_weight = second_weight * state.conduction_scale;
 		state.temperatures[first_index] += difference * first_weight;
 		state.temperatures[second_index] -= difference * second_weight;
 		state.conduction_edge += 1;
@@ -2912,8 +2977,14 @@ impl DogmosWorld {
 				.as_ref()
 				.expect("component stage owns traversal state");
 			if let Some(current) = state.queue.get(state.queue_index).copied() {
-				let neighbors = self.topology.gas_neighbors(current).collect::<Vec<_>>();
-				if state.next_neighbor >= neighbors.len() {
+				// See advance_stage_heat_topology()'s identical fix: nth() walks the same fixed
+				// (≤6-entry) neighbor iterator .collect() would have, without allocating a Vec
+				// every single call.
+				let Some(neighbor) = self
+					.topology
+					.gas_neighbors(current)
+					.nth(state.next_neighbor)
+				else {
 					let state = self
 						.stage_components
 						.as_mut()
@@ -2921,8 +2992,8 @@ impl DogmosWorld {
 					state.queue_index += 1;
 					state.next_neighbor = 0;
 					continue;
-				}
-				let neighbor = neighbors[state.next_neighbor].handle;
+				};
+				let neighbor = neighbor.handle;
 				let state = self
 					.stage_components
 					.as_mut()
@@ -3006,10 +3077,17 @@ impl DogmosWorld {
 		state.queue_index = 0;
 		state.next_neighbor = 0;
 		state.component_ready = false;
+		state.components_processed += 1;
 		Ok(())
 	}
 
-	fn commit_stage_components(&mut self) -> Result<u32, WorldError> {
+	/// Returns (callback_events, components_processed) - the latter is the number of components
+	/// process_ready_stage_component() actually ran this stage, which is what
+	/// produced_equalize_seeds/produced_group_seeds report back over the wire. Before this,
+	/// the Equalize/ExcitedGroups branch of process_stage_chunk_cancellable() always returned
+	/// both of those fields as 0 regardless of how much real work ran - DM-side telemetry (and
+	/// the dogmos_excited_groups unit test) had nothing but a permanent zero to read.
+	fn commit_stage_components(&mut self) -> Result<(u32, u32), WorldError> {
 		let state = self
 			.stage_components
 			.take()
@@ -3023,11 +3101,12 @@ impl DogmosWorld {
 			});
 		}
 		let callback_events = u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX);
+		let components_processed = state.components_processed;
 		for (handle, record) in state.staged_records {
 			*self.require_handle_mut(handle)? = record;
 		}
 		self.events.extend(state.staged_events);
-		Ok(callback_events)
+		Ok((callback_events, components_processed))
 	}
 
 	fn stage_component_discovery_complete(&self) -> bool {

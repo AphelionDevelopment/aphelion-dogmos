@@ -153,15 +153,27 @@ impl PackedTopology {
 		let Some(entry) = self.slots.get_mut(slot as usize) else {
 			return false;
 		};
-		let removed_gas = entry.gas.iter().flatten().count();
-		let removed_heat = entry.heat.iter().flatten().count();
+		// Copy the fixed-size neighbor arrays out (cheap, stack-only - both are Copy) before
+		// clearing the slot, instead of scanning every slot in the world to find who pointed at
+		// it. Degree is capped at MAX_TURF_NEIGHBORS and the slot already names its own partners
+		// exactly, so only those ≤12 partner slots need their back-reference removed.
+		let gas_neighbors = entry.gas;
+		let heat_neighbors = entry.heat;
+		let removed_gas = gas_neighbors.iter().flatten().count();
+		let removed_heat = heat_neighbors.iter().flatten().count();
 		if removed_gas == 0 && removed_heat == 0 {
 			return false;
 		}
 		*entry = TopologySlot::default();
-		for other in &mut self.slots {
-			remove_neighbor_slot(&mut other.gas, slot);
-			remove_neighbor_slot(&mut other.heat, slot);
+		for neighbor in gas_neighbors.into_iter().flatten() {
+			if let Some(partner) = self.slots.get_mut(neighbor.handle.slot as usize) {
+				remove_neighbor_slot(&mut partner.gas, slot);
+			}
+		}
+		for neighbor in heat_neighbors.into_iter().flatten() {
+			if let Some(partner) = self.slots.get_mut(neighbor.handle.slot as usize) {
+				remove_neighbor_slot(&mut partner.heat, slot);
+			}
 		}
 		self.gas_edges -= removed_gas;
 		self.heat_edges -= removed_heat;

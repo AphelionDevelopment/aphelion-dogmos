@@ -71,6 +71,69 @@ fn frontier_commit_atomically_replaces_the_previous_snapshot() {
 }
 
 #[test]
+fn incremental_add_and_remove_mutate_the_committed_frontier_without_a_full_reupload() {
+	let handles = [turf(0, 1), turf(1, 1), turf(2, 1), turf(3, 1)];
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &handles);
+
+	// Bootstrap via the existing two-phase path, exactly as DM does for the first-ever publish.
+	world.begin_frontier(1, 2).unwrap();
+	world.append_frontier(1, 0, &handles[..2]).unwrap();
+	world.commit_frontier(1).unwrap();
+	assert_eq!(world.committed_frontier(), &handles[..2]);
+
+	// Steady-state sync: add one, without touching the two already committed.
+	assert_eq!(world.add_frontier(2, &handles[2..3]), Ok(1));
+	assert_eq!(world.committed_frontier_epoch(), Some(2));
+	assert_eq!(
+		world.committed_frontier().iter().collect::<Vec<_>>(),
+		vec![&handles[0], &handles[1], &handles[2]]
+	);
+
+	// Remove one of the originally-committed turfs, leaving the newly added one alone.
+	assert_eq!(world.remove_frontier(3, &handles[..1]), Ok(1));
+	assert_eq!(world.committed_frontier_epoch(), Some(3));
+	assert_eq!(
+		world.committed_frontier().iter().collect::<Vec<_>>(),
+		vec![&handles[1], &handles[2]]
+	);
+
+	// Removing a handle that isn't present is a no-op, not an error - DM's diff is computed
+	// against its own last-known snapshot and can legitimately be stale by one partial sync.
+	assert_eq!(world.remove_frontier(4, &handles[3..]), Ok(0));
+	assert_eq!(world.committed_frontier_epoch(), Some(4));
+	assert_eq!(
+		world.committed_frontier().iter().collect::<Vec<_>>(),
+		vec![&handles[1], &handles[2]]
+	);
+
+	// Adding a handle already present is rejected rather than silently ignored, since DM's diff
+	// should never legitimately re-add something it already knows is committed.
+	assert_eq!(
+		world.add_frontier(5, &handles[1..2]),
+		Err(WorldError::Frontier(FrontierError::DuplicateHandle(
+			handles[1]
+		)))
+	);
+	// A rejected add must not have mutated the committed epoch or set.
+	assert_eq!(world.committed_frontier_epoch(), Some(4));
+	assert_eq!(
+		world.committed_frontier().iter().collect::<Vec<_>>(),
+		vec![&handles[1], &handles[2]]
+	);
+
+	// A non-increasing epoch is rejected exactly as the two-phase path rejects it.
+	assert_eq!(
+		world.add_frontier(4, &handles[3..]),
+		Err(WorldError::Frontier(FrontierError::EpochConflict {
+			committed: Some(4),
+			uploading: None,
+			requested: 4,
+		}))
+	);
+}
+
+#[test]
 fn newer_begin_cancels_only_the_partial_upload() {
 	let handles = [turf(0, 1), turf(1, 1)];
 	let mut world = DogmosWorld::new(1024 * 1024);

@@ -14,7 +14,7 @@ pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 2;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 9;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 10;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 176;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
@@ -44,6 +44,8 @@ pub const FRONTIER_APPEND_HEADER_LEN: usize = 16;
 pub const FRONTIER_APPEND_RESPONSE_LEN: usize = 4;
 pub const FRONTIER_COMMIT_REQUEST_LEN: usize = 8;
 pub const FRONTIER_COMMIT_RESPONSE_LEN: usize = 16;
+pub const FRONTIER_MUTATE_HEADER_LEN: usize = 12;
+pub const FRONTIER_MUTATE_RESPONSE_LEN: usize = 4;
 pub const MAX_FRONTIER_APPEND_HANDLES: usize = 512;
 pub const MAX_STAGE_WORK_ITEMS: u32 = 4096;
 pub const FLAG_RESPONSE: u16 = 1 << 0;
@@ -91,6 +93,8 @@ pub enum OperationKind {
 	FrontierBegin = 38,
 	FrontierAppend = 39,
 	FrontierCommit = 40,
+	FrontierAdd = 41,
+	FrontierRemove = 42,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +204,8 @@ impl TryFrom<u16> for OperationKind {
 			38 => Ok(Self::FrontierBegin),
 			39 => Ok(Self::FrontierAppend),
 			40 => Ok(Self::FrontierCommit),
+			41 => Ok(Self::FrontierAdd),
+			42 => Ok(Self::FrontierRemove),
 			actual => Err(ProtocolError::UnknownOperationKind(actual)),
 		}
 	}
@@ -734,6 +740,92 @@ impl FrontierAppendResponse {
 		require_exact_len(input, FRONTIER_APPEND_RESPONSE_LEN)?;
 		Ok(Self {
 			accepted_count: read_u32(input, 0),
+		})
+	}
+}
+
+/// Shared wire shape for FrontierAdd and FrontierRemove: unlike FrontierAppend, there's no
+/// begin/commit two-phase upload to coordinate, so each request is epoch + a standalone handle
+/// list - no offset field needed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontierMutateRequest {
+	pub epoch: u64,
+	pub handles: Vec<WireHandle>,
+}
+
+impl FrontierMutateRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+		validate_frontier_handles(&self.handles)?;
+		let count = self.handles.len() as u32;
+		let mut output = Vec::with_capacity(FRONTIER_MUTATE_HEADER_LEN + self.handles.len() * 8);
+		output.extend_from_slice(&self.epoch.to_le_bytes());
+		output.extend_from_slice(&count.to_le_bytes());
+		for handle in &self.handles {
+			output.extend_from_slice(&handle.encode());
+		}
+		Ok(output)
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierMutateHeader {
+	pub epoch: u64,
+	pub count: u32,
+}
+
+pub fn decode_frontier_mutate_into(
+	input: &[u8],
+	handles: &mut Vec<WireHandle>,
+) -> Result<FrontierMutateHeader, ProtocolError> {
+	if input.len() < FRONTIER_MUTATE_HEADER_LEN {
+		return Err(ProtocolError::InvalidPayloadLength {
+			expected: FRONTIER_MUTATE_HEADER_LEN as u32,
+			actual: input.len() as u32,
+		});
+	}
+	let count = read_u32(input, 8);
+	if count == 0 || count as usize > MAX_FRONTIER_APPEND_HANDLES {
+		return Err(ProtocolError::InvalidFrontierAppendCount(count));
+	}
+	let expected = FRONTIER_MUTATE_HEADER_LEN + count as usize * 8;
+	require_exact_len(input, expected)?;
+	for index in 0..count as usize {
+		let start = FRONTIER_MUTATE_HEADER_LEN + index * 8;
+		let handle = WireHandle::decode(&input[start..start + 8])?;
+		for previous_index in 0..index {
+			let previous_start = FRONTIER_MUTATE_HEADER_LEN + previous_index * 8;
+			let previous = WireHandle::decode(&input[previous_start..previous_start + 8])?;
+			if handle == previous {
+				return Err(ProtocolError::DuplicateFrontierHandle(handle));
+			}
+		}
+	}
+	handles.clear();
+	handles.reserve(count as usize);
+	for index in 0..count as usize {
+		let start = FRONTIER_MUTATE_HEADER_LEN + index * 8;
+		handles.push(WireHandle::decode(&input[start..start + 8])?);
+	}
+	Ok(FrontierMutateHeader {
+		epoch: read_u64(input, 0),
+		count,
+	})
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierMutateResponse {
+	pub count: u32,
+}
+
+impl FrontierMutateResponse {
+	pub fn encode(self) -> [u8; FRONTIER_MUTATE_RESPONSE_LEN] {
+		self.count.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, FRONTIER_MUTATE_RESPONSE_LEN)?;
+		Ok(Self {
+			count: read_u32(input, 0),
 		})
 	}
 }

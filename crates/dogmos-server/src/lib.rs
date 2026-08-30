@@ -3,15 +3,15 @@ mod state;
 use dogmos_protocol::{
 	decode_adjacency_batch, decode_adjust_multiple_request,
 	decode_continuation_adjust_multiple_request, decode_frontier_append_into,
-	decode_gas_metadata_batch, decode_lifecycle_batch, decode_mixture_state_batch,
-	decode_reaction_metadata_batch, decode_turf_adjacency_batch, decode_turf_heat_adjacency_batch,
-	decode_turf_heat_batch, decode_turf_lifecycle_batch, read_frame_into, write_frame,
-	CallbackBatchRequest, ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
-	FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse, FrontierCommitRequest,
-	FrontierCommitResponse, HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest,
-	OperationKind, ProtocolHeader, ServiceErrorCode, SimulationStageRequest,
-	SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN,
-	MAX_CONTROL_PAYLOAD,
+	decode_frontier_mutate_into, decode_gas_metadata_batch, decode_lifecycle_batch,
+	decode_mixture_state_batch, decode_reaction_metadata_batch, decode_turf_adjacency_batch,
+	decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
+	read_frame_into, write_frame, CallbackBatchRequest, ContinuationCommandRequest,
+	ContinuationResumeRequest, ContinuationToken, FrontierAppendResponse, FrontierBeginRequest,
+	FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse, FrontierMutateResponse,
+	HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest, OperationKind, ProtocolHeader,
+	ServiceErrorCode, SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest,
+	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -716,6 +716,48 @@ fn handle_primary(
 						count,
 					}
 					.encode(),
+				)?;
+			}
+			OperationKind::FrontierAdd => {
+				let Ok(header) =
+					decode_frontier_mutate_into(&payload[..payload_len], &mut frontier_handles)
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let count = match service_state.add_frontier(header.epoch, &frontier_handles) {
+					Ok(count) => count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&FrontierMutateResponse { count }.encode(),
+				)?;
+			}
+			OperationKind::FrontierRemove => {
+				let Ok(header) =
+					decode_frontier_mutate_into(&payload[..payload_len], &mut frontier_handles)
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let count = match service_state.remove_frontier(header.epoch, &frontier_handles) {
+					Ok(count) => count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&FrontierMutateResponse { count }.encode(),
 				)?;
 			}
 			OperationKind::ServiceTelemetry => {
