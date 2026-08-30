@@ -1,8 +1,8 @@
 # Indexed transaction scratch arena implementation plan
 
-> Status: Approved for autonomous execution on 2026-08-30. The user has standing authorization
-> for in-scope edits, protected-file edits when necessary, and commits on the current `master`
-> checkout. Do not push.
+> Status: Local implementation and qualification complete on 2026-08-30. The paired external
+> DreamDaemon workload remains deferred. The user has standing authorization for in-scope edits,
+> protected-file edits when necessary, and commits on the current `master` checkout. Do not push.
 
 **Goal:** Replace per-component ordered-map record staging in equalize and excited-groups with a
 bounded, fallibly allocated, slot-indexed transaction while preserving exact results, callback
@@ -112,3 +112,23 @@ files unless implementation evidence makes it necessary.
    available; otherwise record it explicitly as the remaining external acceptance gate.
 5. Update this plan with completed/deferred items, commit the verification record as
    `docs(perf): close transaction arena plan`, and leave the repository clean. Do not push.
+
+## Completion record
+
+- Task 1 completed in `684e233`: the internal arena has unit coverage for repeat touch, generation
+  conflict, rollback, checked pair access, sorting, and capacity failure.
+- Tasks 2 and 3 completed in `e9f5726`: equalize and excited-groups share the validated transaction
+  commit path. Existing atomicity/transcript tests pass, and new tests reject a mutable mixture
+  shared across disconnected components.
+- Task 4 completed in `d6335fd`: three byte-identical candidate CSVs preserve all transcript hashes.
+  Equalize reduces allocated bytes by 69.19-69.22%; excited-groups reduces them by 71.56-72.02%.
+  Post-stage reusable-vector capacity is unchanged from control.
+- Task 5 local gates completed: pinned i686 formatting, all-target Clippy, workspace tests, targeted
+  x64 core/server tests, the full feature matrix, 42 Python contract tests, and three legal IPC
+  benchmark processes all exited successfully.
+- The external paired DreamDaemon workload was not run. It requires the separate game fixture,
+  matched controls/candidates, DreamDaemon and service private-byte series, latency percentiles, and
+  SSair headroom; no production-memory or production-latency claim depends on this local closure.
+
+Implementation combined the equalize and excited-groups ports into one commit because both use the
+same transaction and publication path. No protected files were changed, and nothing was pushed.

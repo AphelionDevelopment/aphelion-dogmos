@@ -53,6 +53,26 @@ equalize and excited-groups transcript, decompression, cancellation, and hard-li
 green. Authoritative mixture records and public events are not mutated until the complete component
 transaction passes validation.
 
+## Local verification
+
+The following commands exited 0 against the committed implementation:
+
+```powershell
+cargo +1.98.0 fmt --all -- --check
+cargo +1.98.0 clippy --workspace --locked --target i686-pc-windows-msvc --all-targets -- -D warnings
+cargo +1.98.0 test --workspace --locked --target i686-pc-windows-msvc
+cargo +1.98.0 test --locked --target x86_64-pc-windows-msvc -p dogmos-core -p dogmos-protocol -p dogmos-server -p dogmos-process-metrics -p dogmos-identity
+tools/check_feature_matrix.ps1 -Target i686-pc-windows-msvc
+python -m unittest discover -s tools/tests -p 'test_*.py'
+tools/benchmark_ipc.ps1 -Iterations 20000 -Repetitions 3
+```
+
+The Python run completed 42 tests. The feature matrix checked no features, each supported individual
+feature, defaults, and defaults plus Tracy. All three legal IPC processes completed; every
+1,024-mixture service-stage sample reported 2,048 work items. The service-stage p50 range was
+697.1-781.7 microseconds, with worst p95 929.4 microseconds and worst p99 1,099.8 microseconds. This
+unmatched local series is a transport/functionality gate, not production latency acceptance.
+
 ## Remaining external gates
 
 - Three matched DreamDaemon control/candidate workloads with exact map, seed, BYOND version, and
