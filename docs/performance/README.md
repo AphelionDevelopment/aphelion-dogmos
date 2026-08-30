@@ -3,7 +3,9 @@
 Reviewed 2026-08-30 resource-management results are in
 [`2026-08-30-resource-management-results.md`](2026-08-30-resource-management-results.md). The
 separate transaction follow-up is specified in
-[`2026-08-30-transaction-scratch-arena-design.md`](2026-08-30-transaction-scratch-arena-design.md).
+[`2026-08-30-transaction-scratch-arena-design.md`](2026-08-30-transaction-scratch-arena-design.md)
+and qualified in
+[`2026-08-30-transaction-scratch-arena-results.md`](2026-08-30-transaction-scratch-arena-results.md).
 
 This directory defines reproducible workloads and acceptance budgets for the current in-process
 Dogmos backend and the later 64-bit service. DreamDaemon memory and service-process memory are
@@ -39,9 +41,9 @@ transcript hash, and the active reusable-vector capacity lower bound. Allocation
 allocation-removal work; they are not wall-time acceptance evidence.
 
 `reusable_workset_bytes` is a lower bound over active vector capacities. It includes the complete
-four-field heat-edge tuple and excludes maps, sets, and allocator metadata. Stage-owned state is
-dropped when that stage commits; retained event capacity can remain visible until events are
-drained.
+four-field heat-edge tuple and the component transaction's slot index, bitset, and dense entries;
+it excludes maps, sets, and allocator metadata. Stage-owned state is dropped when that stage
+commits; retained event capacity can remain visible until events are drained.
 
 Three fresh release processes on 2026-08-30 produced byte-identical 36-row controls with SHA-256
 `9C28A0C6D019941F66237EB99B221DCF8BA9C29D2E68852829938C1B520EFE30`. At 100,000 turfs,
@@ -65,6 +67,13 @@ Every transcript hash matched the preceding candidate. At 100,000 turfs, equaliz
 107,222-107,556 allocations and 1,952,016-2,082,224 allocated bytes, while excited-groups removed
 116,667 allocations and 7,961,600 allocated bytes for every topology. These reductions exceed the
 zero-noise allocation controls and retain sorted packed-topology traversal order.
+
+The indexed transaction arena then produced three byte-identical 36-row runs with SHA-256
+`019355931FA73B76C5329096859D28B1946010F5C872A6B48E63970D56CD9539`. Every transcript hash
+matched the packed-topology control. At 100,000 turfs, equalize allocated 60,092,408-60,595,728
+bytes, a 69.19-69.22% reduction, and excited-groups allocated 41,732,584-42,783,920 bytes, a
+71.56-72.02% reduction. The full evidence and the allocation-count tradeoff are recorded in the
+transaction result document.
 
 Stage-state recycling and server translation scratch were reviewed but not implemented. Retaining
 stage vectors would pin large buffers while leaving the measured per-entry tree/set and transaction

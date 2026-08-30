@@ -3823,6 +3823,7 @@ impl DogmosWorld {
 		}
 	}
 
+	#[cfg(debug_assertions)]
 	fn process_excited_groups(
 		&mut self,
 		should_cancel: &mut impl FnMut() -> bool,
@@ -3972,6 +3973,7 @@ impl DogmosWorld {
 		Ok(StageResult { work_items })
 	}
 
+	#[cfg(debug_assertions)]
 	fn process_equalize(
 		&mut self,
 		should_cancel: &mut impl FnMut() -> bool,
