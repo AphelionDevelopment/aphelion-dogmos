@@ -14,6 +14,7 @@ use crate::{
 	},
 	stage_cursor::{StageCursor, MAX_STAGE_WORK_LIMIT},
 	topology::{PackedTopology, TopologyError, MAX_TURF_NEIGHBORS},
+	transaction::{IndexedTransaction, TransactionError},
 	MixtureHandle, MAX_GAS_SLOTS,
 };
 use std::{
@@ -638,14 +639,14 @@ struct StageComponentState {
 	queue_index: usize,
 	next_neighbor: usize,
 	component_ready: bool,
-	staged_records: BTreeMap<MixtureHandle, MixtureRecord>,
+	transaction: IndexedTransaction<MixtureRecord>,
 	staged_events: Vec<WorldEvent>,
 	components_processed: u32,
 }
 
 impl StageComponentState {
-	fn new() -> Self {
-		Self {
+	fn try_new(slot_count: usize, max_entries: usize) -> Result<Self, WorldError> {
+		Ok(Self {
 			targets: Vec::new(),
 			active_by_slot: BTreeMap::new(),
 			visited: BTreeSet::new(),
@@ -654,10 +655,11 @@ impl StageComponentState {
 			queue_index: 0,
 			next_neighbor: 0,
 			component_ready: false,
-			staged_records: BTreeMap::new(),
+			transaction: IndexedTransaction::try_new(slot_count, max_entries)
+				.map_err(transaction_world_error)?,
 			staged_events: Vec::new(),
 			components_processed: 0,
-		}
+		})
 	}
 }
 
@@ -710,6 +712,17 @@ fn map_topology_error(error: TopologyError) -> WorldError {
 	match error {
 		TopologyError::AllocationFailed => WorldError::AllocationFailed,
 		other => WorldError::Graph(format!("{other:?}")),
+	}
+}
+
+fn transaction_world_error(error: TransactionError) -> WorldError {
+	match error {
+		TransactionError::AllocationFailed => WorldError::AllocationFailed,
+		TransactionError::CapacityExceeded => WorldError::StateCapacityExceeded,
+		TransactionError::HandleConflict { .. } => WorldError::StageConflict,
+		TransactionError::UnknownHandle(handle) | TransactionError::SameHandle(handle) => {
+			WorldError::DuplicateMutableTurfMixture(handle)
+		}
 	}
 }
 
@@ -933,6 +946,7 @@ impl DogmosWorld {
 				state.queue.capacity() * std::mem::size_of::<TurfHandle>();
 			active_vec_capacity_bytes_lower_bound +=
 				state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
+			active_vec_capacity_bytes_lower_bound += state.transaction.capacity_bytes_lower_bound();
 		}
 		active_vec_capacity_bytes_lower_bound as u64
 	}
@@ -2204,6 +2218,17 @@ impl DogmosWorld {
 						.as_ref()
 						.ok_or(WorldError::ReactionRegistryMissing)?;
 				}
+				let stage_components = if matches!(
+					request.stage,
+					WorldStage::Equalize | WorldStage::ExcitedGroups
+				) {
+					Some(StageComponentState::try_new(
+						self.mixtures.len(),
+						self.frontier.committed().len().min(self.mixtures.len()),
+					)?)
+				} else {
+					None
+				};
 				self.stage_cursor = Some(StageCursor::new(request, self.topology.revision()));
 				self.stage_diffusion =
 					(request.stage == WorldStage::ProcessTurfs).then(StageDiffusionState::new);
@@ -2228,11 +2253,7 @@ impl DogmosWorld {
 						next_target: 0,
 					}
 				});
-				self.stage_components = matches!(
-					request.stage,
-					WorldStage::Equalize | WorldStage::ExcitedGroups
-				)
-				.then(StageComponentState::new);
+				self.stage_components = stage_components;
 			}
 			Some(_) => {}
 		}
@@ -3074,50 +3095,39 @@ impl DogmosWorld {
 		stage: WorldStage,
 		should_cancel: &mut impl FnMut() -> bool,
 	) -> Result<(), WorldError> {
-		let component = self
+		let mut state = self
 			.stage_components
-			.as_ref()
-			.expect("component stage owns traversal state")
-			.queue
-			.clone();
-		let mixture_handles = component
-			.iter()
-			.filter_map(|turf| self.require_turf_handle(*turf).ok()?.mixture)
-			.collect::<BTreeSet<_>>();
-		let before = mixture_handles
-			.iter()
-			.map(|handle| Ok((*handle, self.require_handle(*handle)?.clone())))
-			.collect::<Result<Vec<_>, WorldError>>()?;
-		let event_start = self.events.len();
-		self.stage_component_turfs = Some(component);
+			.take()
+			.expect("component stage owns traversal state");
+		let checkpoint = state.transaction.checkpoint();
+		let event_checkpoint = state.staged_events.len();
+		self.stage_component_turfs = Some(state.queue.clone());
 		self.use_committed_frontier = true;
 		let result = match stage {
-			WorldStage::Equalize => self.process_equalize(should_cancel),
-			WorldStage::ExcitedGroups => self.process_excited_groups(should_cancel),
+			WorldStage::Equalize => self.compute_equalize(
+				&mut state.transaction,
+				&mut state.staged_events,
+				should_cancel,
+			),
+			WorldStage::ExcitedGroups => {
+				self.compute_excited_groups(&mut state.transaction, should_cancel)
+			}
 			_ => unreachable!("only component stages use component traversal"),
 		};
 		self.use_committed_frontier = false;
 		self.stage_component_turfs = None;
-		result?;
-		let after = mixture_handles
-			.iter()
-			.map(|handle| Ok((*handle, self.require_handle(*handle)?.clone())))
-			.collect::<Result<Vec<_>, WorldError>>()?;
-		for (handle, record) in before {
-			*self.require_handle_mut(handle)? = record;
+		if let Err(error) = result {
+			state.transaction.rollback_to(checkpoint);
+			state.staged_events.truncate(event_checkpoint);
+			self.stage_components = Some(state);
+			return Err(error);
 		}
-		let component_events = self.events.split_off(event_start);
-		let state = self
-			.stage_components
-			.as_mut()
-			.expect("component stage owns traversal state");
-		state.staged_records.extend(after);
-		state.staged_events.extend(component_events);
 		state.queue.clear();
 		state.queue_index = 0;
 		state.next_neighbor = 0;
 		state.component_ready = false;
 		state.components_processed += 1;
+		self.stage_components = Some(state);
 		Ok(())
 	}
 
@@ -3132,21 +3142,61 @@ impl DogmosWorld {
 			.stage_components
 			.take()
 			.expect("component stage owns traversal state");
-		let requested_events = self.events.len().saturating_add(state.staged_events.len());
-		if requested_events > self.max_events as usize {
+		if let Err(error) =
+			self.validate_indexed_transaction(&state.transaction, state.staged_events.len())
+		{
 			self.stage_components = Some(state);
+			return Err(error);
+		}
+		let callback_events = u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX);
+		let components_processed = state.components_processed;
+		self.publish_indexed_transaction(state.transaction, state.staged_events);
+		Ok((callback_events, components_processed))
+	}
+
+	fn validate_indexed_transaction(
+		&self,
+		transaction: &IndexedTransaction<MixtureRecord>,
+		staged_event_count: usize,
+	) -> Result<(), WorldError> {
+		let requested_events = self.events.len().saturating_add(staged_event_count);
+		if requested_events > self.max_events as usize {
 			return Err(WorldError::EventCapacityExceeded {
 				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
 				capacity: self.max_events,
 			});
 		}
-		let callback_events = u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX);
-		let components_processed = state.components_processed;
-		for (handle, record) in state.staged_records {
-			*self.require_handle_mut(handle)? = record;
+		for entry in transaction.entries() {
+			let current = self
+				.require_handle(entry.handle)
+				.map_err(|_| WorldError::StageConflict)?;
+			if current.revision != entry.expected_revision {
+				return Err(WorldError::StageConflict);
+			}
 		}
-		self.events.extend(state.staged_events);
-		Ok((callback_events, components_processed))
+		Ok(())
+	}
+
+	fn publish_indexed_transaction(
+		&mut self,
+		mut transaction: IndexedTransaction<MixtureRecord>,
+		staged_events: Vec<WorldEvent>,
+	) {
+		transaction.sort_by_handle();
+		for entry in transaction.into_entries() {
+			let current = self
+				.require_handle_mut(entry.handle)
+				.expect("transaction handles were validated before commit");
+			if current.gases == entry.candidate.gases
+				&& current.temperature == entry.candidate.temperature
+			{
+				continue;
+			}
+			let mut candidate = entry.candidate;
+			candidate.revision = current.revision + 1;
+			*current = candidate;
+		}
+		self.events.extend(staged_events);
 	}
 
 	fn stage_component_discovery_complete(&self) -> bool {
@@ -3777,6 +3827,20 @@ impl DogmosWorld {
 		&mut self,
 		should_cancel: &mut impl FnMut() -> bool,
 	) -> Result<StageResult, WorldError> {
+		let max_entries = self.stage_turf_handles().len().min(self.mixtures.len());
+		let mut transaction = IndexedTransaction::try_new(self.mixtures.len(), max_entries)
+			.map_err(transaction_world_error)?;
+		let result = self.compute_excited_groups(&mut transaction, should_cancel)?;
+		self.validate_indexed_transaction(&transaction, 0)?;
+		self.publish_indexed_transaction(transaction, Vec::new());
+		Ok(result)
+	}
+
+	fn compute_excited_groups(
+		&self,
+		transaction: &mut IndexedTransaction<MixtureRecord>,
+		should_cancel: &mut impl FnMut() -> bool,
+	) -> Result<StageResult, WorldError> {
 		if should_cancel() {
 			return Err(WorldError::Cancelled);
 		}
@@ -3801,7 +3865,6 @@ impl DogmosWorld {
 		let mut heat_values = [0.0; MAX_GAS_SLOTS];
 		heat_values[..specific_heats.len()].copy_from_slice(specific_heats);
 		let mut found = BTreeSet::new();
-		let mut staged = BTreeMap::<MixtureHandle, MixtureRecord>::new();
 		let mut work_items = 0_u32;
 		for initial_slot in nodes.keys().copied() {
 			if found.contains(&initial_slot)
@@ -3864,9 +3927,13 @@ impl DogmosWorld {
 			let mut mixed_gases = [0.0; MAX_GAS_SLOTS];
 			let mut total_capacity = 0.0;
 			let mut total_energy = 0.0;
+			let mut mutable_mixtures = BTreeSet::new();
 			for slot in &accepted {
 				let handle = nodes[slot].1;
 				let mixture = self.require_handle(handle)?;
+				if transaction.contains(handle) || !mutable_mixtures.insert(handle) {
+					return Err(WorldError::DuplicateMutableTurfMixture(handle));
+				}
 				if mixture.revision == u32::MAX {
 					return Err(WorldError::RevisionExhausted(handle));
 				}
@@ -3888,10 +3955,12 @@ impl DogmosWorld {
 			};
 			for slot in accepted {
 				let handle = nodes[&slot].1;
-				let mut mixture = self.require_handle(handle)?.clone();
-				mixture.gases = mixed_gases;
-				mixture.temperature = mixed_temperature;
-				staged.insert(handle, mixture);
+				let mixture = self.require_handle(handle)?;
+				let candidate = transaction
+					.touch(handle, mixture.revision, mixture)
+					.map_err(transaction_world_error)?;
+				candidate.gases = mixed_gases;
+				candidate.temperature = mixed_temperature;
 				work_items = work_items
 					.checked_add(1)
 					.ok_or_else(|| WorldError::State("excited turf count exceeds u32".into()))?;
@@ -3900,19 +3969,27 @@ impl DogmosWorld {
 		if should_cancel() {
 			return Err(WorldError::Cancelled);
 		}
-		for (handle, mut record) in staged {
-			let current = self.require_handle_mut(handle)?;
-			if current.gases == record.gases && current.temperature == record.temperature {
-				continue;
-			}
-			record.revision = current.revision + 1;
-			*current = record;
-		}
 		Ok(StageResult { work_items })
 	}
 
 	fn process_equalize(
 		&mut self,
+		should_cancel: &mut impl FnMut() -> bool,
+	) -> Result<StageResult, WorldError> {
+		let max_entries = self.stage_turf_handles().len().min(self.mixtures.len());
+		let mut transaction = IndexedTransaction::try_new(self.mixtures.len(), max_entries)
+			.map_err(transaction_world_error)?;
+		let mut staged_events = Vec::new();
+		let result = self.compute_equalize(&mut transaction, &mut staged_events, should_cancel)?;
+		self.validate_indexed_transaction(&transaction, staged_events.len())?;
+		self.publish_indexed_transaction(transaction, staged_events);
+		Ok(result)
+	}
+
+	fn compute_equalize(
+		&self,
+		transaction: &mut IndexedTransaction<MixtureRecord>,
+		staged_events: &mut Vec<WorldEvent>,
 		should_cancel: &mut impl FnMut() -> bool,
 	) -> Result<StageResult, WorldError> {
 		if should_cancel() {
@@ -3945,8 +4022,6 @@ impl DogmosWorld {
 			})
 			.unwrap_or([0.0; MAX_GAS_SLOTS]);
 		let mut visited = BTreeSet::new();
-		let mut staged_records = BTreeMap::<MixtureHandle, MixtureRecord>::new();
-		let mut staged_events = Vec::new();
 		let mut work_items = 0_u32;
 		for start in turf_handles {
 			if !visited.insert(start.slot) {
@@ -4002,6 +4077,9 @@ impl DogmosWorld {
 				if !mutable_mixtures.insert(mixture_handle) {
 					return Err(WorldError::DuplicateMutableTurfMixture(mixture_handle));
 				}
+				if transaction.contains(mixture_handle) {
+					return Err(WorldError::DuplicateMutableTurfMixture(mixture_handle));
+				}
 				if mixture.revision == u32::MAX {
 					return Err(WorldError::RevisionExhausted(mixture_handle));
 				}
@@ -4010,9 +4088,9 @@ impl DogmosWorld {
 				minimum_moles = minimum_moles.min(moles);
 				maximum_moles = maximum_moles.max(moles);
 				mixtures_by_turf.insert(*turf_slot, mixture_handle);
-				staged_records
-					.entry(mixture_handle)
-					.or_insert_with(|| mixture.clone());
+				transaction
+					.touch(mixture_handle, mixture.revision, mixture)
+					.map_err(transaction_world_error)?;
 			}
 			if !immutable_turfs.is_empty() {
 				if maximum_moles >= 10.0 && !mixtures_by_turf.is_empty() {
@@ -4021,8 +4099,8 @@ impl DogmosWorld {
 						&immutable_turfs,
 						&mixtures_by_turf,
 						component_moles,
-						&mut staged_records,
-						&mut staged_events,
+						transaction,
+						staged_events,
 					)?;
 				}
 				work_items = work_items
@@ -4040,7 +4118,14 @@ impl DogmosWorld {
 				.iter()
 				.map(|slot| {
 					let handle = mixtures_by_turf[slot];
-					(*slot, total_moles(&staged_records[&handle]) - average_moles)
+					(
+						*slot,
+						total_moles(
+							transaction
+								.candidate(handle)
+								.expect("component mixtures were touched before balancing"),
+						) - average_moles,
+					)
 				})
 				.collect::<BTreeMap<_, _>>();
 			let mut flows = Vec::<(u32, u32, f32)>::new();
@@ -4059,8 +4144,8 @@ impl DogmosWorld {
 					balance,
 					&mixtures_by_turf,
 					&specific_heats,
-					&mut staged_records,
-					&mut staged_events,
+					transaction,
+					staged_events,
 				)?;
 			}
 			for &(child, parent, balance) in
@@ -4072,8 +4157,8 @@ impl DogmosWorld {
 					-balance,
 					&mixtures_by_turf,
 					&specific_heats,
-					&mut staged_records,
-					&mut staged_events,
+					transaction,
+					staged_events,
 				)?;
 			}
 			work_items = work_items
@@ -4083,22 +4168,6 @@ impl DogmosWorld {
 		if should_cancel() {
 			return Err(WorldError::Cancelled);
 		}
-		let requested_events = self.events.len().saturating_add(staged_events.len());
-		if requested_events > self.max_events as usize {
-			return Err(WorldError::EventCapacityExceeded {
-				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
-				capacity: self.max_events,
-			});
-		}
-		for (handle, mut record) in staged_records {
-			let current = self.require_handle_mut(handle)?;
-			if current.gases == record.gases && current.temperature == record.temperature {
-				continue;
-			}
-			record.revision = current.revision + 1;
-			*current = record;
-		}
-		self.events.extend(staged_events);
 		Ok(StageResult { work_items })
 	}
 
@@ -4109,7 +4178,7 @@ impl DogmosWorld {
 		immutable_turfs: &BTreeSet<u32>,
 		mixtures_by_turf: &BTreeMap<u32, MixtureHandle>,
 		component_moles: f32,
-		records: &mut BTreeMap<MixtureHandle, MixtureRecord>,
+		transaction: &mut IndexedTransaction<MixtureRecord>,
 		events: &mut Vec<WorldEvent>,
 	) -> Result<(), WorldError> {
 		let component_slots = component.iter().copied().collect::<BTreeSet<_>>();
@@ -4139,8 +4208,10 @@ impl DogmosWorld {
 		let removal_per_turf = component_moles / mutable_count as f32 * frontage / 4.0;
 		let mut local_losses = BTreeMap::<u32, f32>::new();
 		for (&turf_slot, &mixture_handle) in mixtures_by_turf {
-			let mut mixture = records[&mixture_handle].clone();
-			let before = total_moles(&mixture);
+			let mixture = transaction
+				.candidate_mut(mixture_handle)
+				.expect("component mixtures were touched before decompression");
+			let before = total_moles(mixture);
 			let ratio = if before > 0.0 {
 				(removal_per_turf / before).clamp(0.0, 1.0)
 			} else {
@@ -4149,8 +4220,7 @@ impl DogmosWorld {
 			for amount in &mut mixture.gases {
 				*amount -= quantize(*amount * ratio);
 			}
-			let lost = before - total_moles(&mixture);
-			records.insert(mixture_handle, mixture);
+			let lost = before - total_moles(mixture);
 			local_losses.insert(turf_slot, lost);
 		}
 		for left in component_slots.iter().copied() {
@@ -4214,7 +4284,7 @@ impl DogmosWorld {
 		amount: f32,
 		mixtures_by_turf: &BTreeMap<u32, MixtureHandle>,
 		specific_heats: &[f32; MAX_GAS_SLOTS],
-		records: &mut BTreeMap<MixtureHandle, MixtureRecord>,
+		transaction: &mut IndexedTransaction<MixtureRecord>,
 		events: &mut Vec<WorldEvent>,
 	) -> Result<(), WorldError> {
 		let source_handle = mixtures_by_turf[&source_slot];
@@ -4222,11 +4292,10 @@ impl DogmosWorld {
 		if source_handle == target_handle {
 			return Err(WorldError::DuplicateMutableTurfMixture(source_handle));
 		}
-		let mut source = records[&source_handle].clone();
-		let mut target = records[&target_handle].clone();
-		let moved = transfer_moles(&mut source, &mut target, amount, specific_heats)?;
-		records.insert(source_handle, source);
-		records.insert(target_handle, target);
+		let (source, target) = transaction
+			.candidate_pair_mut(source_handle, target_handle)
+			.map_err(transaction_world_error)?;
+		let moved = transfer_moles(source, target, amount, specific_heats)?;
 		if moved > 0.0 {
 			events.push(WorldEvent::PressureDifference {
 				source: self.current_turf_handle(source_slot)?,
@@ -5456,6 +5525,47 @@ mod tests {
 			world.reusable_workset_bytes() - before,
 			expected_edge_bytes as u64
 		);
+	}
+
+	#[test]
+	fn reusable_workset_counts_the_component_transaction_capacity() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let before = world.reusable_workset_bytes();
+		let state = StageComponentState::try_new(4, 3).unwrap();
+		let expected_transaction_bytes = state.transaction.capacity_bytes_lower_bound();
+		world.stage_components = Some(state);
+
+		assert_eq!(
+			world.reusable_workset_bytes() - before,
+			expected_transaction_bytes as u64
+		);
+	}
+
+	#[test]
+	fn component_commit_revalidates_the_initial_mixture_revision() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		world
+			.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: handle(0),
+			}])
+			.unwrap();
+		let original = world.require_handle(handle(0)).unwrap().clone();
+		let mut state = StageComponentState::try_new(1, 1).unwrap();
+		state
+			.transaction
+			.touch(handle(0), original.revision, &original)
+			.unwrap()
+			.temperature = 500.0;
+		world.mixtures[0].mixture.as_mut().unwrap().revision += 1;
+		world.stage_components = Some(state);
+
+		assert_eq!(
+			world.commit_stage_components(),
+			Err(WorldError::StageConflict)
+		);
+		assert_eq!(world.require_handle(handle(0)).unwrap().temperature, 2.7);
+		assert!(world.stage_components.is_some());
 	}
 
 	#[test]

@@ -914,3 +914,171 @@ fn equalize_rolls_back_earlier_components_when_a_later_component_overflows_event
 		);
 	}
 }
+
+#[test]
+fn equalize_rejects_a_mutable_mixture_shared_by_disconnected_components() {
+	let turfs = [turf(0, 1), turf(1, 1), turf(2, 1), turf(3, 1)];
+	let mixtures = [mixture(0), mixture(1), mixture(2)];
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&mixtures.map(|handle| LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle,
+		}))
+		.unwrap();
+	for (index, handle) in mixtures.into_iter().enumerate() {
+		let mut gases = [0.0; MAX_GAS_SLOTS];
+		gases[0] = 100.0 * (index + 1) as f32;
+		world
+			.apply_mixture_state(&[MixtureStateMutation {
+				handle,
+				expected_revision: 0,
+				temperature: 293.15,
+				volume: 2500.0,
+				gases,
+			}])
+			.unwrap();
+	}
+	world
+		.apply_turf_lifecycle(&[
+			TurfLifecycleMutation::Register {
+				handle: turfs[0],
+				mixture: Some(mixtures[0]),
+			},
+			TurfLifecycleMutation::Register {
+				handle: turfs[1],
+				mixture: Some(mixtures[1]),
+			},
+			TurfLifecycleMutation::Register {
+				handle: turfs[2],
+				mixture: Some(mixtures[1]),
+			},
+			TurfLifecycleMutation::Register {
+				handle: turfs[3],
+				mixture: Some(mixtures[2]),
+			},
+		])
+		.unwrap();
+	world
+		.apply_turf_adjacency(&[
+			TurfAdjacencyMutation {
+				left: turfs[0],
+				right: turfs[1],
+				connected: true,
+			},
+			TurfAdjacencyMutation {
+				left: turfs[2],
+				right: turfs[3],
+				connected: true,
+			},
+		])
+		.unwrap();
+	world.begin_frontier(1, 4).unwrap();
+	world.append_frontier(1, 0, &turfs).unwrap();
+	world.commit_frontier(1).unwrap();
+	let request = StageChunkRequest {
+		stage: WorldStage::Equalize,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 1,
+		seconds_per_tick: 0.5,
+	};
+
+	let error = (0..64)
+		.find_map(|_| {
+			world
+				.process_stage_chunk_cancellable(request, || false)
+				.err()
+		})
+		.expect("the shared mutable mixture must be rejected");
+
+	assert_eq!(error, WorldError::DuplicateMutableTurfMixture(mixtures[1]));
+	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 100.0);
+	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 200.0);
+	assert_eq!(world.snapshot(mixtures[2]).unwrap().gases[0], 300.0);
+}
+
+#[test]
+fn excited_groups_rejects_a_mutable_mixture_shared_by_disconnected_components() {
+	let turfs = [turf(0, 1), turf(1, 1), turf(2, 1), turf(3, 1)];
+	let mixtures = [mixture(0), mixture(1), mixture(2)];
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&mixtures.map(|handle| LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle,
+		}))
+		.unwrap();
+	for (index, handle) in mixtures.into_iter().enumerate() {
+		let mut gases = [0.0; MAX_GAS_SLOTS];
+		gases[0] = 100.0 + index as f32 * 0.1;
+		world
+			.apply_mixture_state(&[MixtureStateMutation {
+				handle,
+				expected_revision: 0,
+				temperature: 293.15,
+				volume: 2500.0,
+				gases,
+			}])
+			.unwrap();
+	}
+	world
+		.apply_turf_lifecycle(&[
+			TurfLifecycleMutation::Register {
+				handle: turfs[0],
+				mixture: Some(mixtures[0]),
+			},
+			TurfLifecycleMutation::Register {
+				handle: turfs[1],
+				mixture: Some(mixtures[1]),
+			},
+			TurfLifecycleMutation::Register {
+				handle: turfs[2],
+				mixture: Some(mixtures[1]),
+			},
+			TurfLifecycleMutation::Register {
+				handle: turfs[3],
+				mixture: Some(mixtures[2]),
+			},
+		])
+		.unwrap();
+	world
+		.apply_turf_adjacency(&[
+			TurfAdjacencyMutation {
+				left: turfs[0],
+				right: turfs[1],
+				connected: true,
+			},
+			TurfAdjacencyMutation {
+				left: turfs[2],
+				right: turfs[3],
+				connected: true,
+			},
+		])
+		.unwrap();
+	world.begin_frontier(1, 4).unwrap();
+	world.append_frontier(1, 0, &turfs).unwrap();
+	world.commit_frontier(1).unwrap();
+	let request = StageChunkRequest {
+		stage: WorldStage::ExcitedGroups,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 1,
+		seconds_per_tick: 0.5,
+	};
+
+	let error = (0..64)
+		.find_map(|_| {
+			world
+				.process_stage_chunk_cancellable(request, || false)
+				.err()
+		})
+		.expect("the shared mutable mixture must be rejected");
+
+	assert_eq!(error, WorldError::DuplicateMutableTurfMixture(mixtures[1]));
+	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 100.0);
+	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 100.1);
+	assert_eq!(world.snapshot(mixtures[2]).unwrap().gases[0], 100.2);
+}

@@ -63,6 +63,7 @@ impl<T: Clone> IndexedTransaction<T> {
 		})
 	}
 
+	#[cfg(test)]
 	pub(crate) fn len(&self) -> usize {
 		self.entries.len()
 	}
@@ -161,6 +162,10 @@ impl<T: Clone> IndexedTransaction<T> {
 
 	pub(crate) fn entries(&self) -> &[TransactionEntry<T>] {
 		&self.entries
+	}
+
+	pub(crate) fn into_entries(self) -> Vec<TransactionEntry<T>> {
+		self.entries
 	}
 
 	pub(crate) fn capacity_bytes_lower_bound(&self) -> usize {
