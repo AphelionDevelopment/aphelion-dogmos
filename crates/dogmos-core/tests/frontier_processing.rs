@@ -196,11 +196,12 @@ fn frontier_commit_rejects_duplicate_unknown_and_stale_handles() {
 	register_turfs(&mut world, &[first, second]);
 
 	world.begin_frontier(1, 2).unwrap();
-	world.append_frontier(1, 0, &[first, first]).unwrap();
 	assert_eq!(
-		world.commit_frontier(1),
+		world.append_frontier(1, 0, &[first, first]),
 		Err(WorldError::Frontier(FrontierError::DuplicateHandle(first)))
 	);
+	assert_eq!(world.append_frontier(1, 0, &[first, second]), Ok(2));
+	assert_eq!(world.commit_frontier(1), Ok(2));
 
 	world.begin_frontier(2, 1).unwrap();
 	world.append_frontier(2, 0, &[turf(9, 1)]).unwrap();
@@ -223,6 +224,34 @@ fn frontier_commit_rejects_duplicate_unknown_and_stale_handles() {
 			current: 2,
 		})
 	);
+}
+
+#[test]
+fn frontier_upload_rejects_cross_chunk_duplicates_without_consuming_the_range() {
+	let handles = [turf(0, 1), turf(1, 1), turf(2, 1)];
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &handles);
+
+	world.begin_frontier(1, 3).unwrap();
+	assert_eq!(world.append_frontier(1, 2, &handles[2..]), Ok(1));
+	assert_eq!(world.append_frontier(1, 0, &handles[..1]), Ok(1));
+	assert_eq!(
+		world.append_frontier(1, 1, &handles[..1]),
+		Err(WorldError::Frontier(FrontierError::DuplicateHandle(
+			handles[0]
+		)))
+	);
+	assert_eq!(
+		world.commit_frontier(1),
+		Err(WorldError::Frontier(FrontierError::Incomplete {
+			epoch: 1,
+			expected: 3,
+			received: 2,
+		}))
+	);
+	assert_eq!(world.append_frontier(1, 1, &handles[1..2]), Ok(1));
+	assert_eq!(world.commit_frontier(1), Ok(3));
+	assert_eq!(world.committed_frontier(), &handles);
 }
 
 #[test]

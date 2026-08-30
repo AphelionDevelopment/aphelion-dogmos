@@ -604,6 +604,10 @@ git commit -m "perf: reuse measured server translation scratch"
 
 ### Task 11: Remove bootstrap frontier duplicate allocation without changing committed order
 
+**Status:** Complete at the Task 11 commit boundary. Duplicate handles are rejected atomically at
+append time across and within chunks, failed ranges remain retryable, out-of-order ranges retain
+their positional order, and commit no longer constructs a full-frontier `BTreeSet`.
+
 **Files:**
 - Modify: `crates/dogmos-core/src/frontier.rs`
 - Test: `crates/dogmos-core/tests/frontier_processing.rs`
@@ -612,26 +616,26 @@ git commit -m "perf: reuse measured server translation scratch"
 - Consumes: chunked begin/append/commit upload.
 - Produces: incremental duplicate validation during append and unchanged ordered committed frontier.
 
-- [ ] **Step 1: Add cross-chunk duplicate tests**
+- [x] **Step 1: Add cross-chunk duplicate tests**
 
 Upload the same handle in two non-overlapping append ranges and assert the second append fails atomically. Also cover retry after failure, out-of-order non-overlapping ranges, incomplete upload, and exact committed order.
 
-- [ ] **Step 2: Track upload handles incrementally**
+- [x] **Step 2: Track upload handles incrementally**
 
 Add an `upload_seen: HashSet<TurfHandle>` cleared/reserved at `begin`. Before writing an append range, validate every handle against both the current set and a temporary set for that chunk; only extend `upload_seen` after the whole chunk passes.
 
-- [ ] **Step 3: Remove `pending()`'s `BTreeSet` pass**
+- [x] **Step 3: Remove `pending()`'s `BTreeSet` pass**
 
 Once append owns duplicate validation, `pending()` checks epoch and completeness only. Keep `commit_validated`'s ordered vector swap and committed-set rebuild. Do not change `remove()` ordering in this task.
 
-- [ ] **Step 4: Verify frontier and event determinism**
+- [x] **Step 4: Verify frontier and event determinism**
 
 ```powershell
 cargo +1.98.0 test -p dogmos-core --locked --target x86_64-pc-windows-msvc --test frontier_processing
 cargo +1.98.0 test -p dogmos-core --locked --target i686-pc-windows-msvc --test frontier_processing
 ```
 
-- [ ] **Step 5: Suggested commit boundary**
+- [x] **Step 5: Suggested commit boundary**
 
 ```powershell
 git add crates/dogmos-core/src/frontier.rs crates/dogmos-core/tests/frontier_processing.rs

@@ -1,5 +1,5 @@
 use crate::metadata::TurfHandle;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrontierError {
@@ -44,6 +44,7 @@ pub(crate) struct FrontierState {
 	upload_received: u32,
 	staging: Vec<TurfHandle>,
 	received_bits: Vec<u64>,
+	upload_seen: HashSet<TurfHandle>,
 }
 
 impl FrontierState {
@@ -93,6 +94,10 @@ impl FrontierState {
 			.map_err(|_| FrontierError::AllocationFailed)?;
 		self.received_bits.resize(word_count, 0);
 		self.received_bits.fill(0);
+		self.upload_seen.clear();
+		self.upload_seen
+			.try_reserve(expected_usize.saturating_sub(self.upload_seen.capacity()))
+			.map_err(|_| FrontierError::AllocationFailed)?;
 		self.upload_epoch = Some(epoch);
 		self.upload_expected = expected;
 		self.upload_received = 0;
@@ -134,11 +139,21 @@ impl FrontierState {
 		if (offset..end).any(|index| self.is_received(index)) {
 			return Err(FrontierError::RangeAlreadyReceived { offset, count });
 		}
+		let mut incoming = HashSet::new();
+		incoming
+			.try_reserve(handles.len())
+			.map_err(|_| FrontierError::AllocationFailed)?;
+		for handle in handles {
+			if self.upload_seen.contains(handle) || !incoming.insert(*handle) {
+				return Err(FrontierError::DuplicateHandle(*handle));
+			}
+		}
 		for (relative_index, handle) in handles.iter().enumerate() {
 			let index = offset as usize + relative_index;
 			self.staging[index] = *handle;
 			self.received_bits[index / u64::BITS as usize] |= 1 << (index % u64::BITS as usize);
 		}
+		self.upload_seen.extend(handles.iter().copied());
 		self.upload_received += count;
 		Ok(count)
 	}
@@ -158,12 +173,6 @@ impl FrontierState {
 				received: self.upload_received,
 			});
 		}
-		let mut unique = BTreeSet::new();
-		for handle in &self.staging {
-			if !unique.insert(*handle) {
-				return Err(FrontierError::DuplicateHandle(*handle));
-			}
-		}
 		Ok(&self.staging)
 	}
 
@@ -178,6 +187,7 @@ impl FrontierState {
 		self.upload_epoch = None;
 		self.upload_expected = 0;
 		self.upload_received = 0;
+		self.upload_seen.clear();
 		self.committed_set.clear();
 		self.committed_set.extend(self.committed.iter().copied());
 		Ok(self.committed.len() as u32)
@@ -265,7 +275,8 @@ impl FrontierState {
 
 	pub(crate) fn upload_bytes(&self) -> u64 {
 		(self.staging.capacity() * std::mem::size_of::<TurfHandle>()
-			+ self.received_bits.capacity() * std::mem::size_of::<u64>()) as u64
+			+ self.received_bits.capacity() * std::mem::size_of::<u64>()
+			+ self.upload_seen.capacity() * std::mem::size_of::<TurfHandle>()) as u64
 	}
 
 	fn is_received(&self, index: u32) -> bool {
