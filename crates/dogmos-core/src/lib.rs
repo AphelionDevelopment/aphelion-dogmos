@@ -4,6 +4,8 @@ pub mod numerics;
 pub mod reactions;
 pub mod stage_cursor;
 pub mod topology;
+#[allow(dead_code)]
+mod transaction;
 pub mod world;
 
 pub use numerics::diffusion::MixtureHandle;
