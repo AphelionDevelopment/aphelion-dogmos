@@ -13,7 +13,7 @@ use crate::{
 		GAS_DIFFUSION_CONSTANT,
 	},
 	stage_cursor::{StageCursor, MAX_STAGE_WORK_LIMIT},
-	topology::{PackedTopology, TopologyError},
+	topology::{PackedTopology, TopologyError, MAX_TURF_NEIGHBORS},
 	MixtureHandle, MAX_GAS_SLOTS,
 };
 use std::{
@@ -2554,17 +2554,20 @@ impl DogmosWorld {
 			.as_ref()
 			.expect("process-turfs stage owns diffusion state");
 		let turf = state.turfs[index];
-		let neighbors = self
-			.topology
-			.gas_neighbors(turf)
-			.filter_map(|neighbor| state.index_by_turf.get(&neighbor.handle).copied())
-			.collect::<Vec<_>>();
-		let self_weight = diffusion_self_weight(neighbors.len() as u32)
+		let mut neighbors = [0_usize; MAX_TURF_NEIGHBORS];
+		let mut neighbor_count = 0;
+		for neighbor in self.topology.gas_neighbors(turf) {
+			if let Some(index) = state.index_by_turf.get(&neighbor.handle).copied() {
+				neighbors[neighbor_count] = index;
+				neighbor_count += 1;
+			}
+		}
+		let self_weight = diffusion_self_weight(neighbor_count as u32)
 			.map_err(|error| WorldError::State(error.to_string()))?;
 		let mut output = [0.0; MAX_GAS_SLOTS];
 		for (gas_index, output_value) in output.iter_mut().enumerate() {
 			let mut next_value = state.input[index][gas_index] * self_weight;
-			for neighbor in &neighbors {
+			for neighbor in &neighbors[..neighbor_count] {
 				next_value += state.input[*neighbor][gas_index] * GAS_DIFFUSION_CONSTANT;
 			}
 			*output_value = next_value;

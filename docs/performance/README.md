@@ -46,3 +46,10 @@ the largest byte allocator at 197,006,624-198,765,028 bytes and 264,873-269,491 
 excited-groups made 330,967-359,948 allocations and allocated 157,116,200-158,375,520 bytes. These
 controls prioritize component traversal and per-turf diffusion churn while preserving distinct
 transcript hashes for each topology and stage.
+
+Replacing the process-turfs neighbor `Vec` with the topology's six-entry stack bound produced three
+byte-identical 36-row candidate runs with SHA-256
+`7F4733C1E9BC9FECD003F352D34A9F05721308C723F839A31E83BBE2A44A36B4`. Every process-turfs
+transcript hash matched its control. Each fixture eliminated exactly one allocation and 32 allocated
+bytes per turf: the 100,000-turf cases fell from 133,396 to 33,396 allocations and from 79,892,176
+to 76,692,176 allocated bytes for all three topologies.

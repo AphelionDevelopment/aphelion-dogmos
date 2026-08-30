@@ -424,6 +424,10 @@ git commit -m "perf: batch mixture edge cleanup"
 
 ### Task 7: Remove the per-turf diffusion neighbor allocation
 
+**Status:** Complete at the Task 7 commit boundary. Three byte-identical candidate processes removed
+exactly one allocation and 32 allocated bytes per turf while preserving every control transcript
+hash across corridor, grid, and multiz fixtures at 1,000/10,000/100,000 turfs.
+
 **Files:**
 - Modify: `crates/dogmos-core/src/world.rs`
 - Test: `crates/dogmos-core/tests/frontier_processing.rs`
@@ -433,11 +437,11 @@ git commit -m "perf: batch mixture edge cleanup"
 - Consumes: sorted `PackedTopology::gas_neighbors`, maximum degree six.
 - Produces: stack neighbor indices and byte-identical stage results/events.
 
-- [ ] **Step 1: Add allocation/transcript evidence**
+- [x] **Step 1: Add allocation/transcript evidence**
 
 Extend the allocation probe with corridor, grid, and six-neighbor multiz diffusion cases. Record allocations after fixture construction and hash final gas vectors.
 
-- [ ] **Step 2: Replace `collect::<Vec<_>>()` with fixed storage**
+- [x] **Step 2: Replace `collect::<Vec<_>>()` with fixed storage**
 
 Use the existing topology maximum constant if exposed; otherwise add one shared core constant:
 
@@ -454,7 +458,7 @@ for neighbor in self.topology.gas_neighbors(turf) {
 
 Iterate `&neighbors[..neighbor_count]` for each gas and derive self-weight from `neighbor_count`.
 
-- [ ] **Step 3: Run numerical and transcript gates**
+- [x] **Step 3: Run numerical and transcript gates**
 
 ```powershell
 cargo +1.98.0 test -p dogmos-core --locked --target x86_64-pc-windows-msvc --test numerical_properties
@@ -464,7 +468,7 @@ cargo +1.98.0 test -p dogmos-core --locked --target i686-pc-windows-msvc
 
 Expected: exact stage transcript hash and zero per-node neighbor allocations after fixture setup.
 
-- [ ] **Step 4: Suggested commit boundary**
+- [x] **Step 4: Suggested commit boundary**
 
 ```powershell
 git add crates/dogmos-core/src/world.rs crates/dogmos-core/tests/frontier_processing.rs crates/dogmos-core/tests/numerical_properties.rs
