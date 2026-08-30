@@ -21,15 +21,19 @@ New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
 
 Push-Location $repositoryRoot
 try {
-	& cargo "+$rustToolchain" build -p dogmos-server --bin dogmosd --target $serverTarget --release --offline
+	& cargo "+$rustToolchain" build -p dogmos-server --bin dogmosd --target $serverTarget --release --locked --offline
 	if ($LASTEXITCODE -ne 0) { throw "x64 dogmosd build failed with exit code $LASTEXITCODE" }
 	$env:DOGMOSD_PATH = Join-Path $repositoryRoot "target\$serverTarget\release\dogmosd.exe"
 	$env:DOGMOS_IPC_ITERATIONS = $Iterations
+	$successfulStatusRecords = @()
+	$successfulCsvPaths = @()
 	for ($run = 1; $run -le $Repetitions; $run++) {
 		$outputPath = Join-Path $outputDirectory "ipc-round-trip-$run.csv"
 		$memoryPath = Join-Path $outputDirectory "ipc-process-memory-$run.csv"
+		$statusPath = Join-Path $outputDirectory "ipc-round-trip-$run.status.json"
+		Remove-Item -LiteralPath $outputPath, $memoryPath, $statusPath -Force -ErrorAction SilentlyContinue
 		'role,process_id,private_bytes,virtual_bytes,working_set_bytes' | Set-Content -LiteralPath $memoryPath
-		& cargo "+$rustToolchain" bench -p dogmos-perf --bench ipc_round_trip --target $shimTarget --offline 2>&1 |
+		& cargo "+$rustToolchain" bench -p dogmos-perf --bench ipc_round_trip --target $shimTarget --locked --offline 2>&1 |
 			Tee-Object -FilePath $outputPath |
 			ForEach-Object {
 				Write-Output $_
@@ -44,7 +48,32 @@ try {
 					}
 				}
 			}
-		if ($LASTEXITCODE -ne 0) { throw "IPC benchmark run $run failed with exit code $LASTEXITCODE" }
+		$benchmarkExitCode = $LASTEXITCODE
+		if ($benchmarkExitCode -ne 0) { throw "IPC benchmark run $run failed with exit code $benchmarkExitCode" }
+		$status = [ordered]@{
+			run = $run
+			status = 'succeeded'
+			iterations = $Iterations
+			source_revision = $buildIdentity.source_revision
+			feature_fingerprint = $buildIdentity.feature_fingerprint
+			rust_toolchain = $rustToolchain
+			shim_target = $shimTarget
+			server_target = $serverTarget
+			output_path = $outputPath
+			memory_path = $memoryPath
+			completed_utc = [DateTime]::UtcNow.ToString('o')
+		}
+		$status | ConvertTo-Json | Set-Content -LiteralPath $statusPath -Encoding utf8
+		$successfulStatusRecords += $statusPath
+		$successfulCsvPaths += $outputPath
+	}
+	if ($successfulStatusRecords.Count -ne $Repetitions -or $successfulCsvPaths.Count -ne $Repetitions) {
+		throw "IPC benchmark produced $($successfulStatusRecords.Count) status records and $($successfulCsvPaths.Count) CSVs; expected $Repetitions of each"
+	}
+	foreach ($path in @($successfulStatusRecords) + @($successfulCsvPaths)) {
+		if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+			throw "IPC benchmark evidence is incomplete: missing $path"
+		}
 	}
 } finally {
 	Remove-Item Env:DOGMOSD_PATH -ErrorAction SilentlyContinue

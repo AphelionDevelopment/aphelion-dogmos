@@ -1,10 +1,14 @@
 use dogmos_byond::DogmosClient;
 use dogmos_protocol::{
-	encode_adjacency_batch, encode_lifecycle_batch, AdjacencyMutation, BuildIdentity,
-	CallbackBatchRequest, CallbackScope, CapacityLimits, HandshakePayload, LifecycleAction,
-	LifecycleMutation, MixtureSnapshotRequest, OperationKind, ScalarValue, SimulationStage,
-	SimulationStageRequest, WireHandle, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
-	MAX_CONTROL_PAYLOAD, MIXTURE_SNAPSHOT_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	encode_gas_metadata_batch, encode_lifecycle_batch, encode_mixture_state_batch,
+	encode_turf_adjacency_batch, encode_turf_lifecycle_batch, BuildIdentity, CallbackBatchRequest,
+	CallbackScope, CapacityLimits, FrontierAppendRequest, FrontierBeginRequest,
+	FrontierCommitRequest, GasMetadataRegistration, HandshakePayload, LifecycleAction,
+	LifecycleMutation, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ScalarValue,
+	SimulationStage, SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
+	TurfLifecycleMutation, WireGasFireRole, WireHandle, DOGMOS_ABI_VERSION,
+	DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS,
+	MIXTURE_SNAPSHOT_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 use std::{
 	error::Error,
@@ -16,6 +20,10 @@ use std::{
 
 const DEFAULT_ITERATIONS: usize = 20_000;
 const WARMUP_ITERATIONS: usize = 1_000;
+const SERVICE_MIXTURE_COUNT: usize = 1024;
+const SERVICE_GAS_COUNT: usize = 32;
+const SERVICE_STAGE_ITERATION_LIMIT: usize = 500;
+const SERVICE_STAGE_WORK_LIMIT: u32 = 1024;
 
 struct ChildGuard(Child);
 
@@ -31,6 +39,11 @@ struct Case {
 	operation: OperationKind,
 	request: Vec<u8>,
 	response_len: usize,
+}
+
+struct ServiceBenchmarkState {
+	frontier_epoch: u64,
+	next_stage_epoch: u64,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -66,15 +79,30 @@ fn main() -> Result<(), Box<dyn Error>> {
 		std::process::id(),
 		client.peer().process_id,
 	);
-	println!("case,request_bytes,response_bytes,iterations,p50_ns,p95_ns,p99_ns,max_ns");
+	println!(
+		"case,request_bytes,response_bytes,iterations,p50_ns,p95_ns,p99_ns,max_ns,work_items_per_iteration"
+	);
 	for case in cases() {
-		let case_iterations = if case.operation == OperationKind::SimulationStage {
-			iterations.min(500)
-		} else {
-			iterations
-		};
-		run_case(&mut client, &case, case_iterations)?;
+		run_case(&mut client, &case, iterations)?;
 	}
+	let mut service_state = prepare_service_world(&mut client)?;
+	run_case(
+		&mut client,
+		&Case {
+			name: "service_mixture_snapshot_32_gases".into(),
+			operation: OperationKind::MixtureSnapshot,
+			request: MixtureSnapshotRequest { handle: handle(1) }
+				.encode()
+				.to_vec(),
+			response_len: MIXTURE_SNAPSHOT_LEN,
+		},
+		iterations,
+	)?;
+	run_service_stage_case(
+		&mut client,
+		&mut service_state,
+		iterations.min(SERVICE_STAGE_ITERATION_LIMIT),
+	)?;
 	client.shutdown()?;
 	if !service.0.wait()?.success() {
 		return Err("dogmosd did not shut down cleanly".into());
@@ -88,12 +116,7 @@ fn run_case(
 	iterations: usize,
 ) -> Result<(), Box<dyn Error>> {
 	let mut response = vec![0_u8; case.response_len];
-	let warmup_iterations = if case.operation == OperationKind::SimulationStage {
-		50
-	} else {
-		WARMUP_ITERATIONS
-	};
-	for _ in 0..warmup_iterations {
+	for _ in 0..WARMUP_ITERATIONS {
 		let received = client.round_trip_into(case.operation, &case.request, &mut response)?;
 		black_box(&response[..received]);
 	}
@@ -107,7 +130,7 @@ fn run_case(
 	}
 	samples.sort_unstable();
 	println!(
-		"{},{},{},{},{},{},{},{}",
+		"{},{},{},{},{},{},{},{},0",
 		case.name,
 		case.request.len(),
 		case.response_len,
@@ -130,123 +153,292 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 	sorted.get(index).copied().unwrap_or(0)
 }
 
+fn handle(slot: usize) -> WireHandle {
+	WireHandle {
+		slot: slot as u32,
+		generation: 1,
+	}
+}
+
+fn validate_count(
+	response: [u8; 4],
+	expected: usize,
+	operation: &str,
+) -> Result<(), Box<dyn Error>> {
+	let actual = u32::from_le_bytes(response) as usize;
+	if actual != expected {
+		return Err(format!("{operation} processed {actual} records; expected {expected}").into());
+	}
+	Ok(())
+}
+
+fn prepare_service_world(
+	client: &mut DogmosClient,
+) -> Result<ServiceBenchmarkState, Box<dyn Error>> {
+	let gases = (0..SERVICE_GAS_COUNT)
+		.map(|id| GasMetadataRegistration {
+			id: id as u16,
+			key: format!("gas_{id}"),
+			name: format!("Benchmark gas {id}"),
+			flags: 0,
+			specific_heat: ScalarValue(20.0 + id as f64),
+			fusion_power: ScalarValue(0.0),
+			moles_visible: None,
+			enthalpy: ScalarValue(0.0),
+			fire_radiation_released: ScalarValue(0.0),
+			fire_role: WireGasFireRole::None,
+			fire_products: None,
+		})
+		.collect::<Vec<_>>();
+	let mut request = Vec::new();
+	let mut count_response = [0_u8; 4];
+	encode_gas_metadata_batch(&gases, &mut request)?;
+	client.round_trip_into(
+		OperationKind::GasMetadataInstall,
+		&request,
+		&mut count_response,
+	)?;
+	validate_count(count_response, SERVICE_GAS_COUNT, "gas metadata install")?;
+
+	let mixtures = (0..SERVICE_MIXTURE_COUNT)
+		.map(|slot| LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle: handle(slot),
+		})
+		.collect::<Vec<_>>();
+	encode_lifecycle_batch(&mixtures, &mut request)?;
+	client.round_trip_into(
+		OperationKind::MixtureLifecycleBatch,
+		&request,
+		&mut count_response,
+	)?;
+	validate_count(count_response, SERVICE_MIXTURE_COUNT, "mixture lifecycle")?;
+
+	for start in (0..SERVICE_MIXTURE_COUNT).step_by(128) {
+		let end = (start + 128).min(SERVICE_MIXTURE_COUNT);
+		let states = (start..end)
+			.map(|slot| {
+				let mut gas_values = [ScalarValue(0.0); MAX_GAS_SLOTS];
+				gas_values[slot % SERVICE_GAS_COUNT] = ScalarValue(10.0 + slot as f64 / 100.0);
+				MixtureStateMutation {
+					handle: handle(slot),
+					expected_revision: 0,
+					temperature: ScalarValue(273.15 + (slot % 80) as f64),
+					volume: ScalarValue(2500.0),
+					gases: gas_values,
+				}
+			})
+			.collect::<Vec<_>>();
+		encode_mixture_state_batch(&states, &mut request)?;
+		client.round_trip_into(
+			OperationKind::MixtureStateBatch,
+			&request,
+			&mut count_response,
+		)?;
+		validate_count(count_response, states.len(), "mixture state seed")?;
+	}
+
+	let turfs = (0..SERVICE_MIXTURE_COUNT)
+		.map(|slot| TurfLifecycleMutation {
+			action: LifecycleAction::Register,
+			turf: handle(slot),
+			mixture: Some(handle(slot)),
+		})
+		.collect::<Vec<_>>();
+	encode_turf_lifecycle_batch(&turfs, &mut request)?;
+	client.round_trip_into(
+		OperationKind::TurfLifecycleBatch,
+		&request,
+		&mut count_response,
+	)?;
+	validate_count(count_response, SERVICE_MIXTURE_COUNT, "turf lifecycle")?;
+
+	let topology = (0..SERVICE_MIXTURE_COUNT)
+		.map(|slot| TurfAdjacencyMutation {
+			left: handle(slot),
+			right: handle((slot + 1) % SERVICE_MIXTURE_COUNT),
+			connected: true,
+			firelock: false,
+		})
+		.collect::<Vec<_>>();
+	encode_turf_adjacency_batch(&topology, &mut request)?;
+	client.round_trip_into(
+		OperationKind::TurfAdjacencyBatch,
+		&request,
+		&mut count_response,
+	)?;
+	validate_count(count_response, SERVICE_MIXTURE_COUNT, "turf topology")?;
+
+	let frontier_epoch = 1;
+	let mut begin_response = [0_u8; 8];
+	client.round_trip_into(
+		OperationKind::FrontierBegin,
+		&FrontierBeginRequest {
+			epoch: frontier_epoch,
+			expected_count: SERVICE_MIXTURE_COUNT as u32,
+		}
+		.encode(),
+		&mut begin_response,
+	)?;
+	if u64::from_le_bytes(begin_response) != frontier_epoch {
+		return Err("frontier begin returned the wrong epoch".into());
+	}
+	let frontier_handles = (0..SERVICE_MIXTURE_COUNT).map(handle).collect::<Vec<_>>();
+	for (chunk_index, handles) in frontier_handles
+		.chunks(MAX_FRONTIER_APPEND_HANDLES)
+		.enumerate()
+	{
+		client.round_trip_into(
+			OperationKind::FrontierAppend,
+			&FrontierAppendRequest {
+				epoch: frontier_epoch,
+				offset: (chunk_index * MAX_FRONTIER_APPEND_HANDLES) as u32,
+				handles: handles.to_vec(),
+			}
+			.encode()?,
+			&mut count_response,
+		)?;
+		validate_count(count_response, handles.len(), "frontier append")?;
+	}
+	let mut commit_response = [0_u8; 16];
+	client.round_trip_into(
+		OperationKind::FrontierCommit,
+		&FrontierCommitRequest {
+			epoch: frontier_epoch,
+		}
+		.encode(),
+		&mut commit_response,
+	)?;
+	if u64::from_le_bytes(commit_response[0..8].try_into()?) != frontier_epoch
+		|| u32::from_le_bytes(commit_response[8..12].try_into()?) as usize != SERVICE_MIXTURE_COUNT
+	{
+		return Err("frontier commit returned unexpected identity or count".into());
+	}
+
+	Ok(ServiceBenchmarkState {
+		frontier_epoch,
+		next_stage_epoch: 1,
+	})
+}
+
+fn run_service_stage_iteration(
+	client: &mut DogmosClient,
+	state: &mut ServiceBenchmarkState,
+) -> Result<u32, Box<dyn Error>> {
+	let request = SimulationStageRequest {
+		stage: SimulationStage::ProcessTurfs,
+		frontier_epoch: state.frontier_epoch,
+		stage_epoch: state.next_stage_epoch,
+		work_limit: SERVICE_STAGE_WORK_LIMIT,
+		seconds_per_tick: ScalarValue(0.5),
+	}
+	.encode()?;
+	let mut response = [0_u8; SIMULATION_STAGE_RESPONSE_LEN];
+	let mut total_work = 0_u32;
+	loop {
+		client.round_trip_into(OperationKind::SimulationStage, &request, &mut response)?;
+		let result = SimulationStageResponse::decode(&response)?;
+		total_work = total_work
+			.checked_add(result.work_items)
+			.ok_or("stage work count exhausted")?;
+		black_box(result);
+		if !result.pending {
+			break;
+		}
+	}
+	state.next_stage_epoch = state
+		.next_stage_epoch
+		.checked_add(1)
+		.ok_or("stage epoch exhausted")?;
+	Ok(total_work)
+}
+
+fn run_service_stage_case(
+	client: &mut DogmosClient,
+	state: &mut ServiceBenchmarkState,
+	iterations: usize,
+) -> Result<(), Box<dyn Error>> {
+	for _ in 0..50 {
+		run_service_stage_iteration(client, state)?;
+	}
+	let mut samples = Vec::with_capacity(iterations);
+	let mut expected_work = None;
+	for _ in 0..iterations {
+		let started = Instant::now();
+		let work_items = run_service_stage_iteration(client, state)?;
+		let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+		if let Some(expected) = expected_work {
+			if work_items != expected {
+				return Err(
+					format!("service stage work changed from {expected} to {work_items}").into(),
+				);
+			}
+		} else {
+			expected_work = Some(work_items);
+		}
+		samples.push(elapsed);
+	}
+	samples.sort_unstable();
+	println!(
+		"service_simulation_stage_1024_mixtures_32_gases,{},{},{},{},{},{},{},{}",
+		dogmos_protocol::SIMULATION_STAGE_REQUEST_LEN,
+		SIMULATION_STAGE_RESPONSE_LEN,
+		iterations,
+		percentile(&samples, 50),
+		percentile(&samples, 95),
+		percentile(&samples, 99),
+		samples.last().copied().unwrap_or(0),
+		expected_work.unwrap_or(0),
+	);
+	Ok(())
+}
+
 fn cases() -> Vec<Case> {
 	let mut cases = vec![
 		Case {
-			name: "scalar_getter".into(),
+			name: "transport_scalar_getter".into(),
 			operation: OperationKind::ScalarGet,
 			request: vec![0; 8],
 			response_len: 8,
 		},
 		Case {
-			name: "scalar_mutator".into(),
+			name: "transport_scalar_mutator".into(),
 			operation: OperationKind::ScalarSet,
 			request: vec![0; 24],
 			response_len: 0,
 		},
 		Case {
-			name: "two_handle_transfer".into(),
+			name: "transport_two_handle_transfer".into(),
 			operation: OperationKind::Transfer,
 			request: vec![0; 24],
 			response_len: 8,
 		},
 		Case {
-			name: "gas_vector_32".into(),
+			name: "transport_gas_vector_32".into(),
 			operation: OperationKind::GasVector,
 			request: vec![0; 8],
 			response_len: 260,
 		},
 		Case {
-			name: "adjacency_update".into(),
+			name: "transport_adjacency_update".into(),
 			operation: OperationKind::AdjacencyUpdate,
 			request: vec![0; 24],
 			response_len: 0,
 		},
 	];
-	for count in [16_usize, 64, 256, 1024] {
-		let lifecycle = (0..count)
-			.map(|slot| LifecycleMutation {
-				action: LifecycleAction::Register,
-				handle: WireHandle {
-					slot: slot as u32,
-					generation: 1,
-				},
-			})
-			.collect::<Vec<_>>();
-		let mut lifecycle_request = Vec::new();
-		encode_lifecycle_batch(&lifecycle, &mut lifecycle_request)
-			.expect("the benchmark lifecycle batch is within protocol limits");
-		cases.push(Case {
-			name: format!("mixture_lifecycle_batch_{count}"),
-			operation: OperationKind::MixtureLifecycleBatch,
-			request: lifecycle_request,
-			response_len: 4,
-		});
-
-		let adjacency = (0..count)
-			.map(|slot| AdjacencyMutation {
-				left: WireHandle {
-					slot: slot as u32,
-					generation: 1,
-				},
-				right: WireHandle {
-					slot: (slot + 1).wrapping_rem(count) as u32,
-					generation: 1,
-				},
-				conductivity: ScalarValue(0.75),
-			})
-			.collect::<Vec<_>>();
-		let mut adjacency_request = Vec::new();
-		encode_adjacency_batch(&adjacency, &mut adjacency_request)
-			.expect("the benchmark adjacency batch is within protocol limits");
-		cases.push(Case {
-			name: format!("adjacency_batch_{count}"),
-			operation: OperationKind::AdjacencyBatch,
-			request: adjacency_request,
-			response_len: 4,
-		});
-	}
-	cases.push(Case {
-		name: "mixture_snapshot_32_gases".into(),
-		operation: OperationKind::MixtureSnapshot,
-		request: MixtureSnapshotRequest {
-			handle: WireHandle {
-				slot: 1,
-				generation: 1,
-			},
-		}
-		.encode()
-		.to_vec(),
-		response_len: MIXTURE_SNAPSHOT_LEN,
-	});
-	cases.push(Case {
-		name: "simulation_stage_1024_mixtures_32_gases".into(),
-		operation: OperationKind::SimulationStage,
-		request: SimulationStageRequest {
-			stage: SimulationStage::ProcessTurfs,
-			frontier_epoch: 1,
-			stage_epoch: 1,
-			work_limit: 1024,
-			seconds_per_tick: ScalarValue(0.5),
-		}
-		.encode()
-		.expect("the benchmark stage request is finite")
-		.to_vec(),
-		response_len: SIMULATION_STAGE_RESPONSE_LEN,
-	});
 	for count in [1_usize, 8, 64, 1024] {
 		let mut request = Vec::with_capacity(4 + count * 16);
 		request.extend_from_slice(&(count as u32).to_le_bytes());
 		request.resize(4 + count * 16, 0);
 		cases.push(Case {
-			name: format!("batch_{count}"),
+			name: format!("transport_batch_{count}"),
 			operation: OperationKind::Batch,
 			request,
 			response_len: 4,
 		});
 	}
 	cases.push(Case {
-		name: "callback_drain_empty".into(),
+		name: "transport_callback_drain_empty".into(),
 		operation: OperationKind::CallbackBatch,
 		request: CallbackBatchRequest {
 			max_events: 1024,

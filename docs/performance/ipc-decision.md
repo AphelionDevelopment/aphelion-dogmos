@@ -130,6 +130,30 @@ single p95 is about 17.5 ms for the 70,214-mixture captured world, but this is o
 estimate: topology, active gas count, reactions, heat, callbacks, and full-map contention are not yet
 represented.
 
+The repaired protocol-v10 benchmark completed three controlled repetitions on 2026-08-30. It used
+Rust 1.98.0, an i686 benchmark client, an x86_64 service, source revision
+`7e7b513bae99ebd0b82265b849f70664dfa3bb09`, and feature fingerprint
+`7ee0a12425df8b2d85eb47f08d19655a3a217eadec26e9d290da78f6de17bcff`. The working tree contained
+the benchmark repair under review, so these measurements qualify that implementation but are not a
+clean-revision release result. Each run has a separate success record and exact shim/service PID
+memory sample under the ignored `tmp/dogmos-perf/ipc/` directory.
+
+The service case installs 32 gas definitions, registers and seeds 1,024 mixtures, registers a
+1,024-turf ring, and atomically commits all turf handles before timing. Every measured stage uses a
+new stage epoch and drains pending chunks with the same request. All 1,500 measured logical stages
+reported exactly 2,048 work items: 1,024 preparation items plus 1,024 turf-compute items.
+
+| Qualified protocol-v10 case | Iterations per run | p50 range (us) | worst p95 (us) | worst p99 (us) | worst max (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `transport_scalar_getter` | 20,000 | 31.6-32.2 | 84.2 | 124.3 | 3.266 |
+| `transport_batch_1024` | 20,000 | 33.5-33.6 | 75.8 | 120.0 | 0.708 |
+| `service_mixture_snapshot_32_gases` | 20,000 | 32.5-32.6 | 79.7 | 120.4 | 0.908 |
+| `service_simulation_stage_1024_mixtures_32_gases` | 500 | 748.6-777.1 | 949.3 | 1,122.5 | 1.613 |
+
+The stage row measures one complete logical stage across both required chunks; it must not be
+combined with the single-round-trip transport rows. The earlier 182.5 us exploratory stage number
+used a different, incomplete workload and is not the current protocol-v10 control.
+
 ## DreamDaemon call_ext validation
 
 A minimal DreamMaker environment loaded the i686 `dogmos_byond.dll`, launched x86_64 `dogmosd`, and

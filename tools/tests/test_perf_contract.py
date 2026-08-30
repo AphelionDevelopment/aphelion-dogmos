@@ -22,6 +22,19 @@ EXPECTED_SCENARIOS = {
 
 
 class PerformanceContractTests(unittest.TestCase):
+    def test_ipc_benchmark_separates_transport_and_service_cases(self):
+        source = (
+            ROOT / "crates" / "dogmos-perf" / "benches" / "ipc_round_trip.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn('name: "transport_scalar_getter"', source)
+        self.assertIn("fn prepare_service_world(", source)
+        self.assertIn("FrontierCommit", source)
+        self.assertIn("next_stage_epoch", source)
+
+        runner = (ROOT / "tools" / "benchmark_ipc.ps1").read_text(encoding="utf-8")
+        self.assertIn('ipc-round-trip-$run.status.json', runner)
+        self.assertIn("$successfulStatusRecords.Count -ne $Repetitions", runner)
+
     def test_workload_corpus_is_complete_and_reproducible(self):
         documents = {}
         for path in WORKLOADS.glob("*.json"):
