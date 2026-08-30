@@ -26,8 +26,7 @@ pin memory without addressing the leading cost.
 Create one stage-local arena indexed by dense mixture slot. It owns:
 
 - a bitset marking mixtures touched by the transaction;
-- a dense `Vec<MixtureRecord>` containing one original record per touched mixture;
-- a parallel dense `Vec<MixtureRecord>` containing the candidate record;
+- a dense entry vector containing the touched handle, its initial revision, and its candidate record;
 - a slot-to-dense-index vector using a sentinel for untouched slots;
 - ordered staged events; and
 - component scratch vectors for turf slots, parents, balances, and flows.
@@ -39,12 +38,13 @@ verifying the stored handle, so ABA protection remains explicit.
 ## Transaction flow
 
 1. Reserve bounded scratch before mutating any candidate record.
-2. On first touch, copy the authoritative record into both original and candidate arrays and record
-   its handle/index.
+2. On first touch, copy the authoritative record into a candidate entry and record its handle,
+   initial revision, and dense index. A separate original-record copy is unnecessary because the
+   authoritative record remains untouched until commit.
 3. Run component math only against candidate records. Append events to the transaction-owned event
    vector.
-4. On cancellation or any error, clear logical arena lengths. Authoritative world records and the
-   public event queue remain untouched.
+4. On cancellation or any error, truncate entries and events to the component checkpoint and clear
+   their slot indexes. Authoritative world records and the public event queue remain untouched.
 5. Before commit, revalidate every handle/revision and the combined event capacity.
 6. Commit candidates in deterministic handle order, incrementing revisions exactly once, then append
    events in their staged order.
