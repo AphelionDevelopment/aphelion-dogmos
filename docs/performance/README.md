@@ -1,5 +1,10 @@
 # Dogmos performance evidence
 
+Reviewed 2026-08-30 resource-management results are in
+[`2026-08-30-resource-management-results.md`](2026-08-30-resource-management-results.md). The
+separate transaction follow-up is specified in
+[`2026-08-30-transaction-scratch-arena-design.md`](2026-08-30-transaction-scratch-arena-design.md).
+
 This directory defines reproducible workloads and acceptance budgets for the current in-process
 Dogmos backend and the later 64-bit service. DreamDaemon memory and service-process memory are
 always recorded separately. Only DreamDaemon footprint is used for the BYOND memory target.
