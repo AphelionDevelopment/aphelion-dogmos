@@ -53,3 +53,10 @@ byte-identical 36-row candidate runs with SHA-256
 transcript hash matched its control. Each fixture eliminated exactly one allocation and 32 allocated
 bytes per turf: the 100,000-turf cases fell from 133,396 to 33,396 allocations and from 79,892,176
 to 76,692,176 allocated bytes for all three topologies.
+
+Direct packed-topology traversal for component stages produced three byte-identical 36-row candidate
+runs with SHA-256 `C569CEDAC3DAC2C96C1E0A2371DF8DEA32E4189CC99F7775A54C9C4B22FAA22C`.
+Every transcript hash matched the preceding candidate. At 100,000 turfs, equalize removed
+107,222-107,556 allocations and 1,952,016-2,082,224 allocated bytes, while excited-groups removed
+116,667 allocations and 7,961,600 allocated bytes for every topology. These reductions exceed the
+zero-noise allocation controls and retain sorted packed-topology traversal order.

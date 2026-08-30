@@ -17,6 +17,7 @@ use crate::{
 	MixtureHandle, MAX_GAS_SLOTS,
 };
 use std::{
+	borrow::Cow,
 	collections::{BTreeMap, BTreeSet},
 	error::Error,
 	fmt,
@@ -3310,7 +3311,8 @@ impl DogmosWorld {
 			.collect::<BTreeSet<_>>();
 		let targets = self
 			.stage_turf_handles()
-			.into_iter()
+			.iter()
+			.copied()
 			.filter_map(|handle| Some((handle, self.require_turf_handle(handle).ok()?.mixture?)))
 			.collect::<Vec<_>>();
 		let mut seen_mixtures = BTreeSet::new();
@@ -3780,7 +3782,8 @@ impl DogmosWorld {
 		}
 		let nodes = self
 			.stage_turf_handles()
-			.into_iter()
+			.iter()
+			.copied()
 			.filter_map(|handle| {
 				let turf = self.require_turf_handle(handle).ok()?;
 				let mixture = turf.mixture?;
@@ -3797,28 +3800,19 @@ impl DogmosWorld {
 			.specific_heats();
 		let mut heat_values = [0.0; MAX_GAS_SLOTS];
 		heat_values[..specific_heats.len()].copy_from_slice(specific_heats);
-		let mut adjacency = BTreeMap::<u32, Vec<u32>>::new();
-		for slot in nodes.keys().copied() {
-			adjacency.entry(slot).or_default();
-		}
-		for (slot, (handle, _)) in &nodes {
-			for neighbor in self.topology.gas_neighbors(*handle) {
-				if nodes.contains_key(&neighbor.handle.slot) {
-					adjacency
-						.entry(*slot)
-						.or_default()
-						.push(neighbor.handle.slot);
-				}
-			}
-		}
-		for neighbors in adjacency.values_mut() {
-			neighbors.sort_unstable();
-		}
 		let mut found = BTreeSet::new();
 		let mut staged = BTreeMap::<MixtureHandle, MixtureRecord>::new();
 		let mut work_items = 0_u32;
 		for initial_slot in nodes.keys().copied() {
-			if found.contains(&initial_slot) || adjacency[&initial_slot].is_empty() {
+			if found.contains(&initial_slot)
+				|| !self
+					.topology
+					.gas_neighbors(nodes[&initial_slot].0)
+					.any(|neighbor| {
+						nodes
+							.get(&neighbor.handle.slot)
+							.is_some_and(|(handle, _)| *handle == neighbor.handle)
+					}) {
 				continue;
 			}
 			if should_cancel() {
@@ -3854,9 +3848,13 @@ impl DogmosWorld {
 				minimum_pressure = next_minimum;
 				maximum_pressure = next_maximum;
 				accepted.push(slot);
-				for neighbor in adjacency[&slot].iter().copied() {
-					if found.insert(neighbor) {
-						queue.push(neighbor);
+				for neighbor in self.topology.gas_neighbors(nodes[&slot].0) {
+					if nodes
+						.get(&neighbor.handle.slot)
+						.is_some_and(|(handle, _)| *handle == neighbor.handle)
+						&& found.insert(neighbor.handle.slot)
+					{
+						queue.push(neighbor.handle.slot);
 					}
 				}
 			}
@@ -3922,7 +3920,8 @@ impl DogmosWorld {
 		}
 		let turf_handles = self
 			.stage_turf_handles()
-			.into_iter()
+			.iter()
+			.copied()
 			.filter(|handle| {
 				self.require_turf_handle(*handle)
 					.is_ok_and(|turf| turf.mixture.is_some())
@@ -3931,23 +3930,10 @@ impl DogmosWorld {
 		if turf_handles.is_empty() {
 			return Ok(StageResult { work_items: 0 });
 		}
-		let mut adjacency = BTreeMap::<u32, Vec<u32>>::new();
-		for handle in &turf_handles {
-			adjacency.entry(handle.slot).or_default();
-		}
-		for handle in &turf_handles {
-			for neighbor in self.topology.gas_neighbors(*handle) {
-				if adjacency.contains_key(&neighbor.handle.slot) {
-					adjacency
-						.entry(handle.slot)
-						.or_default()
-						.push(neighbor.handle.slot);
-				}
-			}
-		}
-		for neighbors in adjacency.values_mut() {
-			neighbors.sort_unstable();
-		}
+		let active_by_slot = turf_handles
+			.iter()
+			.map(|handle| (handle.slot, *handle))
+			.collect::<BTreeMap<_, _>>();
 		let specific_heats = self
 			.gas_registry
 			.as_ref()
@@ -3978,15 +3964,16 @@ impl DogmosWorld {
 				}
 				let current = component[queue_index];
 				queue_index += 1;
-				for neighbor in adjacency.get(&current).into_iter().flatten().copied() {
-					if visited.contains(&neighbor)
+				for neighbor in self.topology.gas_neighbors(active_by_slot[&current]) {
+					if active_by_slot.get(&neighbor.handle.slot) != Some(&neighbor.handle)
 						|| component.len() >= self.equalize_hard_turf_limit as usize
 					{
 						continue;
 					}
-					visited.insert(neighbor);
-					parents.insert(neighbor, current);
-					component.push(neighbor);
+					if visited.insert(neighbor.handle.slot) {
+						parents.insert(neighbor.handle.slot, current);
+						component.push(neighbor.handle.slot);
+					}
 				}
 			}
 			if component.len() < 2 {
@@ -4031,7 +4018,6 @@ impl DogmosWorld {
 				if maximum_moles >= 10.0 && !mixtures_by_turf.is_empty() {
 					self.stage_decompression_component(
 						&component,
-						&adjacency,
 						&immutable_turfs,
 						&mixtures_by_turf,
 						component_moles,
@@ -4120,7 +4106,6 @@ impl DogmosWorld {
 	fn stage_decompression_component(
 		&self,
 		component: &[u32],
-		adjacency: &BTreeMap<u32, Vec<u32>>,
 		immutable_turfs: &BTreeSet<u32>,
 		mixtures_by_turf: &BTreeMap<u32, MixtureHandle>,
 		component_moles: f32,
@@ -4135,10 +4120,13 @@ impl DogmosWorld {
 		while queue_index < queue.len() {
 			let current = queue[queue_index];
 			queue_index += 1;
-			for neighbor in adjacency.get(&current).into_iter().flatten().copied() {
-				if component_slots.contains(&neighbor) && reached.insert(neighbor) {
-					parents.insert(neighbor, current);
-					queue.push(neighbor);
+			let current_handle = self.current_turf_handle(current)?;
+			for neighbor in self.topology.gas_neighbors(current_handle) {
+				if component_slots.contains(&neighbor.handle.slot)
+					&& reached.insert(neighbor.handle.slot)
+				{
+					parents.insert(neighbor.handle.slot, current);
+					queue.push(neighbor.handle.slot);
 				}
 			}
 		}
@@ -4260,7 +4248,8 @@ impl DogmosWorld {
 		}
 		let nodes = self
 			.stage_turf_handles()
-			.into_iter()
+			.iter()
+			.copied()
 			.filter_map(|handle| {
 				let turf = self.require_turf_handle(handle).ok()?;
 				Some((handle, turf.heat?, turf.mixture))
@@ -4991,30 +4980,33 @@ impl DogmosWorld {
 		require_turf_handle_in(&self.turfs, handle)
 	}
 
-	fn stage_turf_handles(&self) -> Vec<TurfHandle> {
+	fn stage_turf_handles(&self) -> Cow<'_, [TurfHandle]> {
 		if let Some(component) = &self.stage_component_turfs {
-			return component.clone();
+			return Cow::Borrowed(component);
 		}
 		if self.use_committed_frontier {
-			return self
-				.frontier
-				.committed()
-				.iter()
-				.copied()
-				.filter(|handle| self.require_turf_handle(*handle).is_ok())
-				.collect();
+			return Cow::Owned(
+				self.frontier
+					.committed()
+					.iter()
+					.copied()
+					.filter(|handle| self.require_turf_handle(*handle).is_ok())
+					.collect(),
+			);
 		}
-		self.turfs
-			.iter()
-			.enumerate()
-			.filter_map(|(slot, turf_slot)| {
-				turf_slot.turf.as_ref()?;
-				Some(TurfHandle {
-					slot: slot as u32,
-					generation: turf_slot.generation?,
+		Cow::Owned(
+			self.turfs
+				.iter()
+				.enumerate()
+				.filter_map(|(slot, turf_slot)| {
+					turf_slot.turf.as_ref()?;
+					Some(TurfHandle {
+						slot: slot as u32,
+						generation: turf_slot.generation?,
+					})
 				})
-			})
-			.collect()
+				.collect(),
+		)
 	}
 
 	fn require_turf_handle_mut(

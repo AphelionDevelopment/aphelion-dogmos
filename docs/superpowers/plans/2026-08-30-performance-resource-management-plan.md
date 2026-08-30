@@ -477,6 +477,10 @@ git commit -m "perf: keep diffusion neighbors on the stack"
 
 ### Task 8: Measure and simplify component traversal without changing order
 
+**Status:** Complete at the Task 8 commit boundary. The control threshold was material. Three
+byte-identical candidate processes preserved every transcript hash; at 100,000 turfs the candidate
+removed 107,222-107,556 equalize allocations and 116,667 excited-groups allocations.
+
 **Files:**
 - Modify: `crates/dogmos-core/src/world.rs`
 - Test: `crates/dogmos-core/tests/frontier_processing.rs`
@@ -487,29 +491,29 @@ git commit -m "perf: keep diffusion neighbors on the stack"
 - Consumes: sorted packed topology and active component membership.
 - Produces: deterministic direct-neighbor traversal without a per-node adjacency vector.
 
-- [ ] **Step 1: Establish a threshold to proceed**
+- [x] **Step 1: Establish a threshold to proceed**
 
 From Task 3 controls, proceed only if adjacency construction accounts for a material share of component-stage allocations or time. Record the threshold decision in the reviewed performance summary; otherwise skip this task.
 
-- [ ] **Step 2: Add golden order and rollback tests**
+- [x] **Step 2: Add golden order and rollback tests**
 
 Cover a branching multiz component with firelocks, immutable space, duplicate mixture rejection, cancellation mid-component, and event-capacity overflow. Assert ordered events and exact final numeric state.
 
-- [ ] **Step 3: Borrow stage turf handles**
+- [x] **Step 3: Borrow stage turf handles**
 
 Split `stage_turf_handles` into a borrowed committed/component path plus an owning fallback only for the all-turfs debug path. Do not clone `stage_component_turfs` when it already owns the component.
 
-- [ ] **Step 4: Traverse packed neighbors directly**
+- [x] **Step 4: Traverse packed neighbors directly**
 
 Replace `BTreeMap<u32, Vec<u32>>` adjacency with direct `gas_neighbors(current_handle)` iteration filtered by an active membership map/set. Rely on `PackedTopology`'s tested sorted order; do not add a new sort.
 
 Replace `contains` followed by `insert` with one `if visited.insert(neighbor)`. Preserve the hard turf limit before marking a node visited.
 
-- [ ] **Step 5: Verify and compare**
+- [x] **Step 5: Verify and compare**
 
 Run both component test files on x64 and i686, then three allocation/time candidate processes. Require identical hashes/events and improvement beyond control noise.
 
-- [ ] **Step 6: Suggested commit boundary**
+- [x] **Step 6: Suggested commit boundary**
 
 ```powershell
 git add crates/dogmos-core/src/world.rs crates/dogmos-core/tests/frontier_processing.rs crates/dogmos-core/tests/world_state.rs crates/dogmos-perf/examples/core_stage_allocations.rs
