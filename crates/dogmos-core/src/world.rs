@@ -640,7 +640,9 @@ struct StageComponentState {
 	next_neighbor: usize,
 	component_ready: bool,
 	transaction: IndexedTransaction<MixtureRecord>,
+	published_mixtures: BTreeSet<MixtureHandle>,
 	staged_events: Vec<WorldEvent>,
+	callback_events: u32,
 	components_processed: u32,
 }
 
@@ -657,7 +659,9 @@ impl StageComponentState {
 			component_ready: false,
 			transaction: IndexedTransaction::try_new(slot_count, max_entries)
 				.map_err(transaction_world_error)?,
+			published_mixtures: BTreeSet::new(),
 			staged_events: Vec::new(),
+			callback_events: 0,
 			components_processed: 0,
 		})
 	}
@@ -2198,6 +2202,28 @@ impl DogmosWorld {
 		request: StageChunkRequest,
 		mut should_cancel: impl FnMut() -> bool,
 	) -> Result<StageChunkResult, WorldError> {
+		let result = self.process_stage_chunk_cancellable_inner(request, &mut should_cancel);
+		if result.is_err() {
+			self.abort_stage();
+		}
+		result
+	}
+
+	fn abort_stage(&mut self) {
+		self.stage_cursor = None;
+		self.stage_diffusion = None;
+		self.stage_heat = None;
+		self.stage_reactions = None;
+		self.stage_components = None;
+		self.stage_component_turfs = None;
+		self.use_committed_frontier = false;
+	}
+
+	fn process_stage_chunk_cancellable_inner(
+		&mut self,
+		request: StageChunkRequest,
+		mut should_cancel: impl FnMut() -> bool,
+	) -> Result<StageChunkResult, WorldError> {
 		if request.work_limit == 0 || request.work_limit > MAX_STAGE_WORK_LIMIT {
 			return Err(WorldError::InvalidStageWorkLimit(request.work_limit));
 		}
@@ -2517,7 +2543,7 @@ impl DogmosWorld {
 					..StageChunkResult::default()
 				});
 			}
-			let (callback_events, components_processed) = self.commit_stage_components()?;
+			let (callback_events, components_processed) = self.finish_stage_components();
 			self.stage_cursor = None;
 			return Ok(StageChunkResult {
 				work_items,
@@ -3122,6 +3148,33 @@ impl DogmosWorld {
 			self.stage_components = Some(state);
 			return Err(error);
 		}
+		if let Some(handle) = state
+			.transaction
+			.entries()
+			.iter()
+			.map(|entry| entry.handle)
+			.find(|handle| state.published_mixtures.contains(handle))
+		{
+			state.transaction.clear();
+			state.staged_events.clear();
+			self.stage_components = Some(state);
+			return Err(WorldError::DuplicateMutableTurfMixture(handle));
+		}
+		if let Err(error) =
+			self.validate_indexed_transaction(&state.transaction, state.staged_events.len())
+		{
+			state.transaction.clear();
+			state.staged_events.clear();
+			self.stage_components = Some(state);
+			return Err(error);
+		}
+		state.callback_events = state
+			.callback_events
+			.saturating_add(u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX));
+		state
+			.published_mixtures
+			.extend(state.transaction.entries().iter().map(|entry| entry.handle));
+		self.publish_indexed_transaction_reusing(&mut state.transaction, &mut state.staged_events);
 		state.queue.clear();
 		state.queue_index = 0;
 		state.next_neighbor = 0;
@@ -3137,21 +3190,12 @@ impl DogmosWorld {
 	/// the Equalize/ExcitedGroups branch of process_stage_chunk_cancellable() always returned
 	/// both of those fields as 0 regardless of how much real work ran - DM-side telemetry (and
 	/// the dogmos_excited_groups unit test) had nothing but a permanent zero to read.
-	fn commit_stage_components(&mut self) -> Result<(u32, u32), WorldError> {
+	fn finish_stage_components(&mut self) -> (u32, u32) {
 		let state = self
 			.stage_components
 			.take()
 			.expect("component stage owns traversal state");
-		if let Err(error) =
-			self.validate_indexed_transaction(&state.transaction, state.staged_events.len())
-		{
-			self.stage_components = Some(state);
-			return Err(error);
-		}
-		let callback_events = u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX);
-		let components_processed = state.components_processed;
-		self.publish_indexed_transaction(state.transaction, state.staged_events);
-		Ok((callback_events, components_processed))
+		(state.callback_events, state.components_processed)
 	}
 
 	fn validate_indexed_transaction(
@@ -3177,13 +3221,13 @@ impl DogmosWorld {
 		Ok(())
 	}
 
-	fn publish_indexed_transaction(
+	fn publish_indexed_transaction_reusing(
 		&mut self,
-		mut transaction: IndexedTransaction<MixtureRecord>,
-		staged_events: Vec<WorldEvent>,
+		transaction: &mut IndexedTransaction<MixtureRecord>,
+		staged_events: &mut Vec<WorldEvent>,
 	) {
 		transaction.sort_by_handle();
-		for entry in transaction.into_entries() {
+		for entry in transaction.drain_entries() {
 			let current = self
 				.require_handle_mut(entry.handle)
 				.expect("transaction handles were validated before commit");
@@ -3196,7 +3240,7 @@ impl DogmosWorld {
 			candidate.revision = current.revision + 1;
 			*current = candidate;
 		}
-		self.events.extend(staged_events);
+		self.events.append(staged_events);
 	}
 
 	fn stage_component_discovery_complete(&self) -> bool {
@@ -3831,9 +3875,10 @@ impl DogmosWorld {
 		let max_entries = self.stage_turf_handles().len().min(self.mixtures.len());
 		let mut transaction = IndexedTransaction::try_new(self.mixtures.len(), max_entries)
 			.map_err(transaction_world_error)?;
+		let mut staged_events = Vec::new();
 		let result = self.compute_excited_groups(&mut transaction, should_cancel)?;
 		self.validate_indexed_transaction(&transaction, 0)?;
-		self.publish_indexed_transaction(transaction, Vec::new());
+		self.publish_indexed_transaction_reusing(&mut transaction, &mut staged_events);
 		Ok(result)
 	}
 
@@ -3984,7 +4029,7 @@ impl DogmosWorld {
 		let mut staged_events = Vec::new();
 		let result = self.compute_equalize(&mut transaction, &mut staged_events, should_cancel)?;
 		self.validate_indexed_transaction(&transaction, staged_events.len())?;
-		self.publish_indexed_transaction(transaction, staged_events);
+		self.publish_indexed_transaction_reusing(&mut transaction, &mut staged_events);
 		Ok(result)
 	}
 
@@ -5544,7 +5589,7 @@ mod tests {
 	}
 
 	#[test]
-	fn component_commit_revalidates_the_initial_mixture_revision() {
+	fn component_transaction_revalidates_the_initial_mixture_revision() {
 		let mut world = DogmosWorld::new(1024 * 1024);
 		world
 			.apply_lifecycle(&[LifecycleMutation {
@@ -5560,14 +5605,39 @@ mod tests {
 			.unwrap()
 			.temperature = 500.0;
 		world.mixtures[0].mixture.as_mut().unwrap().revision += 1;
-		world.stage_components = Some(state);
-
 		assert_eq!(
-			world.commit_stage_components(),
+			world.validate_indexed_transaction(&state.transaction, state.staged_events.len()),
 			Err(WorldError::StageConflict)
 		);
 		assert_eq!(world.require_handle(handle(0)).unwrap().temperature, 2.7);
-		assert!(world.stage_components.is_some());
+	}
+
+	#[test]
+	fn abort_stage_clears_every_resumable_stage_field() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let request = StageChunkRequest {
+			stage: WorldStage::Equalize,
+			frontier_epoch: 1,
+			stage_epoch: 2,
+			work_limit: 1,
+			seconds_per_tick: 0.5,
+		};
+		world.stage_cursor = Some(StageCursor::new(request, 0));
+		world.stage_diffusion = Some(StageDiffusionState::new());
+		world.stage_heat = Some(StageHeatState::new());
+		world.stage_components = Some(StageComponentState::try_new(1, 1).unwrap());
+		world.stage_component_turfs = Some(Vec::new());
+		world.use_committed_frontier = true;
+
+		world.abort_stage();
+
+		assert!(world.stage_cursor.is_none());
+		assert!(world.stage_diffusion.is_none());
+		assert!(world.stage_heat.is_none());
+		assert!(world.stage_reactions.is_none());
+		assert!(world.stage_components.is_none());
+		assert!(world.stage_component_turfs.is_none());
+		assert!(!world.use_committed_frontier);
 	}
 
 	#[test]

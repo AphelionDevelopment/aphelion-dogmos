@@ -18,10 +18,13 @@ i686 test as a required gate. A server-side elapsed-time check alone cannot rele
 stuck read.
 
 `deadline_ns` is a relative service-processing budget, not a wall-clock timestamp. Check it before
-dispatch and at bounded intervals inside long native stages. A cancellable stage writes only to
-service-owned scratch space, checks the deadline again, and commits atomically; expired work must not
-partially advance mixture revisions. The shim's channel timeout independently bounds DreamMaker and
-terminates the authoritative service on failure.
+dispatch and at bounded intervals inside long native stages. Diffusion, reaction, and heat stages
+write only to service-owned scratch space and commit atomically. Equalize and excited-group stages
+commit atomically per disconnected component so an unrelated component cannot retain stale mixture
+revisions across DreamMaker ticks. Cancellation discards the in-progress component while preserving
+earlier disconnected component commits. Any rejected stage request clears all resumable stage state
+before returning an error. The shim's channel timeout independently bounds DreamMaker and terminates
+the authoritative service on failure.
 
 Events carry typed numeric handles and generations. DreamDaemon resolves them on its main thread and rejects stale identities. If a synchronous DM reaction is required, the service releases simulation locks and returns a single-use, generation-bound continuation before DM code runs. Never wait for DM while holding a world, mixture, or graph lock.
 

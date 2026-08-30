@@ -319,14 +319,18 @@ fn stage_chunks_resume_only_an_identical_request_and_skip_tombstones() {
 		world.process_stage_chunk_cancellable(changed, || false),
 		Err(WorldError::StageConflict)
 	);
-	let second = world
-		.process_stage_chunk_cancellable(request, || false)
-		.unwrap();
-	assert!(second.pending);
-	let final_chunk = world
-		.process_stage_chunk_cancellable(request, || false)
-		.unwrap();
-	assert!(!final_chunk.pending);
+	let mut completed = false;
+	for _ in 0..4 {
+		if !world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap()
+			.pending
+		{
+			completed = true;
+			break;
+		}
+	}
+	assert!(completed);
 	assert_eq!(world.pending_stage_epoch(), None);
 }
 
@@ -359,6 +363,110 @@ fn stage_chunk_validates_frontier_epoch_and_work_limit() {
 		),
 		Err(WorldError::InvalidStageWorkLimit(0))
 	);
+}
+
+#[test]
+fn rejected_component_stage_aborts_and_retries_cleanly() {
+	let handle = turf(0, 1);
+	let mixture = mixture(0);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle: mixture,
+		}])
+		.unwrap();
+	let mut gases = [0.0; MAX_GAS_SLOTS];
+	gases[0] = 10.0;
+	world
+		.apply_mixture_state(&[MixtureStateMutation {
+			handle: mixture,
+			expected_revision: 0,
+			temperature: 293.15,
+			volume: 2500.0,
+			gases,
+		}])
+		.unwrap();
+	world
+		.apply_turf_lifecycle(&[TurfLifecycleMutation::Register {
+			handle,
+			mixture: Some(mixture),
+		}])
+		.unwrap();
+	world.begin_frontier(1, 1).unwrap();
+	world.append_frontier(1, 0, &[handle]).unwrap();
+	world.commit_frontier(1).unwrap();
+	let request = StageChunkRequest {
+		stage: WorldStage::Equalize,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 1,
+		seconds_per_tick: 0.5,
+	};
+	assert!(
+		world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap()
+			.pending
+	);
+	let retry = StageChunkRequest {
+		stage_epoch: 2,
+		..request
+	};
+	assert_eq!(
+		world.process_stage_chunk_cancellable(retry, || false),
+		Err(WorldError::StageConflict)
+	);
+	assert_eq!(world.pending_stage_epoch(), None);
+	for _ in 0..8 {
+		if !world
+			.process_stage_chunk_cancellable(retry, || false)
+			.unwrap()
+			.pending
+		{
+			break;
+		}
+	}
+	assert_eq!(world.pending_stage_epoch(), None);
+
+	let cancelled = StageChunkRequest {
+		stage_epoch: 3,
+		..request
+	};
+	assert!(
+		world
+			.process_stage_chunk_cancellable(cancelled, || false)
+			.unwrap()
+			.pending
+	);
+	let mut cancellation_observed = false;
+	for _ in 0..4 {
+		match world.process_stage_chunk_cancellable(cancelled, || true) {
+			Err(WorldError::Cancelled) => {
+				cancellation_observed = true;
+				break;
+			}
+			Ok(chunk) => assert!(chunk.pending),
+			other => panic!("unexpected component-stage cancellation result: {other:?}"),
+		}
+	}
+	assert!(cancellation_observed);
+	assert_eq!(world.pending_stage_epoch(), None);
+	let final_retry = StageChunkRequest {
+		stage_epoch: 4,
+		..request
+	};
+	for _ in 0..8 {
+		if !world
+			.process_stage_chunk_cancellable(final_retry, || false)
+			.unwrap()
+			.pending
+		{
+			break;
+		}
+	}
+	assert_eq!(world.pending_stage_epoch(), None);
 }
 
 #[test]
@@ -832,7 +940,108 @@ fn equalize_never_exceeds_the_chunk_work_limit_and_preserves_the_event_transcrip
 }
 
 #[test]
-fn equalize_rolls_back_earlier_components_when_a_later_component_overflows_events() {
+fn component_stage_commits_disconnected_components_before_resume() {
+	let turfs = [turf(0, 1), turf(1, 1), turf(2, 1), turf(3, 1)];
+	let mixtures = [mixture(0), mixture(1), mixture(2), mixture(3)];
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&mixtures.map(|handle| LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle,
+		}))
+		.unwrap();
+	for (index, handle) in mixtures.into_iter().enumerate() {
+		let mut gases = [0.0; MAX_GAS_SLOTS];
+		gases[0] = if index % 2 == 0 { 100.0 } else { 0.0 };
+		world
+			.apply_mixture_state(&[MixtureStateMutation {
+				handle,
+				expected_revision: 0,
+				temperature: 293.15,
+				volume: 2500.0,
+				gases,
+			}])
+			.unwrap();
+	}
+	world
+		.apply_turf_lifecycle(
+			&turfs
+				.into_iter()
+				.zip(mixtures)
+				.map(|(handle, mixture)| TurfLifecycleMutation::Register {
+					handle,
+					mixture: Some(mixture),
+				})
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+	world
+		.apply_turf_adjacency(&[
+			TurfAdjacencyMutation {
+				left: turfs[0],
+				right: turfs[1],
+				connected: true,
+			},
+			TurfAdjacencyMutation {
+				left: turfs[2],
+				right: turfs[3],
+				connected: true,
+			},
+		])
+		.unwrap();
+	world.begin_frontier(1, 4).unwrap();
+	world.append_frontier(1, 0, &turfs).unwrap();
+	world.commit_frontier(1).unwrap();
+	let request = StageChunkRequest {
+		stage: WorldStage::Equalize,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 1,
+		seconds_per_tick: 0.5,
+	};
+
+	for _ in 0..9 {
+		assert!(
+			world
+				.process_stage_chunk_cancellable(request, || false)
+				.unwrap()
+				.pending
+		);
+	}
+	let first_snapshot = world.snapshot(mixtures[0]).unwrap();
+	let mut externally_mutated_gases = first_snapshot.gases;
+	externally_mutated_gases[0] = 75.0;
+	world
+		.apply_mixture_state(&[MixtureStateMutation {
+			handle: mixtures[0],
+			expected_revision: first_snapshot.revision,
+			temperature: first_snapshot.temperature,
+			volume: first_snapshot.volume,
+			gases: externally_mutated_gases,
+		}])
+		.unwrap();
+
+	let mut completed = false;
+	for _ in 0..16 {
+		let chunk = world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap();
+		if !chunk.pending {
+			completed = true;
+			break;
+		}
+	}
+
+	assert!(completed);
+	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 75.0);
+	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 50.0);
+	assert_eq!(world.snapshot(mixtures[2]).unwrap().gases[0], 50.0);
+	assert_eq!(world.snapshot(mixtures[3]).unwrap().gases[0], 50.0);
+}
+
+#[test]
+fn equalize_retains_earlier_components_when_a_later_component_overflows_events() {
 	let turfs = [turf(0, 1), turf(1, 1), turf(2, 1), turf(3, 1)];
 	let mixtures = [mixture(0), mixture(1), mixture(2), mixture(3)];
 	let mut world = DogmosWorld::new_with_event_capacity(1024 * 1024, 1);
@@ -907,12 +1116,10 @@ fn equalize_rolls_back_earlier_components_when_a_later_component_overflows_event
 			capacity: 1,
 		}
 	);
-	for (index, mixture) in mixtures.into_iter().enumerate() {
-		assert_eq!(
-			world.snapshot(mixture).unwrap().gases[0],
-			if index % 2 == 0 { 100.0 } else { 0.0 }
-		);
-	}
+	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 50.0);
+	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 50.0);
+	assert_eq!(world.snapshot(mixtures[2]).unwrap().gases[0], 100.0);
+	assert_eq!(world.snapshot(mixtures[3]).unwrap().gases[0], 0.0);
 }
 
 #[test]
@@ -994,8 +1201,8 @@ fn equalize_rejects_a_mutable_mixture_shared_by_disconnected_components() {
 		.expect("the shared mutable mixture must be rejected");
 
 	assert_eq!(error, WorldError::DuplicateMutableTurfMixture(mixtures[1]));
-	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 100.0);
-	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 200.0);
+	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 150.0);
+	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 150.0);
 	assert_eq!(world.snapshot(mixtures[2]).unwrap().gases[0], 300.0);
 }
 
@@ -1078,7 +1285,7 @@ fn excited_groups_rejects_a_mutable_mixture_shared_by_disconnected_components() 
 		.expect("the shared mutable mixture must be rejected");
 
 	assert_eq!(error, WorldError::DuplicateMutableTurfMixture(mixtures[1]));
-	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 100.0);
-	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 100.1);
+	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 100.05);
+	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 100.05);
 	assert_eq!(world.snapshot(mixtures[2]).unwrap().gases[0], 100.2);
 }

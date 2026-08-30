@@ -153,6 +153,10 @@ impl<T: Clone> IndexedTransaction<T> {
 		}
 	}
 
+	pub(crate) fn clear(&mut self) {
+		drop(self.drain_entries());
+	}
+
 	pub(crate) fn sort_by_handle(&mut self) {
 		self.entries.sort_unstable_by_key(|entry| entry.handle);
 		for (index, entry) in self.entries.iter().enumerate() {
@@ -164,8 +168,13 @@ impl<T: Clone> IndexedTransaction<T> {
 		&self.entries
 	}
 
-	pub(crate) fn into_entries(self) -> Vec<TransactionEntry<T>> {
-		self.entries
+	pub(crate) fn drain_entries(&mut self) -> std::vec::Drain<'_, TransactionEntry<T>> {
+		for entry in &self.entries {
+			let slot = entry.handle.slot as usize;
+			self.slot_to_index[slot] = UNUSED_INDEX;
+			self.touched_bits[slot / BITS_PER_WORD] &= !(1 << (slot % BITS_PER_WORD));
+		}
+		self.entries.drain(..)
 	}
 
 	pub(crate) fn capacity_bytes_lower_bound(&self) -> usize {
@@ -232,6 +241,23 @@ mod tests {
 		assert!(!transaction.contains(handle(3, 5)));
 		assert_eq!(transaction.candidate(handle(0, 1)), Some(&10));
 		assert_eq!(transaction.touch(handle(3, 6), 7, &40), Ok(&mut 40));
+	}
+
+	#[test]
+	fn clear_reuses_allocated_indexes_and_entries() {
+		let mut transaction = IndexedTransaction::try_new(4, 4).unwrap();
+		transaction.touch(handle(0, 1), 2, &10).unwrap();
+		transaction.touch(handle(3, 5), 6, &30).unwrap();
+		let allocated_bytes = transaction.capacity_bytes_lower_bound();
+
+		transaction.clear();
+
+		assert_eq!(transaction.len(), 0);
+		assert!(!transaction.contains(handle(0, 1)));
+		assert!(!transaction.contains(handle(3, 5)));
+		assert_eq!(transaction.touch(handle(0, 2), 7, &40), Ok(&mut 40));
+		assert_eq!(transaction.touch(handle(3, 6), 8, &50), Ok(&mut 50));
+		assert_eq!(transaction.capacity_bytes_lower_bound(), allocated_bytes);
 	}
 
 	#[test]

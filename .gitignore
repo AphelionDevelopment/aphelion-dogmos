@@ -2,5 +2,5 @@
 /.vscode
 /.cargo/config.toml
 /bindings.dm
-/tmp/dogmos-perf/
 /tools/tests/__pycache__
+/tmp

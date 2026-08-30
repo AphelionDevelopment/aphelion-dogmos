@@ -2064,11 +2064,12 @@ fn map_world_error(error: WorldError) -> StateError {
 			current,
 		},
 		WorldError::UnknownTurfHandle(handle) => {
-			StateError::State(WorldError::UnknownTurfHandle(handle).to_string())
+			StateError::UnknownHandle(wire_handle_from_turf(handle))
 		}
-		WorldError::StaleTurfHandle { requested, current } => {
-			StateError::State(WorldError::StaleTurfHandle { requested, current }.to_string())
-		}
+		WorldError::StaleTurfHandle { requested, current } => StateError::StaleHandle {
+			requested: wire_handle_from_turf(requested),
+			current,
+		},
 		WorldError::RevisionMismatch {
 			handle,
 			expected,
@@ -2098,12 +2099,13 @@ fn map_world_error(error: WorldError) -> StateError {
 		error @ (WorldError::SelfTurfAdjacency(_)
 		| WorldError::TurfMissingMixture(_)
 		| WorldError::DuplicateMutableTurfMixture(_)
-		| WorldError::InvalidTurfHeatState(_)
-		| WorldError::TurfHeatMissing(_)
-		| WorldError::SelfTurfHeatAdjacency(_)
 		| WorldError::ImmutableEqualizationBoundary(_)
 		| WorldError::UnknownReactionContinuation(_)
 		| WorldError::StaleReactionContinuation { .. }) => StateError::State(error.to_string()),
+		WorldError::InvalidTurfHeatState(_) | WorldError::TurfHeatMissing(_) => {
+			StateError::InvalidMixtureState
+		}
+		error @ WorldError::SelfTurfHeatAdjacency(_) => StateError::Graph(error.to_string()),
 		WorldError::ReactionContinuationCapacityExceeded => {
 			StateError::ContinuationCapacityExceeded
 		}
@@ -2223,6 +2225,38 @@ mod tests {
 		assert_eq!(
 			map_world_error(WorldError::ReactionRegistryMissing),
 			StateError::InvalidMetadata
+		);
+	}
+
+	#[test]
+	fn turf_heat_errors_preserve_caller_legible_categories() {
+		let turf = TurfHandle {
+			slot: 42,
+			generation: 7,
+		};
+		assert_eq!(
+			map_world_error(WorldError::UnknownTurfHandle(turf)),
+			StateError::UnknownHandle(handle(42, 7))
+		);
+		assert_eq!(
+			map_world_error(WorldError::StaleTurfHandle {
+				requested: turf,
+				current: 8,
+			}),
+			StateError::StaleHandle {
+				requested: handle(42, 7),
+				current: 8,
+			}
+		);
+		assert_eq!(
+			map_world_error(WorldError::TurfHeatMissing(turf)),
+			StateError::InvalidMixtureState
+		);
+		assert_eq!(
+			map_world_error(WorldError::SelfTurfHeatAdjacency(turf)),
+			StateError::Graph(
+				"SelfTurfHeatAdjacency(TurfHandle { slot: 42, generation: 7 })".into()
+			)
 		);
 	}
 
