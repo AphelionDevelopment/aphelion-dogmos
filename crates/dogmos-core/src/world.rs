@@ -550,6 +550,8 @@ pub struct DogmosWorld {
 	realistic_space_radiation: bool,
 	equalize_hard_turf_limit: u32,
 	max_world_bytes: u64,
+	#[cfg(test)]
+	mixture_edge_filter_passes: u64,
 }
 
 #[derive(Clone)]
@@ -772,6 +774,8 @@ impl DogmosWorld {
 			realistic_space_radiation: true,
 			equalize_hard_turf_limit: DEFAULT_EQUALIZE_HARD_TURF_LIMIT,
 			max_world_bytes,
+			#[cfg(test)]
+			mixture_edge_filter_passes: 0,
 		}
 	}
 
@@ -1055,6 +1059,7 @@ impl DogmosWorld {
 			.filter(|mutation| matches!(mutation.action, LifecycleAction::Unregister))
 			.map(|mutation| mutation.handle)
 			.collect();
+		let mut invalidated_slots = BTreeSet::new();
 
 		for mutation in mutations {
 			let slot = mutation.handle.slot as usize;
@@ -1067,17 +1072,27 @@ impl DogmosWorld {
 						self.invalidate_continuations_for_mixture_slot(mutation.handle.slot);
 						self.mixtures[slot].generation = Some(mutation.handle.generation);
 						self.mixtures[slot].mixture = Some(MixtureRecord::new());
-						self.remove_incident_edges(mutation.handle.slot);
+						invalidated_slots.insert(mutation.handle.slot);
 						changed = true;
 					}
 				}
 				LifecycleAction::Unregister => {
 					self.invalidate_continuations_for_mixture_slot(mutation.handle.slot);
 					self.mixtures[slot].mixture = None;
-					self.remove_incident_edges(mutation.handle.slot);
+					invalidated_slots.insert(mutation.handle.slot);
 					changed = true;
 				}
 			}
+		}
+		if !invalidated_slots.is_empty() {
+			#[cfg(test)]
+			{
+				self.mixture_edge_filter_passes += 1;
+			}
+			self.edges.retain(|key, _| {
+				!invalidated_slots.contains(&key.left) && !invalidated_slots.contains(&key.right)
+			});
+			self.graph = None;
 		}
 		if !unregistering.is_empty() {
 			let mut detached_turfs = Vec::new();
@@ -5020,11 +5035,6 @@ impl DogmosWorld {
 			.ok_or(WorldError::UnknownTurfHandle(handle))
 	}
 
-	fn remove_incident_edges(&mut self, slot: u32) {
-		self.edges
-			.retain(|key, _| key.left != slot && key.right != slot);
-	}
-
 	fn remove_incident_turf_edges(&mut self, slot: u32) {
 		self.topology.remove_slot(slot);
 		self.turf_graph = None;
@@ -5451,5 +5461,54 @@ mod tests {
 			world.reusable_workset_bytes() - before,
 			expected_edge_bytes as u64
 		);
+	}
+
+	#[test]
+	fn lifecycle_batch_filters_mixture_edges_once_for_all_invalidated_slots() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let handles = [handle(0), handle(1), handle(2), handle(3), handle(4)];
+		world
+			.apply_lifecycle(&handles.map(|handle| LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle,
+			}))
+			.unwrap();
+		world
+			.apply_adjacency(&[
+				AdjacencyMutation {
+					left: handles[0],
+					right: handles[1],
+					conductivity: 0.5,
+				},
+				AdjacencyMutation {
+					left: handles[1],
+					right: handles[2],
+					conductivity: 0.5,
+				},
+				AdjacencyMutation {
+					left: handles[3],
+					right: handles[4],
+					conductivity: 0.5,
+				},
+			])
+			.unwrap();
+		world.mixture_edge_filter_passes = 0;
+
+		world
+			.apply_lifecycle(&[
+				LifecycleMutation {
+					action: LifecycleAction::Unregister,
+					handle: handles[0],
+				},
+				LifecycleMutation {
+					action: LifecycleAction::Unregister,
+					handle: handles[2],
+				},
+			])
+			.unwrap();
+
+		assert_eq!(world.mixture_edge_filter_passes, 1);
+		assert_eq!(world.edges.len(), 1);
+		assert!(world.edges.contains_key(&EdgeKey::new(3, 4).unwrap()));
 	}
 }

@@ -369,6 +369,11 @@ git commit -m "perf: remove shim validation allocation churn"
 
 ### Task 6: Hoist mixture-edge cleanup out of lifecycle mutation loops
 
+**Status:** Complete at the Task 6 commit boundary. The exact structural control was captured by the failing
+test (two edge-filter passes for two invalidations); the candidate performs one pass and preserves
+the expected final topology. No standalone lifecycle wall-time benchmark existed, so the deterministic
+pass-count regression is the acceptance evidence for this task.
+
 **Files:**
 - Modify: `crates/dogmos-core/src/world.rs`
 - Test: `crates/dogmos-core/tests/world_state.rs`
@@ -378,15 +383,15 @@ git commit -m "perf: remove shim validation allocation churn"
 - Consumes: validated lifecycle batch and `EdgeKey { left, right }`.
 - Produces: one mixture-edge retain pass for all replaced/unregistered slots.
 
-- [ ] **Step 1: Write the failing one-pass test**
+- [x] **Step 1: Write the failing one-pass test**
 
 Under `cfg(test)`, count lifecycle edge-filter passes. Build a graph, unregister multiple mixtures in one batch, and assert the batch performs one full edge pass while removing every incident edge and preserving unrelated edges.
 
-- [ ] **Step 2: Collect all invalidated slots**
+- [x] **Step 2: Collect all invalidated slots**
 
 During the already-atomic validation/application flow, insert the slot for each actual unregister and generation replacement into one local set. Do not include idempotent same-generation registrations.
 
-- [ ] **Step 3: Retain once**
+- [x] **Step 3: Retain once**
 
 Replace per-mutation `remove_incident_edges(slot)` calls with:
 
@@ -401,7 +406,7 @@ if !invalidated_slots.is_empty() {
 
 Use the current graph-cache field name at implementation time. Preserve continuation invalidation and turf detachment semantics.
 
-- [ ] **Step 4: Verify behavior and measure bulk teardown**
+- [x] **Step 4: Verify behavior and measure bulk teardown**
 
 ```powershell
 cargo +1.98.0 test -p dogmos-core --locked --target x86_64-pc-windows-msvc --test world_state
@@ -410,7 +415,7 @@ cargo +1.98.0 test -p dogmos-core --locked --target i686-pc-windows-msvc
 
 Run the synthetic lifecycle benchmark at 1,000/10,000/100,000 slots for controls and candidates. Require identical final topology and a single edge-pass count.
 
-- [ ] **Step 5: Suggested commit boundary**
+- [x] **Step 5: Suggested commit boundary**
 
 ```powershell
 git add crates/dogmos-core/src/world.rs crates/dogmos-core/tests/world_state.rs crates/dogmos-core/tests/packed_topology.rs
