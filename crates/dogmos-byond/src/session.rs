@@ -34,12 +34,30 @@ impl ServiceSession {
 	where
 		E: From<ClientError>,
 	{
-		match self.client.round_trip(
+		self.request_with_response_timeout(
 			operation,
 			payload,
 			response_capacity,
 			BENCHMARK_REQUEST_TIMEOUT,
-		) {
+			decode,
+		)
+	}
+
+	pub(crate) fn request_with_response_timeout<T, E>(
+		&mut self,
+		operation: OperationKind,
+		payload: &[u8],
+		response_capacity: usize,
+		timeout: Duration,
+		decode: impl FnOnce(&[u8]) -> Result<T, E>,
+	) -> Result<T, E>
+	where
+		E: From<ClientError>,
+	{
+		match self
+			.client
+			.round_trip(operation, payload, response_capacity, timeout)
+		{
 			Ok(response) => decode(response),
 			Err(error @ (ClientError::RequestTimeout | ClientError::WorkerStopped)) => {
 				let process_id = self.service.id();

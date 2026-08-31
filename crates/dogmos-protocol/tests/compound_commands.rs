@@ -4,14 +4,15 @@ use dogmos_protocol::{
 	AdjacencyMutation, FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest,
 	FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest,
 	FrontierMutateResponse, LifecycleAction, LifecycleMutation, MixtureCommandResponse,
-	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ProtocolError,
-	ScalarValue, SimulationStage, SimulationStageRequest, SimulationStageResponse, WireHandle,
-	ADJACENCY_MUTATION_LEN, DOGMOS_PROTOCOL_VERSION, FRONTIER_APPEND_HEADER_LEN,
-	FRONTIER_APPEND_RESPONSE_LEN, FRONTIER_BEGIN_REQUEST_LEN, FRONTIER_BEGIN_RESPONSE_LEN,
-	FRONTIER_COMMIT_REQUEST_LEN, FRONTIER_COMMIT_RESPONSE_LEN, FRONTIER_MUTATE_HEADER_LEN,
-	FRONTIER_MUTATE_RESPONSE_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES,
-	MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN,
-	SIMULATION_STAGE_RESPONSE_LEN,
+	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, MixtureStateUploadAbortRequest,
+	MixtureStateUploadAppendRequest, MixtureStateUploadBeginRequest,
+	MixtureStateUploadCommitRequest, OperationKind, ProtocolError, ScalarValue, SimulationStage,
+	SimulationStageRequest, SimulationStageResponse, WireHandle, ADJACENCY_MUTATION_LEN,
+	DOGMOS_PROTOCOL_VERSION, FRONTIER_APPEND_HEADER_LEN, FRONTIER_APPEND_RESPONSE_LEN,
+	FRONTIER_BEGIN_REQUEST_LEN, FRONTIER_BEGIN_RESPONSE_LEN, FRONTIER_COMMIT_REQUEST_LEN,
+	FRONTIER_COMMIT_RESPONSE_LEN, FRONTIER_MUTATE_HEADER_LEN, FRONTIER_MUTATE_RESPONSE_LEN,
+	LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
+	MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 
 fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -40,7 +41,7 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 #[test]
 fn compound_operation_ids_are_stable() {
-	assert_eq!(DOGMOS_PROTOCOL_VERSION, 10);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 11);
 	assert_eq!(OperationKind::MixtureSnapshot as u16, 18);
 	assert_eq!(OperationKind::MixtureLifecycleBatch as u16, 19);
 	assert_eq!(OperationKind::AdjacencyBatch as u16, 20);
@@ -56,6 +57,10 @@ fn compound_operation_ids_are_stable() {
 	assert_eq!(OperationKind::FrontierCommit as u16, 40);
 	assert_eq!(OperationKind::FrontierAdd as u16, 41);
 	assert_eq!(OperationKind::FrontierRemove as u16, 42);
+	assert_eq!(OperationKind::MixtureStateUploadBegin as u16, 43);
+	assert_eq!(OperationKind::MixtureStateUploadAppend as u16, 44);
+	assert_eq!(OperationKind::MixtureStateUploadCommit as u16, 45);
+	assert_eq!(OperationKind::MixtureStateUploadAbort as u16, 46);
 	assert_eq!(OperationKind::MixtureCommand as u16, 28);
 	assert_eq!(OperationKind::GasMetadataInstall as u16, 29);
 	assert_eq!(OperationKind::ReactionMetadataInstall as u16, 30);
@@ -324,7 +329,75 @@ fn mixture_state_batch_round_trips_exact_fixed_records() {
 }
 
 #[test]
-fn mixture_state_batch_matches_complete_protocol_v10_golden_bytes() {
+fn mixture_state_upload_frames_round_trip_with_offsets() {
+	let begin = MixtureStateUploadBeginRequest {
+		expected_count: 228,
+	};
+	assert_eq!(
+		MixtureStateUploadBeginRequest::decode(&begin.encode().unwrap()),
+		Ok(begin)
+	);
+
+	let entry = MixtureStateMutation {
+		handle: handle(7, 11),
+		expected_revision: 4,
+		temperature: ScalarValue(293.15),
+		volume: ScalarValue(2500.0),
+		gases: [ScalarValue(0.0); MAX_GAS_SLOTS],
+	};
+	let append = MixtureStateUploadAppendRequest {
+		upload_id: 41,
+		offset: 227,
+		mutations: vec![entry],
+	};
+	let append_bytes = append.encode().unwrap();
+	assert_eq!(
+		MixtureStateUploadAppendRequest::decode(&append_bytes, 4096).unwrap(),
+		append
+	);
+
+	let commit = MixtureStateUploadCommitRequest { upload_id: 41 };
+	assert_eq!(
+		MixtureStateUploadCommitRequest::decode(&commit.encode()),
+		Ok(commit)
+	);
+}
+
+#[test]
+fn mixture_state_upload_frames_reject_ambiguous_or_empty_identifiers() {
+	assert_eq!(
+		MixtureStateUploadBeginRequest { expected_count: 0 }.encode(),
+		Err(ProtocolError::InvalidMixtureStateUploadCount(0))
+	);
+	let mut reserved_begin = MixtureStateUploadBeginRequest { expected_count: 1 }
+		.encode()
+		.unwrap();
+	reserved_begin[4..8].copy_from_slice(&1_u32.to_le_bytes());
+	assert_eq!(
+		MixtureStateUploadBeginRequest::decode(&reserved_begin),
+		Err(ProtocolError::ReservedMixtureStateUploadField(1))
+	);
+	assert!(matches!(
+		MixtureStateUploadAppendRequest {
+			upload_id: 1,
+			offset: 0,
+			mutations: Vec::new(),
+		}
+		.encode(),
+		Err(ProtocolError::InvalidMixtureStateUploadCount(0))
+	));
+	assert_eq!(
+		MixtureStateUploadCommitRequest::decode(&0_u64.to_le_bytes()),
+		Err(ProtocolError::InvalidMixtureStateUploadId)
+	);
+	assert_eq!(
+		MixtureStateUploadAbortRequest::decode(&0_u64.to_le_bytes()),
+		Err(ProtocolError::InvalidMixtureStateUploadId)
+	);
+}
+
+#[test]
+fn mixture_state_batch_matches_complete_protocol_golden_bytes() {
 	const GOLDEN_HEX: &str = concat!(
 		"01000000070000000b0000000400000000000000000000000000104000000000",
 		"00002040000000000000f03f0000000000000000000000000000000000000000",

@@ -81,6 +81,9 @@ pub enum StateError {
 	UnknownReactionTransaction(u64),
 	FrontierConflict,
 	FrontierIncomplete,
+	MixtureStateUploadConflict,
+	MixtureStateUploadIncomplete,
+	MixtureStateUploadIdExhausted,
 	StageConflict,
 	ContinuationCapacityExceeded,
 	ContinuationIdExhausted,
@@ -187,6 +190,12 @@ struct ReactionCallbackQueue {
 	complete: bool,
 }
 
+struct PendingMixtureStateUpload {
+	id: u64,
+	expected_count: usize,
+	mutations: Vec<MixtureStateMutation>,
+}
+
 pub struct ServiceState {
 	world: DogmosWorld,
 	general_callbacks: VecDeque<QueuedCallback>,
@@ -212,6 +221,8 @@ pub struct ServiceState {
 	continuation_high_water: u32,
 	continuation_timeouts: u64,
 	next_continuation_id: u64,
+	pending_mixture_state_upload: Option<PendingMixtureStateUpload>,
+	next_mixture_state_upload_id: u64,
 	request_timeouts: u64,
 	protocol_errors: u64,
 	world_generation: u32,
@@ -268,6 +279,8 @@ impl ServiceState {
 			continuation_high_water: 0,
 			continuation_timeouts: 0,
 			next_continuation_id: 1,
+			pending_mixture_state_upload: None,
+			next_mixture_state_upload_id: 1,
 			request_timeouts: 0,
 			protocol_errors: 0,
 			world_generation,
@@ -984,6 +997,89 @@ impl ServiceState {
 		self.world
 			.apply_mixture_state(&mutations)
 			.map_err(map_world_error)
+	}
+
+	pub fn begin_mixture_state_upload(
+		&mut self,
+		expected_count: u32,
+		maximum: u32,
+	) -> Result<u64, StateError> {
+		if expected_count == 0 || expected_count > maximum {
+			return Err(StateError::MixtureStateUploadConflict);
+		}
+		if self.pending_mixture_state_upload.is_some() {
+			return Err(StateError::MixtureStateUploadConflict);
+		}
+		let upload_id = self.next_mixture_state_upload_id;
+		if upload_id == 0 {
+			return Err(StateError::MixtureStateUploadIdExhausted);
+		}
+		self.next_mixture_state_upload_id = upload_id.checked_add(1).unwrap_or(0);
+		let expected_count = expected_count as usize;
+		let mut mutations = Vec::new();
+		mutations
+			.try_reserve_exact(expected_count)
+			.map_err(|_| StateError::AllocationFailed)?;
+		self.pending_mixture_state_upload = Some(PendingMixtureStateUpload {
+			id: upload_id,
+			expected_count,
+			mutations,
+		});
+		Ok(upload_id)
+	}
+
+	pub fn append_mixture_state_upload(
+		&mut self,
+		upload_id: u64,
+		offset: u32,
+		mutations: &[MixtureStateMutation],
+	) -> Result<u32, StateError> {
+		let pending = self
+			.pending_mixture_state_upload
+			.as_mut()
+			.filter(|pending| pending.id == upload_id)
+			.ok_or(StateError::MixtureStateUploadConflict)?;
+		if mutations.is_empty() || offset as usize != pending.mutations.len() {
+			return Err(StateError::MixtureStateUploadConflict);
+		}
+		let appended_count = pending
+			.mutations
+			.len()
+			.checked_add(mutations.len())
+			.ok_or(StateError::MixtureStateUploadConflict)?;
+		if appended_count > pending.expected_count {
+			return Err(StateError::MixtureStateUploadConflict);
+		}
+		pending.mutations.extend_from_slice(mutations);
+		Ok(mutations.len() as u32)
+	}
+
+	pub fn commit_mixture_state_upload(&mut self, upload_id: u64) -> Result<u32, StateError> {
+		let pending = self
+			.pending_mixture_state_upload
+			.as_ref()
+			.filter(|pending| pending.id == upload_id)
+			.ok_or(StateError::MixtureStateUploadConflict)?;
+		if pending.mutations.len() != pending.expected_count {
+			return Err(StateError::MixtureStateUploadIncomplete);
+		}
+		let pending = self
+			.pending_mixture_state_upload
+			.take()
+			.expect("validated mixture state upload should remain present");
+		self.apply_mixture_state(&pending.mutations)
+	}
+
+	pub fn abort_mixture_state_upload(&mut self, upload_id: u64) -> Result<(), StateError> {
+		if self
+			.pending_mixture_state_upload
+			.as_ref()
+			.is_none_or(|pending| pending.id != upload_id)
+		{
+			return Err(StateError::MixtureStateUploadConflict);
+		}
+		self.pending_mixture_state_upload = None;
+		Ok(())
 	}
 
 	pub fn snapshot(&self, handle: WireHandle) -> Result<MixtureSnapshot, StateError> {
@@ -2309,6 +2405,101 @@ mod tests {
 
 	fn handle(slot: u32, generation: u32) -> WireHandle {
 		WireHandle { slot, generation }
+	}
+
+	#[test]
+	fn mixture_state_upload_is_invisible_until_complete_commit() {
+		let mut state = ServiceState::new(1024 * 1024, 8);
+		let handles = [handle(0, 1), handle(1, 1)];
+		state
+			.apply_lifecycle(&handles.map(|handle| LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle,
+			}))
+			.unwrap();
+		let mutation = |handle, temperature| MixtureStateMutation {
+			handle,
+			expected_revision: 0,
+			temperature: ScalarValue(temperature),
+			volume: ScalarValue(2500.0),
+			gases: [ScalarValue(0.0); MAX_GAS_SLOTS],
+		};
+		let temperature_before = state.snapshot(handles[0]).unwrap().temperature;
+
+		let upload_id = state.begin_mixture_state_upload(2, 4096).unwrap();
+		assert_eq!(
+			state
+				.append_mixture_state_upload(upload_id, 0, &[mutation(handles[0], 300.0)])
+				.unwrap(),
+			1
+		);
+		assert_eq!(
+			state.snapshot(handles[0]).unwrap().temperature,
+			temperature_before
+		);
+		assert_eq!(
+			state.commit_mixture_state_upload(upload_id),
+			Err(StateError::MixtureStateUploadIncomplete)
+		);
+		state
+			.append_mixture_state_upload(upload_id, 1, &[mutation(handles[1], 301.0)])
+			.unwrap();
+		assert_eq!(state.commit_mixture_state_upload(upload_id).unwrap(), 2);
+		assert_eq!(
+			state.snapshot(handles[0]).unwrap().temperature,
+			ScalarValue(300.0)
+		);
+		assert_eq!(
+			state.snapshot(handles[1]).unwrap().temperature,
+			ScalarValue(301.0)
+		);
+
+		let rejected_upload = state.begin_mixture_state_upload(2, 4096).unwrap();
+		state
+			.append_mixture_state_upload(
+				rejected_upload,
+				0,
+				&[
+					MixtureStateMutation {
+						expected_revision: 1,
+						..mutation(handles[0], 400.0)
+					},
+					MixtureStateMutation {
+						expected_revision: 0,
+						..mutation(handles[1], 401.0)
+					},
+				],
+			)
+			.unwrap();
+		assert!(matches!(
+			state.commit_mixture_state_upload(rejected_upload),
+			Err(StateError::RevisionMismatch { .. })
+		));
+		assert_eq!(
+			state.snapshot(handles[0]).unwrap().temperature,
+			ScalarValue(300.0)
+		);
+		assert_eq!(
+			state.snapshot(handles[1]).unwrap().temperature,
+			ScalarValue(301.0)
+		);
+
+		let aborted_upload = state.begin_mixture_state_upload(1, 4096).unwrap();
+		state
+			.append_mixture_state_upload(
+				aborted_upload,
+				0,
+				&[MixtureStateMutation {
+					expected_revision: 2,
+					..mutation(handles[0], 500.0)
+				}],
+			)
+			.unwrap();
+		state.abort_mixture_state_upload(aborted_upload).unwrap();
+		let replacement_upload = state.begin_mixture_state_upload(1, 4096).unwrap();
+		state
+			.abort_mixture_state_upload(replacement_upload)
+			.unwrap();
 	}
 
 	fn equalize_room_to_space_state(callback_capacity: u32) -> (ServiceState, MixtureHandle) {

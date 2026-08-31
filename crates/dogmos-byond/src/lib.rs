@@ -24,7 +24,10 @@ use dogmos_protocol::{
 	FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest, FrontierMutateResponse,
 	GasMetadataRegistration, LifecycleAction, LifecycleMutation, MixtureAdjustment,
 	MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot, MixtureSnapshotRequest,
-	MixtureStateMutation, OperationKind, ReactionMetadataRegistration, ScalarValue,
+	MixtureStateMutation, MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
+	MixtureStateUploadAppendResponse, MixtureStateUploadBeginRequest,
+	MixtureStateUploadBeginResponse, MixtureStateUploadCommitRequest,
+	MixtureStateUploadCommitResponse, OperationKind, ReactionMetadataRegistration, ScalarValue,
 	ServiceTelemetry, SimulationStage, SimulationStageRequest, SimulationStageResponse,
 	TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot,
 	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
@@ -37,7 +40,12 @@ use dogmos_protocol::{
 	TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN,
 	TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
 };
-use std::{fs, path::Path, sync::Mutex, time::Duration};
+use std::{
+	fs,
+	path::Path,
+	sync::Mutex,
+	time::{Duration, Instant},
+};
 
 #[cfg(feature = "diagnostic-bindings")]
 use dogmos_protocol::{encode_adjacency_batch, AdjacencyMutation, ServiceErrorCode};
@@ -906,8 +914,13 @@ fn dogmos_mixture_state_batch(entries: ByondValue) -> eyre::Result<ByondValue> {
 	let values = bounded_number_list(
 		entries,
 		"mixture state batch",
-		PRODUCTION_MAX_MIXTURE_STATE_MUTATIONS * PRODUCTION_MIXTURE_STATE_FIELDS,
+		PRODUCTION_MAX_BATCH_OPERATIONS * PRODUCTION_MIXTURE_STATE_FIELDS,
 	)?;
+	let operation_count = values.len() / PRODUCTION_MIXTURE_STATE_FIELDS;
+	if operation_count > PRODUCTION_MAX_MIXTURE_STATE_MUTATIONS {
+		let count = production_mixture_state_upload(&values)?;
+		return Ok((count as f32).into());
+	}
 	let request = encode_production_mixture_state_batch(&values)?;
 	let count = production_request_with_response(
 		OperationKind::MixtureStateBatch,
@@ -931,7 +944,25 @@ pub fn encode_production_mixture_state_batch(values: &[f32]) -> eyre::Result<Vec
 			"mixture state batch contains {operation_count} operations, maximum {PRODUCTION_MAX_MIXTURE_STATE_MUTATIONS}"
 		));
 	}
-	let mutations = values
+	let mutations = production_mixture_state_mutations(values)?;
+	let capacity = fixed_batch_capacity(
+		mutations.len(),
+		MIXTURE_STATE_MUTATION_LEN,
+		"mixture state batch",
+	)?;
+	let mut output = Vec::with_capacity(capacity);
+	encode_mixture_state_batch(&mutations, &mut output)?;
+	debug_assert_eq!(output.len(), capacity);
+	Ok(output)
+}
+
+fn production_mixture_state_mutations(values: &[f32]) -> eyre::Result<Vec<MixtureStateMutation>> {
+	if !values.len().is_multiple_of(PRODUCTION_MIXTURE_STATE_FIELDS) {
+		return Err(eyre::eyre!(
+			"mixture state batch requires fixed {PRODUCTION_MIXTURE_STATE_FIELDS}-field records"
+		));
+	}
+	values
 		.as_chunks::<PRODUCTION_MIXTURE_STATE_FIELDS>()
 		.0
 		.iter()
@@ -963,16 +994,117 @@ pub fn encode_production_mixture_state_batch(values: &[f32]) -> eyre::Result<Vec
 				gases,
 			})
 		})
-		.collect::<eyre::Result<Vec<_>>>()?;
-	let capacity = fixed_batch_capacity(
-		mutations.len(),
-		MIXTURE_STATE_MUTATION_LEN,
-		"mixture state batch",
+		.collect::<eyre::Result<Vec<_>>>()
+}
+
+fn production_mixture_state_upload(values: &[f32]) -> eyre::Result<u32> {
+	if !values.len().is_multiple_of(PRODUCTION_MIXTURE_STATE_FIELDS) {
+		return Err(eyre::eyre!(
+			"mixture state batch requires fixed {PRODUCTION_MIXTURE_STATE_FIELDS}-field records"
+		));
+	}
+	let operation_count = values.len() / PRODUCTION_MIXTURE_STATE_FIELDS;
+	if operation_count == 0 || operation_count > PRODUCTION_MAX_BATCH_OPERATIONS {
+		return Err(eyre::eyre!(
+			"mixture state upload contains {operation_count} operations, maximum {PRODUCTION_MAX_BATCH_OPERATIONS}"
+		));
+	}
+	let chunk_field_count =
+		PRODUCTION_MAX_MIXTURE_STATE_MUTATIONS * PRODUCTION_MIXTURE_STATE_FIELDS;
+	for chunk in values.chunks(chunk_field_count) {
+		drop(production_mixture_state_mutations(chunk)?);
+	}
+
+	let mut session = SERVICE_SESSION
+		.lock()
+		.map_err(|_| eyre::eyre!("Dogmos production service session lock is poisoned"))?;
+	let session = session
+		.as_mut()
+		.ok_or_else(|| eyre::eyre!("Dogmos production service session is not running"))?;
+	let deadline = Instant::now()
+		.checked_add(BENCHMARK_REQUEST_TIMEOUT)
+		.ok_or_else(|| eyre::eyre!("Dogmos mixture state upload deadline overflowed"))?;
+	let begin = MixtureStateUploadBeginRequest {
+		expected_count: operation_count as u32,
+	}
+	.encode()?;
+	let upload_id = session.request_with_response_timeout(
+		OperationKind::MixtureStateUploadBegin,
+		&begin,
+		8,
+		remaining_upload_timeout(deadline)?,
+		|response| -> eyre::Result<u64> {
+			Ok(MixtureStateUploadBeginResponse::decode(response)?.upload_id)
+		},
 	)?;
-	let mut output = Vec::with_capacity(capacity);
-	encode_mixture_state_batch(&mutations, &mut output)?;
-	debug_assert_eq!(output.len(), capacity);
-	Ok(output)
+
+	let upload_result = (|| {
+		let mut offset = 0_u32;
+		for chunk in values.chunks(chunk_field_count) {
+			let mutations = production_mixture_state_mutations(chunk)?;
+			let request = MixtureStateUploadAppendRequest {
+				upload_id,
+				offset,
+				mutations,
+			}
+			.encode()?;
+			let accepted_count = session.request_with_response_timeout(
+				OperationKind::MixtureStateUploadAppend,
+				&request,
+				4,
+				remaining_upload_timeout(deadline)?,
+				|response| -> eyre::Result<u32> {
+					Ok(MixtureStateUploadAppendResponse::decode(response)?.accepted_count)
+				},
+			)?;
+			let expected_count = (chunk.len() / PRODUCTION_MIXTURE_STATE_FIELDS) as u32;
+			if accepted_count != expected_count {
+				return Err(eyre::eyre!(
+					"Dogmos mixture state upload accepted {accepted_count} operations at offset {offset}, expected {expected_count}"
+				));
+			}
+			offset = offset
+				.checked_add(accepted_count)
+				.ok_or_else(|| eyre::eyre!("Dogmos mixture state upload offset overflowed"))?;
+		}
+		let commit = MixtureStateUploadCommitRequest { upload_id }.encode();
+		let committed_count = session.request_with_response_timeout(
+			OperationKind::MixtureStateUploadCommit,
+			&commit,
+			4,
+			remaining_upload_timeout(deadline)?,
+			|response| -> eyre::Result<u32> {
+				Ok(MixtureStateUploadCommitResponse::decode(response)?.committed_count)
+			},
+		)?;
+		if committed_count != operation_count as u32 {
+			return Err(eyre::eyre!(
+				"Dogmos mixture state upload committed {committed_count} operations, expected {operation_count}"
+			));
+		}
+		Ok(committed_count)
+	})();
+	if upload_result.is_err() {
+		if let Ok(timeout) = remaining_upload_timeout(deadline) {
+			let abort = MixtureStateUploadAbortRequest { upload_id }.encode();
+			let _ = session.request_with_response_timeout(
+				OperationKind::MixtureStateUploadAbort,
+				&abort,
+				0,
+				timeout,
+				|_| Ok::<(), eyre::Report>(()),
+			);
+		}
+	}
+	upload_result
+}
+
+fn remaining_upload_timeout(deadline: Instant) -> eyre::Result<Duration> {
+	let remaining = deadline.saturating_duration_since(Instant::now());
+	if remaining.is_zero() {
+		return Err(eyre::eyre!("Dogmos mixture state upload deadline elapsed"));
+	}
+	Ok(remaining)
 }
 
 #[auxmacros::bind("/proc/dogmos_gas_metadata_install")]

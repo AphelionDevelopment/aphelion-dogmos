@@ -9,9 +9,13 @@ use dogmos_protocol::{
 	read_frame_into, write_frame, CallbackBatchRequest, ContinuationCommandRequest,
 	ContinuationResumeRequest, ContinuationToken, FrontierAppendResponse, FrontierBeginRequest,
 	FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse, FrontierMutateResponse,
-	HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest, OperationKind, ProtocolHeader,
-	ServiceErrorCode, SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest,
-	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
+	HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest,
+	MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
+	MixtureStateUploadAppendResponse, MixtureStateUploadBeginRequest,
+	MixtureStateUploadBeginResponse, MixtureStateUploadCommitRequest,
+	MixtureStateUploadCommitResponse, OperationKind, ProtocolHeader, ServiceErrorCode,
+	SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR,
+	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -514,6 +518,89 @@ fn handle_primary(
 				};
 				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
 			}
+			OperationKind::MixtureStateUploadBegin => {
+				let Ok(upload) = MixtureStateUploadBeginRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let upload_id = match service_state.begin_mixture_state_upload(
+					upload.expected_count,
+					expected.capacities.max_batch_operations,
+				) {
+					Ok(upload_id) => upload_id,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&MixtureStateUploadBeginResponse { upload_id }.encode()?,
+				)?;
+			}
+			OperationKind::MixtureStateUploadAppend => {
+				let Ok(upload) = MixtureStateUploadAppendRequest::decode(
+					&payload[..payload_len],
+					expected.capacities.max_batch_operations,
+				) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let accepted_count = match service_state.append_mixture_state_upload(
+					upload.upload_id,
+					upload.offset,
+					&upload.mutations,
+				) {
+					Ok(count) => count,
+					Err(error) => {
+						write_error_response(&mut stream, request, service_error_code(&error))?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&MixtureStateUploadAppendResponse { accepted_count }.encode(),
+				)?;
+			}
+			OperationKind::MixtureStateUploadCommit => {
+				let Ok(upload) = MixtureStateUploadCommitRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let committed_count =
+					match service_state.commit_mixture_state_upload(upload.upload_id) {
+						Ok(count) => count,
+						Err(error) => {
+							write_error_response(&mut stream, request, service_error_code(&error))?;
+							continue;
+						}
+					};
+				write_response(
+					&mut stream,
+					request,
+					&MixtureStateUploadCommitResponse { committed_count }.encode(),
+				)?;
+			}
+			OperationKind::MixtureStateUploadAbort => {
+				let Ok(upload) = MixtureStateUploadAbortRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				if let Err(error) = service_state.abort_mixture_state_upload(upload.upload_id) {
+					write_error_response(&mut stream, request, service_error_code(&error))?;
+					continue;
+				}
+				write_response(&mut stream, request, &[])?;
+			}
 			OperationKind::AdjacencyBatch => {
 				let Ok(mutations) = decode_adjacency_batch(
 					&payload[..payload_len],
@@ -798,6 +885,12 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		state::StateError::FrontierConflict => ServiceErrorCode::FrontierConflict,
 		state::StateError::FrontierIncomplete => ServiceErrorCode::FrontierIncomplete,
 		state::StateError::StageConflict => ServiceErrorCode::StageConflict,
+		state::StateError::MixtureStateUploadConflict => {
+			ServiceErrorCode::MixtureStateUploadConflict
+		}
+		state::StateError::MixtureStateUploadIncomplete => {
+			ServiceErrorCode::MixtureStateUploadIncomplete
+		}
 		state::StateError::ContinuationCapacityExceeded => {
 			ServiceErrorCode::ContinuationCapacityExceeded
 		}
@@ -821,6 +914,7 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		| state::StateError::CallbackOutputTooSmall
 		| state::StateError::CallbackSequenceExhausted
 		| state::StateError::ReactionTransactionIdExhausted
+		| state::StateError::MixtureStateUploadIdExhausted
 		| state::StateError::ContinuationIdExhausted
 		| state::StateError::ContinuationDeadlineExhausted => ServiceErrorCode::Internal,
 	}
