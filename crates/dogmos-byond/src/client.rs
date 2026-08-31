@@ -25,6 +25,7 @@ pub enum ClientError {
 	ConnectTimeout,
 	RequestTimeout,
 	WorkerStopped,
+	WorkerShutdownTimeout,
 }
 
 impl fmt::Display for ClientError {
@@ -387,19 +388,29 @@ impl BoundedDogmosClient {
 			.as_ref()
 			.is_none_or(thread::JoinHandle::is_finished)
 	}
-}
 
-impl Drop for BoundedDogmosClient {
-	fn drop(&mut self) {
+	pub fn close(&mut self, timeout: Duration) -> Result<(), ClientError> {
 		self.sender.take();
 		if !self.is_worker_finished() {
 			let _ = self.canceller.cancel();
 		}
-		if self.is_worker_finished() {
-			if let Some(worker) = self.worker.take() {
-				let _ = worker.join();
-			}
+		let deadline = Instant::now() + timeout;
+		while !self.is_worker_finished() && Instant::now() < deadline {
+			thread::yield_now();
 		}
+		if !self.is_worker_finished() {
+			return Err(ClientError::WorkerShutdownTimeout);
+		}
+		if let Some(worker) = self.worker.take() {
+			worker.join().map_err(|_| ClientError::WorkerStopped)?;
+		}
+		Ok(())
+	}
+}
+
+impl Drop for BoundedDogmosClient {
+	fn drop(&mut self) {
+		let _ = self.close(Duration::ZERO);
 	}
 }
 

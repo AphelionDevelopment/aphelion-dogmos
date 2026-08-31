@@ -91,7 +91,8 @@ struct AllocationRecord {
 	allocation: AllocationSnapshot,
 	work_items: u64,
 	transcript_hash: u64,
-	active_vec_capacity_bytes_lower_bound: u64,
+	peak_active_vec_capacity_bytes_lower_bound: u64,
+	post_stage_retained_vec_capacity_bytes_lower_bound: u64,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -102,9 +103,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 			for stage in STAGES {
 				let mut world = build_world(turf_count, topology)?;
 				reset_allocation_counters();
-				let work_items = run_stage(&mut world, stage)?;
+				let (work_items, peak_active_vec_capacity_bytes_lower_bound) =
+					run_stage(&mut world, stage)?;
 				let allocation = allocation_snapshot();
-				let active_vec_capacity_bytes_lower_bound = world.reusable_workset_bytes();
+				let post_stage_retained_vec_capacity_bytes_lower_bound =
+					world.reusable_workset_bytes();
 				let transcript_hash =
 					transcript_hash(&mut world, stage, topology, turf_count, work_items)?;
 				records.push(AllocationRecord {
@@ -114,7 +117,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 					allocation,
 					work_items,
 					transcript_hash,
-					active_vec_capacity_bytes_lower_bound,
+					peak_active_vec_capacity_bytes_lower_bound,
+					post_stage_retained_vec_capacity_bytes_lower_bound,
 				});
 			}
 		}
@@ -289,7 +293,7 @@ fn topology_edges(topology: Topology, turf_count: usize) -> Vec<(usize, usize)> 
 	edges
 }
 
-fn run_stage(world: &mut DogmosWorld, stage: WorldStage) -> Result<u64, Box<dyn Error>> {
+fn run_stage(world: &mut DogmosWorld, stage: WorldStage) -> Result<(u64, u64), Box<dyn Error>> {
 	let request = StageChunkRequest {
 		stage,
 		frontier_epoch: 1,
@@ -298,11 +302,14 @@ fn run_stage(world: &mut DogmosWorld, stage: WorldStage) -> Result<u64, Box<dyn 
 		seconds_per_tick: 0.5,
 	};
 	let mut work_items = 0_u64;
+	let mut peak_active_vec_capacity_bytes_lower_bound = world.reusable_workset_bytes();
 	loop {
 		let result = world.process_stage_chunk_cancellable(request, || false)?;
 		work_items += u64::from(result.work_items);
+		peak_active_vec_capacity_bytes_lower_bound =
+			peak_active_vec_capacity_bytes_lower_bound.max(world.reusable_workset_bytes());
 		if !result.pending {
-			return Ok(work_items);
+			return Ok((work_items, peak_active_vec_capacity_bytes_lower_bound));
 		}
 	}
 }
@@ -374,12 +381,12 @@ fn write_records(path: PathBuf, records: &[AllocationRecord]) -> Result<(), Box<
 		fs::create_dir_all(parent)?;
 	}
 	let mut output = String::from(
-		"stage,topology,turf_count,allocations,deallocations,allocated_bytes,deallocated_bytes,work_items,transcript_hash,active_vec_capacity_bytes_lower_bound\n",
+		"stage,topology,turf_count,allocations,deallocations,allocated_bytes,deallocated_bytes,work_items,transcript_hash,peak_active_vec_capacity_bytes_lower_bound,post_stage_retained_vec_capacity_bytes_lower_bound\n",
 	);
 	for record in records {
 		writeln!(
 			output,
-			"{},{},{},{},{},{},{},{},{:016x},{}",
+			"{},{},{},{},{},{},{},{},{:016x},{},{}",
 			record.stage,
 			record.topology,
 			record.turf_count,
@@ -389,7 +396,8 @@ fn write_records(path: PathBuf, records: &[AllocationRecord]) -> Result<(), Box<
 			record.allocation.deallocated_bytes,
 			record.work_items,
 			record.transcript_hash,
-			record.active_vec_capacity_bytes_lower_bound,
+			record.peak_active_vec_capacity_bytes_lower_bound,
+			record.post_stage_retained_vec_capacity_bytes_lower_bound,
 		)?;
 	}
 	fs::write(path, output)?;

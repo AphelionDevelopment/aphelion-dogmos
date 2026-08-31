@@ -211,6 +211,24 @@ fn incremental_add_and_remove_mutate_the_committed_frontier_without_a_full_reupl
 }
 
 #[test]
+fn committed_frontier_storage_is_separate_from_upload_scratch() {
+	let handle = turf(0, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &[handle]);
+	world.add_frontier(1, &[handle]).unwrap();
+
+	assert_eq!(world.frontier_upload_bytes(), 0);
+	assert_eq!(world.committed_frontier(), &[handle]);
+	let (committed_capacity, membership_capacity) = world.frontier_committed_capacities();
+	assert!(committed_capacity >= 1);
+	assert!(membership_capacity >= 1);
+	assert_eq!(
+		world.frontier_committed_storage_bytes_lower_bound(),
+		((committed_capacity + membership_capacity) * std::mem::size_of::<TurfHandle>()) as u64
+	);
+}
+
+#[test]
 fn newer_begin_cancels_only_the_partial_upload() {
 	let handles = [turf(0, 1), turf(1, 1)];
 	let mut world = DogmosWorld::new(1024 * 1024);
@@ -1042,7 +1060,7 @@ fn equalize_never_exceeds_the_chunk_work_limit_and_preserves_the_event_transcrip
 	let mut completed = false;
 	for _ in 0..32 {
 		let chunk = world
-			.process_stage_chunk_cancellable(request, || false)
+			.process_stage_chunk_cancellable_with_event_limit(request, 1, || false)
 			.unwrap();
 		assert!(chunk.work_items <= 1);
 		if !chunk.pending {

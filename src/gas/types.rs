@@ -226,6 +226,8 @@ pub fn initialize_gas_info_structs() {
 pub fn destroy_gas_info_structs() {
 	#[cfg(feature = "turf_processing")]
 	crate::turfs::wait_for_tasks();
+	crate::reaction::clear_reaction_values();
+	*REACTION_INFO.write() = None;
 	if let Some(gas_info_by_string) = GAS_INFO_BY_STRING.write().as_mut() {
 		gas_info_by_string.clear();
 	}
@@ -314,8 +316,11 @@ fn hook_register_gas(gas: ByondValue) -> Result<ByondValue> {
 fn hook_init(gas_data: ByondValue) -> Result<ByondValue> {
 	crate::reset_shutdown_state(&crate::DOGMOS_SHUTDOWN);
 	auxcallback::begin_callbacks();
+	crate::gas::prepare_gases_for_world();
+	#[cfg(feature = "turf_processing")]
+	crate::turfs::prepare_turfs_for_world();
 	#[cfg(feature = "superconductivity")]
-	crate::turfs::prepare_turf_heat_for_world();
+	crate::turfs::prepare_turf_heat_for_world()?;
 	let data = gas_data.read_var_id(byond_string!("datums"))?;
 	data.iter()?
 		.map(|(_, gas)| hook_register_gas(gas))
@@ -346,16 +351,20 @@ fn get_reaction_info() -> Result<BTreeMap<ReactionPriority, Reaction>> {
 				{
 					e.insert(reaction);
 				} else {
-					auxcallback::queue_callback(Box::new(move || {
-						Err(eyre::eyre!(format!(
-							"Duplicate reaction priority {}, this reaction will be ignored!",
-							reaction.get_priority().0
-						)))
-					}));
+					let owned_bytes = reaction.owned_bytes_lower_bound();
+					auxcallback::queue_callback(
+						Box::new(move || {
+							Err(eyre::eyre!(format!(
+								"Duplicate reaction priority {}, this reaction will be ignored!",
+								reaction.get_priority().0
+							)))
+						}),
+						owned_bytes,
+					)?;
 				}
 			}
 			Err(runtime) => {
-				auxcallback::queue_callback(Box::new(move || Err(runtime)));
+				auxcallback::queue_callback(Box::new(move || Err(runtime)), 0)?;
 			}
 		}
 	}
@@ -571,4 +580,34 @@ pub fn set_gas_statics_manually() {
 #[cfg(test)]
 pub fn destroy_gas_statics() {
 	destroy_gas_info_structs();
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::gas::GAS_TEST_LOCK;
+	use crate::reaction::{install_test_reaction_value, reaction_name_by_id};
+
+	#[test]
+	fn legacy_shutdown_clears_reaction_registries() {
+		let _guard = GAS_TEST_LOCK.lock().unwrap();
+		let rust_reaction = install_test_reaction_value(11, "old-rust", false);
+		let byond_reaction = install_test_reaction_value(12, "old-byond", true);
+		*REACTION_INFO.write() = Some(BTreeMap::from([
+			(rust_reaction.get_priority(), rust_reaction),
+			(byond_reaction.get_priority(), byond_reaction),
+		]));
+
+		destroy_gas_info_structs();
+
+		assert!(REACTION_INFO.read().is_none());
+		assert_eq!(reaction_name_by_id(11), None);
+		assert_eq!(reaction_name_by_id(12), None);
+
+		let replacement = install_test_reaction_value(11, "replacement", false);
+		*REACTION_INFO.write() = Some(BTreeMap::from([(replacement.get_priority(), replacement)]));
+		assert_eq!(reaction_name_by_id(11).as_deref(), Some("replacement"));
+		assert_eq!(reaction_name_by_id(12), None);
+		destroy_gas_info_structs();
+	}
 }

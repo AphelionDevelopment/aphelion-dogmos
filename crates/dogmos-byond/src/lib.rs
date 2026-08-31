@@ -540,9 +540,10 @@ pub fn decode_production_callback_batch(
 		append_u32_words(&mut fields, event.target.slot);
 		append_u32_words(&mut fields, event.target.generation);
 		for (index, value) in event.values.into_iter().enumerate() {
-			fields.push(finite_byond_scalar(
+			fields.push(finite_indexed_byond_scalar(
 				value.0,
-				&format!("callback value {index}"),
+				"callback value",
+				index,
 			)?);
 		}
 		append_u32_words(&mut fields, event.aux);
@@ -891,9 +892,10 @@ pub fn decode_production_mixture_snapshot(response: &[u8]) -> eyre::Result<Vec<f
 		f32::from(snapshot.immutable),
 	]);
 	for (index, gas) in snapshot.gases.into_iter().enumerate() {
-		fields.push(finite_byond_scalar(
+		fields.push(finite_indexed_byond_scalar(
 			gas.0,
-			&format!("mixture snapshot gas {index}"),
+			"mixture snapshot gas",
+			index,
 		)?);
 	}
 	Ok(fields)
@@ -2463,6 +2465,20 @@ fn finite_byond_scalar(value: f64, field: &str) -> eyre::Result<f32> {
 	Ok(value)
 }
 
+fn finite_indexed_byond_scalar(
+	value: f64,
+	prefix: &'static str,
+	index: usize,
+) -> eyre::Result<f32> {
+	let value = value as f32;
+	if !value.is_finite() {
+		return Err(eyre::eyre!(
+			"{prefix} {index} is outside the finite BYOND number range"
+		));
+	}
+	Ok(value)
+}
+
 /// Inlines exact_u32()'s check instead of calling it with a &format!(...) label: that label was
 /// built unconditionally on every call to bounded_number_list()/bounded_string_list() - both on
 /// the hot decode path for every DM proc call - even though it's only read in the error branch.
@@ -2648,6 +2664,36 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+struct TestCountingAllocator;
+
+#[cfg(test)]
+thread_local! {
+	static COUNT_TEST_ALLOCATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	static TEST_ALLOCATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+unsafe impl std::alloc::GlobalAlloc for TestCountingAllocator {
+	unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+		let allocation = unsafe { std::alloc::System.alloc(layout) };
+		COUNT_TEST_ALLOCATIONS.with(|enabled| {
+			if enabled.get() && !allocation.is_null() {
+				TEST_ALLOCATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+			}
+		});
+		allocation
+	}
+
+	unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+		unsafe { std::alloc::System.dealloc(pointer, layout) };
+	}
+}
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_GLOBAL_ALLOCATOR: TestCountingAllocator = TestCountingAllocator;
+
+#[cfg(test)]
 mod tests {
 	use super::{
 		callback_count_from_number, decode_production_callback_batch,
@@ -2664,6 +2710,8 @@ mod tests {
 		encode_production_turf_heat_adjacency_batch, encode_production_turf_heat_batch,
 		encode_production_turf_lifecycle_batch, exact_u16, exact_u32, hex_lower,
 		normalize_generated_bindings, scalar_response_value, DmMixtureCommandFields,
+		COUNT_TEST_ALLOCATIONS, PRODUCTION_CALLBACK_HEADER_FIELDS, PRODUCTION_MAX_CALLBACK_EVENTS,
+		TEST_ALLOCATION_COUNT,
 	};
 	use dogmos_process_metrics::{
 		CurrentProcessMetrics, PROCESS_ALL_AVAILABLE, PROCESS_PRIVATE_BYTES_AVAILABLE,
@@ -2693,6 +2741,24 @@ mod tests {
 			Ok(_) => panic!("expected an error"),
 			Err(error) => error.to_string(),
 		}
+	}
+
+	fn count_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+		struct CountingGuard;
+
+		impl Drop for CountingGuard {
+			fn drop(&mut self) {
+				COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(false));
+			}
+		}
+
+		TEST_ALLOCATION_COUNT.with(|count| count.set(0));
+		COUNT_TEST_ALLOCATIONS.with(|enabled| enabled.set(true));
+		let guard = CountingGuard;
+		let output = operation();
+		drop(guard);
+		let allocations = TEST_ALLOCATION_COUNT.with(std::cell::Cell::get);
+		(output, allocations)
 	}
 
 	#[test]
@@ -2829,6 +2895,96 @@ mod tests {
 				0,
 			)),
 			"callback value 0 is outside the finite BYOND number range"
+		);
+	}
+
+	#[test]
+	fn callback_value_overflow_preserves_the_exact_index() {
+		let event = CallbackEvent {
+			scope_sequence: 1,
+			transaction_id: 0,
+			scope: CallbackScope::General,
+			kind: CallbackEventKind::Diagnostic,
+			flags: 0,
+			subject: handle(0, 1),
+			target: handle(0, 1),
+			values: [
+				ScalarValue(0.0),
+				ScalarValue(0.0),
+				ScalarValue(0.0),
+				ScalarValue(f64::from(f32::MAX) * 2.0),
+			],
+			aux: 0,
+			continuation: None,
+		};
+		let mut response = CallbackBatchHeader {
+			returned: 1,
+			remaining: 0,
+			capacity: 1,
+			high_water: 1,
+			rejected: 0,
+		}
+		.encode()
+		.to_vec();
+		response.extend(event.encode().unwrap());
+
+		assert_eq!(
+			error_text(decode_production_callback_batch(
+				&response,
+				1,
+				CallbackScope::General,
+				0,
+			)),
+			"callback value 3 is outside the finite BYOND number range"
+		);
+	}
+
+	#[test]
+	fn callback_value_success_path_does_not_allocate_index_labels() {
+		let mut response = CallbackBatchHeader {
+			returned: PRODUCTION_MAX_CALLBACK_EVENTS,
+			remaining: 0,
+			capacity: PRODUCTION_MAX_CALLBACK_EVENTS,
+			high_water: PRODUCTION_MAX_CALLBACK_EVENTS,
+			rejected: 0,
+		}
+		.encode()
+		.to_vec();
+		for sequence in 1..=u64::from(PRODUCTION_MAX_CALLBACK_EVENTS) {
+			response.extend(
+				CallbackEvent {
+					scope_sequence: sequence,
+					transaction_id: 0,
+					scope: CallbackScope::General,
+					kind: CallbackEventKind::Diagnostic,
+					flags: 0,
+					subject: handle(0, 1),
+					target: handle(0, 1),
+					values: [ScalarValue(1.0); 4],
+					aux: 0,
+					continuation: None,
+				}
+				.encode()
+				.unwrap(),
+			);
+		}
+
+		let (fields, allocations) = count_allocations(|| {
+			decode_production_callback_batch(
+				&response,
+				PRODUCTION_MAX_CALLBACK_EVENTS,
+				CallbackScope::General,
+				0,
+			)
+			.unwrap()
+		});
+		assert_eq!(
+			fields.len(),
+			PRODUCTION_CALLBACK_HEADER_FIELDS + PRODUCTION_MAX_CALLBACK_EVENTS as usize * 36
+		);
+		assert_eq!(
+			allocations, 1,
+			"only the returned field vector should allocate"
 		);
 	}
 
@@ -2988,6 +3144,57 @@ mod tests {
 		);
 		assert_eq!(fields[10], 1.25);
 		assert_eq!(fields[10 + 31], 9.5);
+	}
+
+	#[test]
+	fn mixture_snapshot_gas_overflow_preserves_the_exact_index() {
+		let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
+		gases[17] = ScalarValue(f64::from(f32::MAX) * 2.0);
+		let response = MixtureSnapshot {
+			revision: 1,
+			gas_count: MAX_GAS_SLOTS as u32,
+			temperature: ScalarValue(293.15),
+			volume: ScalarValue(2_500.0),
+			minimum_heat_capacity: ScalarValue(0.5),
+			total_moles: ScalarValue(10.75),
+			pressure: ScalarValue(10.5),
+			heat_capacity: ScalarValue(215.0),
+			immutable: false,
+			gases,
+		}
+		.encode()
+		.unwrap();
+
+		assert_eq!(
+			error_text(decode_production_mixture_snapshot(&response)),
+			"mixture snapshot gas 17 is outside the finite BYOND number range"
+		);
+	}
+
+	#[test]
+	fn mixture_snapshot_success_path_does_not_allocate_index_labels() {
+		let response = MixtureSnapshot {
+			revision: 1,
+			gas_count: MAX_GAS_SLOTS as u32,
+			temperature: ScalarValue(293.15),
+			volume: ScalarValue(2_500.0),
+			minimum_heat_capacity: ScalarValue(0.5),
+			total_moles: ScalarValue(10.75),
+			pressure: ScalarValue(10.5),
+			heat_capacity: ScalarValue(215.0),
+			immutable: false,
+			gases: [ScalarValue(1.0); MAX_GAS_SLOTS],
+		}
+		.encode()
+		.unwrap();
+
+		let (fields, allocations) =
+			count_allocations(|| decode_production_mixture_snapshot(&response).unwrap());
+		assert_eq!(fields.len(), 10 + MAX_GAS_SLOTS);
+		assert_eq!(
+			allocations, 1,
+			"only the returned field vector should allocate"
+		);
 	}
 
 	#[test]

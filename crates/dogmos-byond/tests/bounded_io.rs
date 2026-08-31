@@ -38,6 +38,18 @@ fn handshake() -> HandshakePayload {
 	}
 }
 
+fn current_process_handle_count() -> u32 {
+	use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+	let mut count = 0;
+	// SAFETY: GetCurrentProcess returns a pseudo-handle valid in this process and `count` is writable.
+	assert_ne!(
+		unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+		0
+	);
+	count
+}
+
 #[test]
 fn stalled_read_releases_the_caller_and_cancels_the_worker() {
 	let unique = SystemTime::now()
@@ -83,6 +95,56 @@ fn stalled_read_releases_the_caller_and_cancels_the_worker() {
 		thread::sleep(Duration::from_millis(5));
 	}
 	assert!(bounded.is_worker_finished());
+	bounded.close(Duration::from_millis(500)).unwrap();
+	assert!(bounded.is_worker_finished());
+}
+
+#[test]
+fn repeated_timeout_close_cycles_release_worker_handles() {
+	let starting_handles = current_process_handle_count();
+	for cycle in 0..8 {
+		let unique = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let endpoint = format!(
+			"dogmos-bounded-close-{}-{unique}-{cycle}",
+			std::process::id()
+		);
+		let name = endpoint.clone().to_ns_name::<GenericNamespaced>().unwrap();
+		let listener = ListenerOptions::new().name(name).create_sync().unwrap();
+		let expected = handshake();
+		let (release_sender, release_receiver) = std::sync::mpsc::channel();
+		let server = thread::spawn(move || {
+			let mut stream = listener.accept().unwrap();
+			let mut payload = [0_u8; HANDSHAKE_PAYLOAD_LEN];
+			let (request, payload_len) = read_frame_into(&mut stream, &mut payload).unwrap();
+			assert_eq!(
+				HandshakePayload::decode(&payload[..payload_len]).unwrap(),
+				expected
+			);
+			write_frame(&mut stream, request.response(), &expected.encode()).unwrap();
+			let mut request_payload = [0_u8; 16];
+			let _ = read_frame_into(&mut stream, &mut request_payload).unwrap();
+			release_receiver.recv().unwrap();
+		});
+
+		let client = DogmosClient::connect(&endpoint, expected, Duration::from_secs(1)).unwrap();
+		let mut bounded = BoundedDogmosClient::new(client).unwrap();
+		assert!(matches!(
+			bounded.echo(b"stall", Duration::from_millis(25)),
+			Err(ClientError::RequestTimeout)
+		));
+		bounded.close(Duration::from_millis(500)).unwrap();
+		assert!(bounded.is_worker_finished());
+		release_sender.send(()).unwrap();
+		server.join().unwrap();
+	}
+	let ending_handles = current_process_handle_count();
+	assert!(
+		ending_handles <= starting_handles + 8,
+		"process handle count grew from {starting_handles} to {ending_handles}"
+	);
 }
 
 #[test]

@@ -496,6 +496,10 @@ pub enum WorldError {
 		requested: u32,
 		capacity: u32,
 	},
+	PendingEventCountExceeded {
+		requested: u32,
+		available: u32,
+	},
 	UnknownReactionContinuation(ReactionContinuationToken),
 	StaleReactionContinuation {
 		requested: ReactionContinuationToken,
@@ -645,7 +649,7 @@ struct StageComponentState {
 	next_neighbor: usize,
 	component_ready: bool,
 	transaction: IndexedTransaction<MixtureRecord>,
-	published_mixtures: BTreeSet<MixtureHandle>,
+	published_generation_by_slot: Vec<Option<u32>>,
 	staged_events: Vec<WorldEvent>,
 	callback_events: u32,
 	components_processed: u32,
@@ -653,6 +657,11 @@ struct StageComponentState {
 
 impl StageComponentState {
 	fn try_new(slot_count: usize, max_entries: usize) -> Result<Self, WorldError> {
+		let mut published_generation_by_slot = Vec::new();
+		published_generation_by_slot
+			.try_reserve_exact(slot_count)
+			.map_err(|_| WorldError::AllocationFailed)?;
+		published_generation_by_slot.resize(slot_count, None);
 		Ok(Self {
 			targets: Vec::new(),
 			active_by_slot: BTreeMap::new(),
@@ -664,11 +673,21 @@ impl StageComponentState {
 			component_ready: false,
 			transaction: IndexedTransaction::try_new(slot_count, max_entries)
 				.map_err(transaction_world_error)?,
-			published_mixtures: BTreeSet::new(),
+			published_generation_by_slot,
 			staged_events: Vec::new(),
 			callback_events: 0,
 			components_processed: 0,
 		})
+	}
+
+	fn mixture_was_published(&self, handle: MixtureHandle) -> bool {
+		self.published_generation_by_slot
+			.get(handle.slot as usize)
+			.is_some_and(|generation| *generation == Some(handle.generation))
+	}
+
+	fn mark_mixture_published(&mut self, handle: MixtureHandle) {
+		self.published_generation_by_slot[handle.slot as usize] = Some(handle.generation);
 	}
 }
 
@@ -894,6 +913,17 @@ impl DogmosWorld {
 		self.frontier.upload_bytes()
 	}
 
+	/// Returns the committed frontier's element-storage lower bound.
+	///
+	/// Hash-table control bytes, bucket padding, and allocator metadata are excluded.
+	pub fn frontier_committed_storage_bytes_lower_bound(&self) -> u64 {
+		self.frontier.committed_storage_bytes_lower_bound()
+	}
+
+	pub fn frontier_committed_capacities(&self) -> (usize, usize) {
+		self.frontier.committed_capacities()
+	}
+
 	pub fn topology_revision(&self) -> u64 {
 		self.topology.revision()
 	}
@@ -961,6 +991,12 @@ impl DogmosWorld {
 			active_vec_capacity_bytes_lower_bound +=
 				state.staged_events.capacity() * std::mem::size_of::<WorldEvent>();
 			active_vec_capacity_bytes_lower_bound += state.transaction.capacity_bytes_lower_bound();
+			active_vec_capacity_bytes_lower_bound +=
+				state.published_generation_by_slot.capacity() * std::mem::size_of::<Option<u32>>();
+		}
+		if let Some(component_turfs) = &self.stage_component_turfs {
+			active_vec_capacity_bytes_lower_bound +=
+				component_turfs.capacity() * std::mem::size_of::<TurfHandle>();
 		}
 		active_vec_capacity_bytes_lower_bound as u64
 	}
@@ -2171,6 +2207,23 @@ impl DogmosWorld {
 		count as u32
 	}
 
+	pub fn pending_events(&self, maximum: u32) -> &[WorldEvent] {
+		let count = self.events.len().min(maximum as usize);
+		&self.events[..count]
+	}
+
+	pub fn discard_pending_events(&mut self, count: u32) -> Result<(), WorldError> {
+		let available = self.events.len();
+		if count as usize > available {
+			return Err(WorldError::PendingEventCountExceeded {
+				requested: count,
+				available: u32::try_from(available).unwrap_or(u32::MAX),
+			});
+		}
+		self.events.drain(..count as usize);
+		Ok(())
+	}
+
 	pub fn pending_reaction_continuations(&self) -> u32 {
 		self.continuations
 			.iter()
@@ -2210,9 +2263,24 @@ impl DogmosWorld {
 	pub fn process_stage_chunk_cancellable(
 		&mut self,
 		request: StageChunkRequest,
+		should_cancel: impl FnMut() -> bool,
+	) -> Result<StageChunkResult, WorldError> {
+		self.process_stage_chunk_cancellable_with_event_limit(
+			request,
+			self.max_events,
+			should_cancel,
+		)
+	}
+
+	pub fn process_stage_chunk_cancellable_with_event_limit(
+		&mut self,
+		request: StageChunkRequest,
+		event_limit: u32,
 		mut should_cancel: impl FnMut() -> bool,
 	) -> Result<StageChunkResult, WorldError> {
-		let result = self.process_stage_chunk_cancellable_inner(request, &mut should_cancel);
+		let event_capacity = self.max_events.min(event_limit) as usize;
+		let result =
+			self.process_stage_chunk_cancellable_inner(request, event_capacity, &mut should_cancel);
 		if result.is_err() {
 			self.abort_stage();
 		}
@@ -2232,6 +2300,7 @@ impl DogmosWorld {
 	fn process_stage_chunk_cancellable_inner(
 		&mut self,
 		request: StageChunkRequest,
+		event_capacity: usize,
 		mut should_cancel: impl FnMut() -> bool,
 	) -> Result<StageChunkResult, WorldError> {
 		if request.work_limit == 0 || request.work_limit > MAX_STAGE_WORK_LIMIT {
@@ -2470,7 +2539,7 @@ impl DogmosWorld {
 					..StageChunkResult::default()
 				});
 			}
-			let (completed, callback_events) = self.commit_stage_heat()?;
+			let (completed, callback_events) = self.commit_stage_heat(event_capacity)?;
 			self.stage_cursor = None;
 			return Ok(StageChunkResult {
 				work_items,
@@ -2522,7 +2591,7 @@ impl DogmosWorld {
 					..StageChunkResult::default()
 				});
 			}
-			let (_, callback_events) = self.commit_stage_reactions()?;
+			let (_, callback_events) = self.commit_stage_reactions(event_capacity)?;
 			self.stage_cursor = None;
 			return Ok(StageChunkResult {
 				work_items,
@@ -2545,7 +2614,11 @@ impl DogmosWorld {
 					if should_cancel() {
 						return Err(WorldError::Cancelled);
 					}
-					self.process_ready_stage_component(request.stage, &mut should_cancel)?;
+					self.process_ready_stage_component(
+						request.stage,
+						event_capacity,
+						&mut should_cancel,
+					)?;
 					work_items += 1;
 					continue;
 				}
@@ -2986,17 +3059,17 @@ impl DogmosWorld {
 		})
 	}
 
-	fn commit_stage_heat(&mut self) -> Result<(u32, u32), WorldError> {
+	fn commit_stage_heat(&mut self, event_capacity: usize) -> Result<(u32, u32), WorldError> {
 		let state = self
 			.stage_heat
 			.take()
 			.expect("turf-heat stage owns heat state");
 		let requested_events = self.events.len().saturating_add(state.staged_events.len());
-		if requested_events > self.max_events as usize {
+		if requested_events > event_capacity {
 			self.stage_heat = Some(state);
 			return Err(WorldError::EventCapacityExceeded {
 				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
-				capacity: self.max_events,
+				capacity: u32::try_from(event_capacity).unwrap_or(u32::MAX),
 			});
 		}
 		let completed = u32::try_from(state.nodes.len())
@@ -3062,7 +3135,7 @@ impl DogmosWorld {
 		Ok(())
 	}
 
-	fn commit_stage_reactions(&mut self) -> Result<(u32, u32), WorldError> {
+	fn commit_stage_reactions(&mut self, event_capacity: usize) -> Result<(u32, u32), WorldError> {
 		let state = self
 			.stage_reactions
 			.take()
@@ -3072,11 +3145,11 @@ impl DogmosWorld {
 			.len()
 			.saturating_add(state.staged_events.len())
 			.saturating_add(usize::from(state.pending.is_some()));
-		if requested_events > self.max_events as usize {
+		if requested_events > event_capacity {
 			self.stage_reactions = Some(state);
 			return Err(WorldError::EventCapacityExceeded {
 				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
-				capacity: self.max_events,
+				capacity: u32::try_from(event_capacity).unwrap_or(u32::MAX),
 			});
 		}
 		let continuation_event = if let Some((turf, mixture, pending)) = state.pending {
@@ -3194,6 +3267,7 @@ impl DogmosWorld {
 	fn process_ready_stage_component(
 		&mut self,
 		stage: WorldStage,
+		event_capacity: usize,
 		should_cancel: &mut impl FnMut() -> bool,
 	) -> Result<(), WorldError> {
 		let mut state = self
@@ -3202,7 +3276,7 @@ impl DogmosWorld {
 			.expect("component stage owns traversal state");
 		let checkpoint = state.transaction.checkpoint();
 		let event_checkpoint = state.staged_events.len();
-		self.stage_component_turfs = Some(state.queue.clone());
+		self.stage_component_turfs = Some(std::mem::take(&mut state.queue));
 		self.use_committed_frontier = true;
 		let result = match stage {
 			WorldStage::Equalize => self.compute_equalize(
@@ -3216,7 +3290,10 @@ impl DogmosWorld {
 			_ => unreachable!("only component stages use component traversal"),
 		};
 		self.use_committed_frontier = false;
-		self.stage_component_turfs = None;
+		state.queue = self
+			.stage_component_turfs
+			.take()
+			.expect("component stage owns its turf queue");
 		if let Err(error) = result {
 			state.transaction.rollback_to(checkpoint);
 			state.staged_events.truncate(event_checkpoint);
@@ -3228,16 +3305,18 @@ impl DogmosWorld {
 			.entries()
 			.iter()
 			.map(|entry| entry.handle)
-			.find(|handle| state.published_mixtures.contains(handle))
+			.find(|handle| state.mixture_was_published(*handle))
 		{
 			state.transaction.clear();
 			state.staged_events.clear();
 			self.stage_components = Some(state);
 			return Err(WorldError::DuplicateMutableTurfMixture(handle));
 		}
-		if let Err(error) =
-			self.validate_indexed_transaction(&state.transaction, state.staged_events.len())
-		{
+		if let Err(error) = self.validate_indexed_transaction(
+			&state.transaction,
+			state.staged_events.len(),
+			event_capacity,
+		) {
 			state.transaction.clear();
 			state.staged_events.clear();
 			self.stage_components = Some(state);
@@ -3246,9 +3325,9 @@ impl DogmosWorld {
 		state.callback_events = state
 			.callback_events
 			.saturating_add(u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX));
-		state
-			.published_mixtures
-			.extend(state.transaction.entries().iter().map(|entry| entry.handle));
+		for index in 0..state.transaction.entries().len() {
+			state.mark_mixture_published(state.transaction.entries()[index].handle);
+		}
 		self.publish_indexed_transaction_reusing(&mut state.transaction, &mut state.staged_events);
 		state.queue.clear();
 		state.queue_index = 0;
@@ -3277,12 +3356,13 @@ impl DogmosWorld {
 		&self,
 		transaction: &IndexedTransaction<MixtureRecord>,
 		staged_event_count: usize,
+		event_capacity: usize,
 	) -> Result<(), WorldError> {
 		let requested_events = self.events.len().saturating_add(staged_event_count);
-		if requested_events > self.max_events as usize {
+		if requested_events > event_capacity {
 			return Err(WorldError::EventCapacityExceeded {
 				requested: u32::try_from(requested_events).unwrap_or(u32::MAX),
-				capacity: self.max_events,
+				capacity: u32::try_from(event_capacity).unwrap_or(u32::MAX),
 			});
 		}
 		for entry in transaction.entries() {
@@ -3952,7 +4032,7 @@ impl DogmosWorld {
 			.map_err(transaction_world_error)?;
 		let mut staged_events = Vec::new();
 		let result = self.compute_excited_groups(&mut transaction, should_cancel)?;
-		self.validate_indexed_transaction(&transaction, 0)?;
+		self.validate_indexed_transaction(&transaction, 0, self.max_events as usize)?;
 		self.publish_indexed_transaction_reusing(&mut transaction, &mut staged_events);
 		Ok(result)
 	}
@@ -4103,7 +4183,11 @@ impl DogmosWorld {
 			.map_err(transaction_world_error)?;
 		let mut staged_events = Vec::new();
 		let result = self.compute_equalize(&mut transaction, &mut staged_events, should_cancel)?;
-		self.validate_indexed_transaction(&transaction, staged_events.len())?;
+		self.validate_indexed_transaction(
+			&transaction,
+			staged_events.len(),
+			self.max_events as usize,
+		)?;
 		self.publish_indexed_transaction_reusing(&mut transaction, &mut staged_events);
 		Ok(result)
 	}
@@ -5650,16 +5734,35 @@ mod tests {
 	}
 
 	#[test]
-	fn reusable_workset_counts_the_component_transaction_capacity() {
+	fn reusable_workset_counts_component_transaction_and_generation_marker_capacity() {
 		let mut world = DogmosWorld::new(1024 * 1024);
 		let before = world.reusable_workset_bytes();
 		let state = StageComponentState::try_new(4, 3).unwrap();
-		let expected_transaction_bytes = state.transaction.capacity_bytes_lower_bound();
+		let expected_component_bytes = state.transaction.capacity_bytes_lower_bound()
+			+ state.published_generation_by_slot.capacity() * std::mem::size_of::<Option<u32>>();
 		world.stage_components = Some(state);
 
 		assert_eq!(
 			world.reusable_workset_bytes() - before,
-			expected_transaction_bytes as u64
+			expected_component_bytes as u64
+		);
+	}
+
+	#[test]
+	fn reusable_workset_counts_temporary_component_turfs_once() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let before = world.reusable_workset_bytes();
+		let mut component_turfs = Vec::with_capacity(4);
+		component_turfs.push(TurfHandle {
+			slot: 0,
+			generation: 1,
+		});
+		let expected_bytes = component_turfs.capacity() * std::mem::size_of::<TurfHandle>();
+		world.stage_component_turfs = Some(component_turfs);
+
+		assert_eq!(
+			world.reusable_workset_bytes() - before,
+			expected_bytes as u64
 		);
 	}
 
@@ -5681,10 +5784,31 @@ mod tests {
 			.temperature = 500.0;
 		world.mixtures[0].mixture.as_mut().unwrap().revision += 1;
 		assert_eq!(
-			world.validate_indexed_transaction(&state.transaction, state.staged_events.len()),
+			world.validate_indexed_transaction(
+				&state.transaction,
+				state.staged_events.len(),
+				world.max_events as usize,
+			),
 			Err(WorldError::StageConflict)
 		);
 		assert_eq!(world.require_handle(handle(0)).unwrap().temperature, 2.7);
+	}
+
+	#[test]
+	fn component_publication_identity_includes_the_mixture_generation() {
+		let mut state = StageComponentState::try_new(1, 1).unwrap();
+		let original = MixtureHandle {
+			slot: 0,
+			generation: 1,
+		};
+		let reused = MixtureHandle {
+			slot: 0,
+			generation: 2,
+		};
+		state.mark_mixture_published(original);
+
+		assert!(state.mixture_was_published(original));
+		assert!(!state.mixture_was_published(reused));
 	}
 
 	#[test]
