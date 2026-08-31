@@ -7,17 +7,136 @@ use dogmos_protocol::{
 	DOGMOS_PROTOCOL_VERSION,
 };
 use std::{
-	io::{self, Write},
+	io::{self, Read, Write},
 	path::Path,
 	process::{Child, Command, Stdio},
+	sync::{Arc, Condvar, Mutex},
+	thread::{self, JoinHandle},
 	time::Duration,
 };
 
 const REQUEST_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const SERVICE_DIAGNOSTIC_WAIT: Duration = Duration::from_millis(50);
+const MAX_SERVICE_DIAGNOSTIC_BYTES: usize = 4096;
+
+#[derive(Default)]
+struct ServiceDiagnosticState {
+	sequence: u64,
+	latest: Option<String>,
+}
+
+struct ServiceDiagnosticCapture {
+	state: Arc<(Mutex<ServiceDiagnosticState>, Condvar)>,
+	worker: Option<JoinHandle<()>>,
+}
+
+impl ServiceDiagnosticCapture {
+	fn start(mut reader: impl Read + Send + 'static) -> Self {
+		let state = Arc::new((
+			Mutex::new(ServiceDiagnosticState::default()),
+			Condvar::new(),
+		));
+		let worker_state = Arc::clone(&state);
+		let worker = thread::spawn(move || {
+			let mut read_buffer = [0_u8; 1024];
+			let mut line = Vec::with_capacity(MAX_SERVICE_DIAGNOSTIC_BYTES);
+			loop {
+				let read = match reader.read(&mut read_buffer) {
+					Ok(0) => {
+						if !line.is_empty() {
+							record_service_diagnostic(&worker_state, &line);
+						}
+						break;
+					}
+					Ok(read) => read,
+					Err(error) => {
+						record_service_diagnostic(
+							&worker_state,
+							format!("dogmosd stderr read failed: {error}").as_bytes(),
+						);
+						break;
+					}
+				};
+				for byte in &read_buffer[..read] {
+					if *byte == b'\n' {
+						if line.last() == Some(&b'\r') {
+							line.pop();
+						}
+						if !line.is_empty() {
+							record_service_diagnostic(&worker_state, &line);
+						}
+						line.clear();
+					} else if line.len() < MAX_SERVICE_DIAGNOSTIC_BYTES {
+						line.push(*byte);
+					}
+				}
+			}
+		});
+		Self {
+			state,
+			worker: Some(worker),
+		}
+	}
+
+	fn sequence(&self) -> u64 {
+		let (state, _) = &*self.state;
+		state
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.sequence
+	}
+
+	fn latest_after(&self, sequence: u64, timeout: Duration) -> Option<String> {
+		let (state, updated) = &*self.state;
+		let locked = state
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		let (locked, _) = updated
+			.wait_timeout_while(locked, timeout, |state| state.sequence <= sequence)
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		(sequence < locked.sequence)
+			.then(|| locked.latest.clone())
+			.flatten()
+	}
+
+	fn latest(&self) -> Option<String> {
+		let (state, _) = &*self.state;
+		state
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.latest
+			.clone()
+	}
+
+	fn close(&mut self) {
+		if let Some(worker) = self.worker.take() {
+			let _ = worker.join();
+		}
+	}
+}
+
+fn record_service_diagnostic(state: &Arc<(Mutex<ServiceDiagnosticState>, Condvar)>, bytes: &[u8]) {
+	let mut diagnostic = String::from_utf8_lossy(bytes).into_owned();
+	if diagnostic.len() > MAX_SERVICE_DIAGNOSTIC_BYTES {
+		let mut end = MAX_SERVICE_DIAGNOSTIC_BYTES;
+		while !diagnostic.is_char_boundary(end) {
+			end -= 1;
+		}
+		diagnostic.truncate(end);
+	}
+	let (state, updated) = &**state;
+	let mut state = state
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	state.sequence = state.sequence.saturating_add(1);
+	state.latest = Some(diagnostic);
+	updated.notify_all();
+}
 
 pub(crate) struct ServiceSession {
 	pub(crate) client: BoundedDogmosClient,
 	service: Child,
+	diagnostics: ServiceDiagnosticCapture,
 	reaped: bool,
 	#[cfg(windows)]
 	service_job: Option<std::os::windows::io::OwnedHandle>,
@@ -54,6 +173,7 @@ impl ServiceSession {
 	where
 		E: From<ClientError>,
 	{
+		let diagnostic_sequence = self.diagnostics.sequence();
 		match self
 			.client
 			.round_trip(operation, payload, response_capacity, timeout)
@@ -66,11 +186,15 @@ impl ServiceSession {
 					source: Box::new(error),
 					process_id,
 					process_state,
+					service_diagnostic: self.diagnostics.latest(),
 				}
 				.into())
 			}
-			Err(error @ ClientError::Server(dogmos_protocol::ServiceErrorCode::Internal)) => {
-				Err(self.with_process_context(error).into())
+			Err(error @ ClientError::Server(_)) => {
+				let diagnostic = self
+					.diagnostics
+					.latest_after(diagnostic_sequence, SERVICE_DIAGNOSTIC_WAIT);
+				Err(self.with_process_context(error, diagnostic).into())
 			}
 			Err(error) => Err(error.into()),
 		}
@@ -90,6 +214,7 @@ impl ServiceSession {
 		let kill_result = self.service.kill();
 		let wait_result = self.service.wait();
 		self.reaped = true;
+		self.diagnostics.close();
 		let process_state = match (kill_result, wait_result) {
 			(_, Ok(status)) => format!("terminated ({status})"),
 			(Err(error), Err(wait_error)) => {
@@ -103,7 +228,11 @@ impl ServiceSession {
 		}
 	}
 
-	fn with_process_context(&mut self, error: ClientError) -> ClientError {
+	fn with_process_context(
+		&mut self,
+		error: ClientError,
+		service_diagnostic: Option<String>,
+	) -> ClientError {
 		let process_id = self.service.id();
 		let process_state = match self.service.try_wait() {
 			Ok(Some(status)) => {
@@ -117,6 +246,7 @@ impl ServiceSession {
 			source: Box::new(error),
 			process_id,
 			process_state,
+			service_diagnostic,
 		}
 	}
 
@@ -137,6 +267,7 @@ impl ServiceSession {
 		self.request_without_response(OperationKind::Shutdown, &[])?;
 		let status = self.service.wait()?;
 		self.reaped = true;
+		self.diagnostics.close();
 		self.client.close(REQUEST_WORKER_SHUTDOWN_TIMEOUT)?;
 		if !status.success() {
 			return Err(eyre::eyre!("dogmosd did not shut down cleanly"));
@@ -192,15 +323,21 @@ pub(crate) fn start_service_session(service_path: &str) -> eyre::Result<ServiceS
 		.arg(&endpoint)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::null())
-		.stderr(Stdio::inherit());
+		.stderr(Stdio::piped());
 	configure_service_command(&mut command);
 	let mut service = command.spawn()?;
+	let stderr = service
+		.stderr
+		.take()
+		.ok_or_else(|| eyre::eyre!("dogmosd stderr was not piped"))?;
+	let mut diagnostics = ServiceDiagnosticCapture::start(stderr);
 	#[cfg(windows)]
 	let service_job = match attach_kill_on_close_job(&service) {
 		Ok(job) => job,
 		Err(error) => {
 			let _ = service.kill();
 			let _ = service.wait();
+			diagnostics.close();
 			return Err(error.into());
 		}
 	};
@@ -212,6 +349,7 @@ pub(crate) fn start_service_session(service_path: &str) -> eyre::Result<ServiceS
 	{
 		let _ = service.kill();
 		let _ = service.wait();
+		diagnostics.close();
 		return Err(error.into());
 	}
 	let client = match DogmosClient::connect(&endpoint, handshake, Duration::from_secs(5)) {
@@ -219,13 +357,23 @@ pub(crate) fn start_service_session(service_path: &str) -> eyre::Result<ServiceS
 		Err(error) => {
 			let _ = service.kill();
 			let _ = service.wait();
+			diagnostics.close();
 			return Err(error.into());
 		}
 	};
-	let client = BoundedDogmosClient::new(client)?;
+	let client = match BoundedDogmosClient::new(client) {
+		Ok(client) => client,
+		Err(error) => {
+			let _ = service.kill();
+			let _ = service.wait();
+			diagnostics.close();
+			return Err(error.into());
+		}
+	};
 	Ok(ServiceSession {
 		client,
 		service,
+		diagnostics,
 		reaped: false,
 		#[cfg(windows)]
 		service_job: Some(service_job),
@@ -319,4 +467,33 @@ pub(crate) fn system_auth_token() -> eyre::Result<[u8; 32]> {
 	let mut token = [0_u8; 32];
 	fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
 	Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ServiceDiagnosticCapture, MAX_SERVICE_DIAGNOSTIC_BYTES};
+	use std::io::Cursor;
+
+	#[test]
+	fn service_diagnostic_capture_keeps_only_the_last_complete_line() {
+		let mut capture = ServiceDiagnosticCapture::start(Cursor::new(
+			b"first diagnostic\nlast diagnostic\n\n".to_vec(),
+		));
+		capture.close();
+
+		assert_eq!(capture.latest().as_deref(), Some("last diagnostic"));
+	}
+
+	#[test]
+	fn service_diagnostic_capture_bounds_the_retained_line() {
+		let mut line = vec![b'x'; MAX_SERVICE_DIAGNOSTIC_BYTES + 128];
+		line.push(b'\n');
+		let mut capture = ServiceDiagnosticCapture::start(Cursor::new(line));
+		capture.close();
+
+		assert_eq!(
+			capture.latest().unwrap().len(),
+			MAX_SERVICE_DIAGNOSTIC_BYTES
+		);
+	}
 }

@@ -84,7 +84,7 @@ pub enum StateError {
 	MixtureStateUploadConflict,
 	MixtureStateUploadIncomplete,
 	MixtureStateUploadIdExhausted,
-	StageConflict,
+	StageConflict(String),
 	ContinuationCapacityExceeded,
 	ContinuationIdExhausted,
 	ContinuationDeadlineExhausted,
@@ -100,7 +100,10 @@ pub enum StateError {
 
 impl fmt::Display for StateError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{self:?}")
+		match self {
+			Self::StageConflict(detail) => formatter.write_str(detail),
+			_ => write!(formatter, "{self:?}"),
+		}
 	}
 }
 
@@ -2334,8 +2337,10 @@ fn map_world_error(error: WorldError) -> StateError {
 			StateError::State(WorldError::InvalidEqualizeHardTurfLimit.to_string())
 		}
 		WorldError::InvalidSecondsPerTick => StateError::InvalidSecondsPerTick,
-		WorldError::InvalidStageWorkLimit(_) => StateError::StageConflict,
-		WorldError::StageConflict => StateError::StageConflict,
+		error @ WorldError::InvalidStageWorkLimit(_) => {
+			StateError::StageConflict(error.to_string())
+		}
+		error @ WorldError::StageConflict(_) => StateError::StageConflict(error.to_string()),
 		WorldError::StageNotImplemented(stage) => StateError::StageNotImplemented(match stage {
 			WorldStage::ProcessTurfs => SimulationStage::ProcessTurfs,
 			WorldStage::Equalize => SimulationStage::ProcessTurfEqualize,
@@ -2668,6 +2673,26 @@ mod tests {
 		assert_eq!(
 			map_world_error(WorldError::ReactionRegistryMissing),
 			StateError::InvalidMetadata
+		);
+	}
+
+	#[test]
+	fn stage_conflict_preserves_native_frontier_identity() {
+		let mut state = ServiceState::new(1024 * 1024, 8);
+		let error = state
+			.process_stage_chunk_cancellable(
+				SimulationStage::ProcessExcitedGroups,
+				7,
+				3,
+				1,
+				0.5,
+				|| false,
+			)
+			.unwrap_err();
+
+		assert_eq!(
+			error.to_string(),
+			"stage conflict: requested frontier epoch 7, committed frontier epoch None"
 		);
 	}
 

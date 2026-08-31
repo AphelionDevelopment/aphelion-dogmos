@@ -366,6 +366,92 @@ pub enum WorldStage {
 	TurfHeat,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StageConflictReason {
+	ActiveStageMutation {
+		operation: &'static str,
+	},
+	FrontierEpoch {
+		requested: u64,
+		committed: Option<u64>,
+	},
+	CursorIdentity {
+		requested_stage: WorldStage,
+		requested_frontier_epoch: u64,
+		requested_stage_epoch: u64,
+		requested_seconds_per_tick_bits: u64,
+		active_stage: WorldStage,
+		active_frontier_epoch: u64,
+		active_stage_epoch: u64,
+		active_seconds_per_tick_bits: u64,
+	},
+	TopologyRevision {
+		captured: u64,
+		current: u64,
+	},
+	TransactionGeneration {
+		requested: MixtureHandle,
+		current: MixtureHandle,
+	},
+	TransactionHandleMissing {
+		handle: MixtureHandle,
+	},
+	TransactionRevision {
+		handle: MixtureHandle,
+		expected: u32,
+		actual: u32,
+	},
+}
+
+impl fmt::Display for StageConflictReason {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::ActiveStageMutation { operation } => {
+				write!(formatter, "{operation} attempted while a stage is active")
+			}
+			Self::FrontierEpoch {
+				requested,
+				committed,
+			} => write!(
+				formatter,
+				"requested frontier epoch {requested}, committed frontier epoch {committed:?}"
+			),
+			Self::CursorIdentity {
+				requested_stage,
+				requested_frontier_epoch,
+				requested_stage_epoch,
+				requested_seconds_per_tick_bits,
+				active_stage,
+				active_frontier_epoch,
+				active_stage_epoch,
+				active_seconds_per_tick_bits,
+			} => write!(
+				formatter,
+				"requested cursor stage={requested_stage:?} frontier_epoch={requested_frontier_epoch} stage_epoch={requested_stage_epoch} seconds_per_tick_bits={requested_seconds_per_tick_bits}, active cursor stage={active_stage:?} frontier_epoch={active_frontier_epoch} stage_epoch={active_stage_epoch} seconds_per_tick_bits={active_seconds_per_tick_bits}"
+			),
+			Self::TopologyRevision { captured, current } => write!(
+				formatter,
+				"captured topology revision {captured}, current topology revision {current}"
+			),
+			Self::TransactionGeneration { requested, current } => write!(
+				formatter,
+				"transaction requested mixture {requested:?}, current transaction mixture {current:?}"
+			),
+			Self::TransactionHandleMissing { handle } => {
+				write!(formatter, "transaction mixture {handle:?} is no longer registered")
+			}
+			Self::TransactionRevision {
+				handle,
+				expected,
+				actual,
+			} => write!(
+				formatter,
+				"transaction mixture {handle:?} expected revision {expected}, current revision {actual}"
+			),
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(C)]
 pub struct ReactionContinuationToken {
@@ -513,7 +599,7 @@ pub enum WorldError {
 	InvalidEqualizeHardTurfLimit,
 	InvalidSecondsPerTick,
 	InvalidStageWorkLimit(u32),
-	StageConflict,
+	StageConflict(StageConflictReason),
 	StageNotImplemented(WorldStage),
 	Graph(String),
 	State(String),
@@ -524,7 +610,10 @@ pub enum WorldError {
 
 impl fmt::Display for WorldError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{self:?}")
+		match self {
+			Self::StageConflict(reason) => write!(formatter, "stage conflict: {reason}"),
+			_ => write!(formatter, "{self:?}"),
+		}
 	}
 }
 
@@ -764,7 +853,12 @@ fn transaction_world_error(error: TransactionError) -> WorldError {
 	match error {
 		TransactionError::AllocationFailed => WorldError::AllocationFailed,
 		TransactionError::CapacityExceeded => WorldError::StateCapacityExceeded,
-		TransactionError::HandleConflict { .. } => WorldError::StageConflict,
+		TransactionError::HandleConflict { requested, current } => {
+			WorldError::StageConflict(StageConflictReason::TransactionGeneration {
+				requested,
+				current,
+			})
+		}
 		TransactionError::UnknownHandle(handle) | TransactionError::SameHandle(handle) => {
 			WorldError::DuplicateMutableTurfMixture(handle)
 		}
@@ -853,7 +947,11 @@ impl DogmosWorld {
 
 	pub fn begin_frontier(&mut self, epoch: u64, expected: u32) -> Result<(), WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "begin frontier",
+				},
+			));
 		}
 		let maximum = u32::try_from(self.turfs.len()).unwrap_or(u32::MAX);
 		self.frontier
@@ -874,7 +972,11 @@ impl DogmosWorld {
 
 	pub fn commit_frontier(&mut self, epoch: u64) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "commit frontier",
+				},
+			));
 		}
 		for handle in self.frontier.pending(epoch).map_err(WorldError::Frontier)? {
 			require_turf_handle_in(&self.turfs, *handle)?;
@@ -888,7 +990,11 @@ impl DogmosWorld {
 	/// begin/append/commit. See `FrontierState::add` for the rationale.
 	pub fn add_frontier(&mut self, epoch: u64, handles: &[TurfHandle]) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "add frontier handles",
+				},
+			));
 		}
 		for handle in handles {
 			require_turf_handle_in(&self.turfs, *handle)?;
@@ -907,7 +1013,11 @@ impl DogmosWorld {
 		handles: &[TurfHandle],
 	) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "remove frontier handles",
+				},
+			));
 		}
 		self.frontier
 			.remove(epoch, handles)
@@ -1221,7 +1331,11 @@ impl DogmosWorld {
 		mutations: &[TurfLifecycleMutation],
 	) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply turf lifecycle",
+				},
+			));
 		}
 		let mut projected = BTreeMap::<u32, ProjectedSlot>::new();
 		let mut required_slots = self.turfs.len();
@@ -1353,7 +1467,11 @@ impl DogmosWorld {
 
 	pub fn apply_turf_heat(&mut self, mutations: &[TurfHeatMutation]) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply turf heat",
+				},
+			));
 		}
 		for mutation in mutations {
 			self.require_turf_handle(mutation.handle)?;
@@ -1407,7 +1525,11 @@ impl DogmosWorld {
 		mutations: &[TurfHeatAdjacencyMutation],
 	) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply turf heat adjacency",
+				},
+			));
 		}
 		// See apply_turf_adjacency() above for why this mutates self.topology directly instead of
 		// cloning it into a candidate first.
@@ -1439,7 +1561,11 @@ impl DogmosWorld {
 		mutations: &[TurfAdjacencyMutation],
 	) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply turf adjacency",
+				},
+			));
 		}
 		// Mutates self.topology directly rather than cloning it into a candidate first: the clone
 		// was a full copy of every turf slot in the world, paid on every call regardless of batch
@@ -1484,7 +1610,11 @@ impl DogmosWorld {
 		mutations: &[TurfFirelockMutation],
 	) -> Result<u32, WorldError> {
 		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply turf firelocks",
+				},
+			));
 		}
 		// See apply_turf_adjacency() above for why this mutates self.topology directly instead of
 		// cloning it into a candidate first.
@@ -2372,10 +2502,28 @@ impl DogmosWorld {
 			return Err(WorldError::InvalidSecondsPerTick);
 		}
 		if self.frontier.committed_epoch() != Some(request.frontier_epoch) {
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::FrontierEpoch {
+					requested: request.frontier_epoch,
+					committed: self.frontier.committed_epoch(),
+				},
+			));
 		}
 		match &self.stage_cursor {
-			Some(cursor) if !cursor.matches(request) => return Err(WorldError::StageConflict),
+			Some(cursor) if !cursor.matches(request) => {
+				return Err(WorldError::StageConflict(
+					StageConflictReason::CursorIdentity {
+						requested_stage: request.stage,
+						requested_frontier_epoch: request.frontier_epoch,
+						requested_stage_epoch: request.stage_epoch,
+						requested_seconds_per_tick_bits: request.seconds_per_tick.to_bits(),
+						active_stage: cursor.stage,
+						active_frontier_epoch: cursor.frontier_epoch,
+						active_stage_epoch: cursor.stage_epoch,
+						active_seconds_per_tick_bits: cursor.seconds_per_tick_bits,
+					},
+				));
+			}
 			None => {
 				if request.stage == WorldStage::React {
 					self.gas_registry
@@ -2436,12 +2584,17 @@ impl DogmosWorld {
 		}
 
 		let preparation_len = u32::try_from(self.frontier.committed().len()).unwrap_or(u32::MAX);
-		if self
+		if let Some(cursor) = self
 			.stage_cursor
 			.as_ref()
-			.is_some_and(|cursor| cursor.topology_revision != self.topology.revision())
+			.filter(|cursor| cursor.topology_revision != self.topology.revision())
 		{
-			return Err(WorldError::StageConflict);
+			return Err(WorldError::StageConflict(
+				StageConflictReason::TopologyRevision {
+					captured: cursor.topology_revision,
+					current: self.topology.revision(),
+				},
+			));
 		}
 		let mut work_items = 0;
 		while self
@@ -3508,11 +3661,19 @@ impl DogmosWorld {
 			});
 		}
 		for entry in transaction.entries() {
-			let current = self
-				.require_handle(entry.handle)
-				.map_err(|_| WorldError::StageConflict)?;
+			let current = self.require_handle(entry.handle).map_err(|_| {
+				WorldError::StageConflict(StageConflictReason::TransactionHandleMissing {
+					handle: entry.handle,
+				})
+			})?;
 			if current.revision != entry.expected_revision {
-				return Err(WorldError::StageConflict);
+				return Err(WorldError::StageConflict(
+					StageConflictReason::TransactionRevision {
+						handle: entry.handle,
+						expected: entry.expected_revision,
+						actual: current.revision,
+					},
+				));
 			}
 		}
 		Ok(())
@@ -6028,7 +6189,13 @@ mod tests {
 				state.staged_events.len(),
 				world.max_events as usize,
 			),
-			Err(WorldError::StageConflict)
+			Err(WorldError::StageConflict(
+				StageConflictReason::TransactionRevision {
+					handle: handle(0),
+					expected: original.revision,
+					actual: original.revision + 1,
+				},
+			))
 		);
 		assert_eq!(world.require_handle(handle(0)).unwrap().temperature, 2.7);
 	}
