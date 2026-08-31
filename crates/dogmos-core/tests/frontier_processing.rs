@@ -1,9 +1,9 @@
 use dogmos_core::{
 	metadata::{GasFireRole, GasId, GasMetadata, TurfHandle},
 	world::{
-		DogmosWorld, FrontierError, LifecycleAction, LifecycleMutation, MixtureStateMutation,
-		StageChunkRequest, TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation,
-		TurfHeatState, TurfLifecycleMutation, WorldError, WorldStage,
+		Command, DogmosWorld, FrontierError, LifecycleAction, LifecycleMutation,
+		MixtureStateMutation, StageChunkRequest, TurfAdjacencyMutation, TurfHeatAdjacencyMutation,
+		TurfHeatMutation, TurfHeatState, TurfLifecycleMutation, WorldError, WorldStage,
 	},
 	MixtureHandle, MAX_GAS_SLOTS,
 };
@@ -47,6 +47,83 @@ fn oxygen() -> GasMetadata {
 		fire_role: GasFireRole::None,
 		fire_products: None,
 	}
+}
+
+fn diffusion_pair(
+	left_moles: f32,
+	left_temperature: f32,
+	right_moles: f32,
+	right_temperature: f32,
+) -> (DogmosWorld, [TurfHandle; 2], [MixtureHandle; 2]) {
+	let turfs = [turf(0, 1), turf(1, 1)];
+	let mixtures = [mixture(0), mixture(1)];
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&mixtures.map(|handle| LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle,
+		}))
+		.unwrap();
+	for (handle, moles, temperature) in [
+		(mixtures[0], left_moles, left_temperature),
+		(mixtures[1], right_moles, right_temperature),
+	] {
+		let mut gases = [0.0; MAX_GAS_SLOTS];
+		gases[0] = moles;
+		world
+			.apply_mixture_state(&[MixtureStateMutation {
+				handle,
+				expected_revision: 0,
+				temperature,
+				volume: 2500.0,
+				gases,
+			}])
+			.unwrap();
+	}
+	world
+		.apply_turf_lifecycle(&[
+			TurfLifecycleMutation::Register {
+				handle: turfs[0],
+				mixture: Some(mixtures[0]),
+			},
+			TurfLifecycleMutation::Register {
+				handle: turfs[1],
+				mixture: Some(mixtures[1]),
+			},
+		])
+		.unwrap();
+	world
+		.apply_turf_adjacency(&[TurfAdjacencyMutation {
+			left: turfs[0],
+			right: turfs[1],
+			connected: true,
+		}])
+		.unwrap();
+	(world, turfs, mixtures)
+}
+
+fn run_diffusion_stage(world: &mut DogmosWorld, frontier: &[TurfHandle]) {
+	world.begin_frontier(1, frontier.len() as u32).unwrap();
+	world.append_frontier(1, 0, frontier).unwrap();
+	world.commit_frontier(1).unwrap();
+	let request = StageChunkRequest {
+		stage: WorldStage::ProcessTurfs,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: 16,
+		seconds_per_tick: 0.5,
+	};
+	for _ in 0..4 {
+		if !world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap()
+			.pending
+		{
+			return;
+		}
+	}
+	panic!("diffusion stage did not complete within four chunks");
 }
 
 #[test]
@@ -701,6 +778,55 @@ fn process_turfs_computes_at_most_one_frontier_node_per_unit_of_work() {
 	assert_eq!(world.snapshot(mixtures[1]).unwrap().revision, 2);
 	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 14.0);
 	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 2.0);
+}
+
+#[test]
+fn process_turfs_diffuses_into_an_inactive_mutable_neighbor() {
+	let (mut world, turfs, mixtures) = diffusion_pair(16.0, 500.0, 0.0, 300.0);
+
+	run_diffusion_stage(&mut world, &turfs[..1]);
+
+	let left = world.snapshot(mixtures[0]).unwrap();
+	let right = world.snapshot(mixtures[1]).unwrap();
+	assert_eq!(left.gases[0], 14.0);
+	assert_eq!(right.gases[0], 2.0);
+	assert_eq!(left.gases[0] + right.gases[0], 16.0);
+}
+
+#[test]
+fn process_turfs_drains_into_an_inactive_immutable_boundary() {
+	let (mut world, turfs, mixtures) = diffusion_pair(16.0, 500.0, 0.0, 2.7);
+	world
+		.apply_command(Command::MarkImmutable {
+			handle: mixtures[1],
+		})
+		.unwrap();
+
+	run_diffusion_stage(&mut world, &turfs[..1]);
+
+	let interior = world.snapshot(mixtures[0]).unwrap();
+	let boundary = world.snapshot(mixtures[1]).unwrap();
+	assert_eq!(interior.gases[0], 14.0);
+	assert_eq!(interior.temperature, 500.0);
+	assert_eq!(boundary.gases[0], 0.0);
+	assert_eq!(boundary.temperature, 2.7);
+}
+
+#[test]
+fn process_turfs_transports_thermal_energy_with_diffusing_gas() {
+	let (mut world, turfs, mixtures) = diffusion_pair(10.0, 500.0, 10.0, 300.0);
+
+	run_diffusion_stage(&mut world, &turfs);
+
+	let left = world.snapshot(mixtures[0]).unwrap();
+	let right = world.snapshot(mixtures[1]).unwrap();
+	assert_eq!(left.gases[0], 10.0);
+	assert_eq!(right.gases[0], 10.0);
+	assert_eq!(left.temperature, 475.0);
+	assert_eq!(right.temperature, 325.0);
+	let total_energy =
+		left.heat_capacity * left.temperature + right.heat_capacity * right.temperature;
+	assert_eq!(total_energy, 160_000.0);
 }
 
 #[test]

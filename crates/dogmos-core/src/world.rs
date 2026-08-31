@@ -592,6 +592,11 @@ struct StageDiffusionState {
 	seen_mixtures: BTreeSet<MixtureHandle>,
 	input: Vec<[f32; MAX_GAS_SLOTS]>,
 	output: Vec<[f32; MAX_GAS_SLOTS]>,
+	input_temperatures: Vec<f32>,
+	minimum_heat_capacities: Vec<f32>,
+	input_energy: Vec<f32>,
+	output_energy: Vec<f32>,
+	specific_heats: [f32; MAX_GAS_SLOTS],
 	next_node: usize,
 }
 
@@ -692,7 +697,7 @@ impl StageHeatState {
 }
 
 impl StageDiffusionState {
-	fn new() -> Self {
+	fn new(specific_heats: [f32; MAX_GAS_SLOTS]) -> Self {
 		Self {
 			turfs: Vec::new(),
 			mixtures: Vec::new(),
@@ -700,6 +705,11 @@ impl StageDiffusionState {
 			seen_mixtures: BTreeSet::new(),
 			input: Vec::new(),
 			output: Vec::new(),
+			input_temperatures: Vec::new(),
+			minimum_heat_capacities: Vec::new(),
+			input_energy: Vec::new(),
+			output_energy: Vec::new(),
+			specific_heats,
 			next_node: 0,
 		}
 	}
@@ -2255,9 +2265,19 @@ impl DogmosWorld {
 				} else {
 					None
 				};
+				let diffusion_specific_heats = self
+					.gas_registry
+					.as_ref()
+					.map(|registry| {
+						let mut values = [0.0; MAX_GAS_SLOTS];
+						values[..registry.specific_heats().len()]
+							.copy_from_slice(registry.specific_heats());
+						values
+					})
+					.unwrap_or([0.0; MAX_GAS_SLOTS]);
 				self.stage_cursor = Some(StageCursor::new(request, self.topology.revision()));
-				self.stage_diffusion =
-					(request.stage == WorldStage::ProcessTurfs).then(StageDiffusionState::new);
+				self.stage_diffusion = (request.stage == WorldStage::ProcessTurfs)
+					.then(|| StageDiffusionState::new(diffusion_specific_heats));
 				self.stage_heat = (request.stage == WorldStage::TurfHeat).then(StageHeatState::new);
 				self.stage_reactions = (request.stage == WorldStage::React).then(|| {
 					let active_continuations = self
@@ -2567,6 +2587,28 @@ impl DogmosWorld {
 	}
 
 	fn prepare_stage_diffusion_turf(&mut self, turf_handle: TurfHandle) -> Result<(), WorldError> {
+		let neighbors = self
+			.topology
+			.gas_neighbors(turf_handle)
+			.map(|neighbor| neighbor.handle)
+			.collect::<Vec<_>>();
+		self.append_stage_diffusion_turf(turf_handle)?;
+		for neighbor in neighbors {
+			self.append_stage_diffusion_turf(neighbor)?;
+		}
+		Ok(())
+	}
+
+	fn append_stage_diffusion_turf(&mut self, turf_handle: TurfHandle) -> Result<(), WorldError> {
+		if self
+			.stage_diffusion
+			.as_ref()
+			.expect("process-turfs stage owns diffusion state")
+			.index_by_turf
+			.contains_key(&turf_handle)
+		{
+			return Ok(());
+		}
 		let Ok(turf) = self.require_turf_handle(turf_handle) else {
 			return Ok(());
 		};
@@ -2577,6 +2619,8 @@ impl DogmosWorld {
 		let immutable = mixture.immutable;
 		let revision = mixture.revision;
 		let gases = mixture.gases;
+		let temperature = mixture.temperature;
+		let minimum_heat_capacity = mixture.minimum_heat_capacity;
 		let state = self
 			.stage_diffusion
 			.as_mut()
@@ -2593,6 +2637,17 @@ impl DogmosWorld {
 		state.index_by_turf.insert(turf_handle, index);
 		state.input.push(gases);
 		state.output.push([0.0; MAX_GAS_SLOTS]);
+		state.input_temperatures.push(temperature);
+		state.minimum_heat_capacities.push(minimum_heat_capacity);
+		let heat_capacity = gases
+			.iter()
+			.zip(state.specific_heats)
+			.fold(0.0, |capacity, (amount, specific_heat)| {
+				specific_heat.mul_add(*amount, capacity)
+			})
+			.max(minimum_heat_capacity);
+		state.input_energy.push(heat_capacity * temperature);
+		state.output_energy.push(0.0);
 		Ok(())
 	}
 
@@ -2620,10 +2675,16 @@ impl DogmosWorld {
 			}
 			*output_value = next_value;
 		}
-		self.stage_diffusion
+		let mut output_energy = state.input_energy[index] * self_weight;
+		for neighbor in &neighbors[..neighbor_count] {
+			output_energy += state.input_energy[*neighbor] * GAS_DIFFUSION_CONSTANT;
+		}
+		let state = self
+			.stage_diffusion
 			.as_mut()
-			.expect("process-turfs stage owns diffusion state")
-			.output[index] = output;
+			.expect("process-turfs stage owns diffusion state");
+		state.output[index] = output;
+		state.output_energy[index] = output_energy;
 		Ok(())
 	}
 
@@ -2634,12 +2695,26 @@ impl DogmosWorld {
 			.expect("process-turfs stage owns diffusion state");
 		let work_items = u32::try_from(state.mixtures.len())
 			.map_err(|_| WorldError::State("turf count exceeds u32".into()))?;
-		for (handle, gases) in state.mixtures.into_iter().zip(state.output) {
+		for index in 0..state.mixtures.len() {
+			let handle = state.mixtures[index];
 			let mixture = self.require_handle_mut(handle)?;
 			if mixture.immutable {
 				continue;
 			}
+			let gases = state.output[index];
+			let heat_capacity = gases
+				.iter()
+				.zip(state.specific_heats)
+				.fold(0.0, |capacity, (amount, specific_heat)| {
+					specific_heat.mul_add(*amount, capacity)
+				})
+				.max(state.minimum_heat_capacities[index]);
 			mixture.gases = gases;
+			mixture.temperature = if heat_capacity > MINIMUM_HEAT_CAPACITY {
+				(state.output_energy[index] / heat_capacity).max(MINIMUM_TEMPERATURE_K)
+			} else {
+				state.input_temperatures[index]
+			};
 			mixture.revision += 1;
 		}
 		Ok(work_items)
@@ -5623,7 +5698,7 @@ mod tests {
 			seconds_per_tick: 0.5,
 		};
 		world.stage_cursor = Some(StageCursor::new(request, 0));
-		world.stage_diffusion = Some(StageDiffusionState::new());
+		world.stage_diffusion = Some(StageDiffusionState::new([0.0; MAX_GAS_SLOTS]));
 		world.stage_heat = Some(StageHeatState::new());
 		world.stage_components = Some(StageComponentState::try_new(1, 1).unwrap());
 		world.stage_component_turfs = Some(Vec::new());
