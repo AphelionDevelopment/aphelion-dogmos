@@ -626,7 +626,9 @@ fn handle_primary(
 				) {
 					Ok(result) => result,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						let code = service_error_code(&error);
+						eprintln!("{}", service_error_diagnostic(request, code, &error));
+						write_error_response(&mut stream, request, code)?;
 						continue;
 					}
 				};
@@ -824,6 +826,22 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 	}
 }
 
+fn service_error_diagnostic(
+	request: ProtocolHeader,
+	code: ServiceErrorCode,
+	error: &state::StateError,
+) -> String {
+	let operation = request
+		.operation_kind()
+		.map_or_else(|_| "Unknown".into(), |operation| format!("{operation:?}"));
+	format!(
+		"DOGMOS SERVICE ERROR: pid={} request_id={} operation={} code={code:?} detail={error}",
+		std::process::id(),
+		request.request_id,
+		operation,
+	)
+}
+
 fn write_response(
 	stream: &mut Stream,
 	request: ProtocolHeader,
@@ -865,7 +883,22 @@ fn write_error_response(
 
 #[cfg(test)]
 mod tests {
-	use super::RequestSequence;
+	use super::{service_error_diagnostic, RequestSequence};
+	use crate::state::StateError;
+	use dogmos_protocol::{OperationKind, ProtocolHeader, ServiceErrorCode};
+
+	#[test]
+	fn service_error_diagnostic_preserves_request_identity_and_native_detail() {
+		let request = ProtocolHeader::request(OperationKind::SimulationStage, 37, 11, 13, 0, 0);
+		let error = StateError::State("native reaction returned a non-finite result".into());
+		let diagnostic = service_error_diagnostic(request, ServiceErrorCode::Internal, &error);
+
+		assert!(diagnostic.contains(&format!("pid={}", std::process::id())));
+		assert!(diagnostic.contains("request_id=37"));
+		assert!(diagnostic.contains("operation=SimulationStage"));
+		assert!(diagnostic.contains("code=Internal"));
+		assert!(diagnostic.contains("native reaction returned a non-finite result"));
+	}
 
 	#[test]
 	fn request_sequence_rejects_duplicate_and_decreasing_ids() {

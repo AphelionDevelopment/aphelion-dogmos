@@ -40,8 +40,17 @@ impl ServiceSession {
 		) {
 			Ok(response) => decode(response),
 			Err(error @ (ClientError::RequestTimeout | ClientError::WorkerStopped)) => {
-				self.terminate_service();
-				Err(error.into())
+				let process_id = self.service.id();
+				let process_state = self.terminate_service();
+				Err(ClientError::ServiceProcess {
+					source: Box::new(error),
+					process_id,
+					process_state,
+				}
+				.into())
+			}
+			Err(error @ ClientError::Server(dogmos_protocol::ServiceErrorCode::Internal)) => {
+				Err(self.with_process_context(error).into())
 			}
 			Err(error) => Err(error.into()),
 		}
@@ -55,12 +64,36 @@ impl ServiceSession {
 		self.request_with_response(operation, payload, 0, |_| Ok(()))
 	}
 
-	fn terminate_service(&mut self) {
+	fn terminate_service(&mut self) -> String {
 		#[cfg(windows)]
 		self.service_job.take();
-		let _ = self.service.kill();
-		let _ = self.service.wait();
+		let kill_result = self.service.kill();
+		let wait_result = self.service.wait();
 		self.reaped = true;
+		match (kill_result, wait_result) {
+			(_, Ok(status)) => format!("terminated ({status})"),
+			(Err(error), Err(wait_error)) => {
+				format!("termination failed ({error}); wait failed ({wait_error})")
+			}
+			(Ok(()), Err(error)) => format!("terminated; wait failed ({error})"),
+		}
+	}
+
+	fn with_process_context(&mut self, error: ClientError) -> ClientError {
+		let process_id = self.service.id();
+		let process_state = match self.service.try_wait() {
+			Ok(Some(status)) => {
+				self.reaped = true;
+				format!("exited ({status})")
+			}
+			Ok(None) => "running".into(),
+			Err(status_error) => format!("unavailable ({status_error})"),
+		};
+		ClientError::ServiceProcess {
+			source: Box::new(error),
+			process_id,
+			process_state,
+		}
 	}
 
 	pub(crate) fn is_healthy(&mut self) -> io::Result<bool> {
@@ -90,7 +123,7 @@ impl ServiceSession {
 impl Drop for ServiceSession {
 	fn drop(&mut self) {
 		if !self.reaped {
-			self.terminate_service();
+			let _ = self.terminate_service();
 		}
 	}
 }
@@ -134,7 +167,7 @@ pub(crate) fn start_service_session(service_path: &str) -> eyre::Result<ServiceS
 		.arg(&endpoint)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::null())
-		.stderr(Stdio::null());
+		.stderr(Stdio::inherit());
 	configure_service_command(&mut command);
 	let mut service = command.spawn()?;
 	#[cfg(windows)]

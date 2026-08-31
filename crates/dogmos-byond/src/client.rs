@@ -17,6 +17,11 @@ pub enum ClientError {
 	Transport(TransportError),
 	ServerBusy,
 	Server(ServiceErrorCode),
+	ServiceProcess {
+		source: Box<ClientError>,
+		process_id: u32,
+		process_state: String,
+	},
 	ConnectTimeout,
 	RequestTimeout,
 	WorkerStopped,
@@ -24,11 +29,28 @@ pub enum ClientError {
 
 impl fmt::Display for ClientError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{self:?}")
+		match self {
+			Self::ServiceProcess {
+				source,
+				process_id,
+				process_state,
+			} => write!(
+				formatter,
+				"{source}; dogmosd pid={process_id} status={process_state}"
+			),
+			_ => write!(formatter, "{self:?}"),
+		}
 	}
 }
 
-impl std::error::Error for ClientError {}
+impl std::error::Error for ClientError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::ServiceProcess { source, .. } => Some(source.as_ref()),
+			_ => None,
+		}
+	}
+}
 
 impl ClientError {
 	fn is_fatal_connection_error(&self) -> bool {
@@ -472,4 +494,24 @@ fn current_thread_token() -> u32 {
 #[cfg(not(windows))]
 fn current_io_handle_token(_client: &DogmosClient) -> Result<IoHandleToken, ClientError> {
 	Ok(IoHandleToken)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::ClientError;
+	use dogmos_protocol::ServiceErrorCode;
+
+	#[test]
+	fn service_process_context_is_caller_legible() {
+		let error = ClientError::ServiceProcess {
+			source: Box::new(ClientError::Server(ServiceErrorCode::Internal)),
+			process_id: 42,
+			process_state: "running".into(),
+		};
+
+		assert_eq!(
+			error.to_string(),
+			"Server(Internal); dogmosd pid=42 status=running"
+		);
+	}
 }
