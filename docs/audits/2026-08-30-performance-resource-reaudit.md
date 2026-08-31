@@ -261,3 +261,31 @@ This report does not claim production completion. The following evidence remains
 - paired Meridian-Rift PowerShell DreamMaker compile and DreamDaemon boot/full-suite gates;
 - three identical control and three identical candidate live workloads with exact revision, map, seed, BYOND version, configuration, operation counts, callback counts, and transcript/event equivalence;
 - separate DreamDaemon private/committed bytes and address-space series, separate `dogmosd` private/RSS series, stage p50/p95/p99/max, SSair headroom, and callback queue item/owned-byte high water.
+
+## 2026-08-31 resolution status
+
+The approved plan was implemented through its repository-local and synthetic-performance gates.
+Detailed evidence is recorded in
+`docs/performance/2026-08-31-performance-resource-resolution-results.md`, with callback-pressure and
+component-stage measurements in their dedicated dated result files.
+
+The callback-capacity propagation, prepared atomic callback commit, legacy reaction cleanup,
+callback ownership telemetry, shim success-path allocation removal, component-stage allocation
+recovery, bounded client close, owned heat thread, arena release/rearm, and committed-frontier
+diagnostics are resolved locally. The gas-slot reference-count change was skipped because its
+required representative hot-path evidence was absent. Bounded legacy callback admission remains at
+the mandatory policy checkpoint because the paired checkout does not provide a retained-legacy
+pressure workload or an approved DM rejection path.
+
+Fresh formatting, strict i686 Clippy, full i686 workspace tests, x64 core/service tests, the
+supported feature matrix, 42 Python tool tests, deterministic generated-binding comparison, and
+diff whitespace checks passed. The measured component rows recovered the qualified allocation
+values with exact transcript/work equivalence, and the affected same-session IPC percentiles stayed
+within the 5 percent budget.
+
+Production qualification remains externally blocked. The paired Meridian-Rift contract names
+source `a09f26ab8dffc6d6a1c50274ea1ced5dc5953ab7`, while the candidate reports
+`d8dc92d8fd3d268abd89463c5818f174bf077b48`; the maintained runtime gate therefore rejected the
+candidate before initialization. No DreamDaemon memory reduction or live-round equivalence is
+claimed. The paired checkout also requires restoration or authorized regeneration of the two
+installed native artifacts, as described in the implementation results.

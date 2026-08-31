@@ -331,11 +331,6 @@ impl TurfGases {
 			.filter_map(|neighbor| self.graph.node_weight(neighbor))
 			.filter_map(move |idx| Some((&idx.id, all_mixtures.get(idx.mix)?)))
 	}
-	pub fn clear(&mut self) {
-		self.graph.clear();
-		self.map.clear();
-	}
-
 	/*
 	pub fn adjacent_infos(
 		&self,
@@ -393,14 +388,16 @@ pub fn initialize_turfs() {
 	*PLANETARY_ATMOS.write() = Some(Default::default());
 }
 
+pub fn prepare_turfs_for_world() {
+	if TURF_GASES.read().is_none() || PLANETARY_ATMOS.read().is_none() {
+		initialize_turfs();
+	}
+}
+
 pub fn shutdown_turfs() {
 	wait_for_tasks();
-	if let Some(turf_gases) = TURF_GASES.write().as_mut() {
-		turf_gases.clear();
-	}
-	if let Some(planetary_atmos) = PLANETARY_ATMOS.write().as_mut() {
-		planetary_atmos.clear();
-	}
+	TURF_GASES.write().take();
+	PLANETARY_ATMOS.write().take();
 }
 
 pub(crate) fn turf_runtime_metrics() -> TurfRuntimeMetrics {
@@ -428,13 +425,13 @@ pub(crate) fn heat_runtime_metrics() -> superconduct::HeatRuntimeMetrics {
 }
 
 #[cfg(feature = "superconductivity")]
-pub fn shutdown_turf_heat() {
-	superconduct::shutdown_turf_heat();
+pub fn shutdown_turf_heat() -> Result<()> {
+	superconduct::shutdown_turf_heat()
 }
 
 #[cfg(feature = "superconductivity")]
-pub fn prepare_turf_heat_for_world() {
-	superconduct::prepare_turf_heat_for_world();
+pub fn prepare_turf_heat_for_world() -> Result<()> {
+	superconduct::prepare_turf_heat_for_world()
 }
 
 fn with_turf_gases_read<T, F>(f: F) -> T
@@ -775,13 +772,37 @@ fn adjacent_tile_ids(adj: Directions, i: TurfID, max_x: i32, max_y: i32) -> Adja
 
 #[cfg(test)]
 mod tests {
-	use super::{initialize_turfs, turf_runtime_metrics};
+	use super::{
+		initialize_turfs, prepare_turfs_for_world, shutdown_turfs, turf_runtime_metrics,
+		PLANETARY_ATMOS, TURF_GASES,
+	};
+	static TURF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 	#[test]
 	fn turf_runtime_metrics_report_source_layout_and_reserved_capacity() {
+		let _guard = TURF_TEST_LOCK.lock().unwrap();
 		initialize_turfs();
 		let metrics = turf_runtime_metrics();
 		assert_eq!(metrics.turf_mixture_bytes, 32);
+		assert_eq!(metrics.node_capacity, 650_250);
+		assert_eq!(metrics.edge_capacity, 1_300_500);
+		assert_eq!(metrics.map_capacity, 650_250);
+	}
+
+	#[test]
+	fn turf_arenas_are_released_and_recreated_for_world_reuse() {
+		let _guard = TURF_TEST_LOCK.lock().unwrap();
+		prepare_turfs_for_world();
+		shutdown_turfs();
+		assert!(TURF_GASES.read().is_none());
+		assert!(PLANETARY_ATMOS.read().is_none());
+		let metrics = turf_runtime_metrics();
+		assert_eq!(metrics.node_capacity, 0);
+		assert_eq!(metrics.edge_capacity, 0);
+		assert_eq!(metrics.map_capacity, 0);
+
+		initialize_turfs();
+		let metrics = turf_runtime_metrics();
 		assert_eq!(metrics.node_capacity, 650_250);
 		assert_eq!(metrics.edge_capacity, 1_300_500);
 		assert_eq!(metrics.map_capacity, 650_250);

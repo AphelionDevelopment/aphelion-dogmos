@@ -5,6 +5,7 @@ use crate::GasArena;
 use coarsetime::Instant;
 use dogmos_core::numerics::conduction::{conduction_step, BASE_HEAT_STEP_SECONDS};
 use eyre::Result;
+use parking_lot::{const_mutex, Mutex};
 use std::{
 	collections::HashSet,
 	sync::{
@@ -16,9 +17,12 @@ use std::{
 type HeatNodeIndex = petgraph::graph::NodeIndex<usize>;
 
 static TURF_HEAT: RwLock<Option<TurfHeat>> = const_rwlock(None);
+static HEAT_WORKER: Mutex<Option<std::thread::JoinHandle<()>>> = const_mutex(None);
 
-static HEAT_CHANNEL: LazyLock<(flume::Sender<SSheatInfo>, flume::Receiver<SSheatInfo>)> =
-	LazyLock::new(|| flume::bounded(1));
+static HEAT_CHANNEL: LazyLock<(
+	flume::Sender<HeatWorkerMessage>,
+	flume::Receiver<HeatWorkerMessage>,
+)> = LazyLock::new(|| flume::bounded(1));
 
 static HEAT_REGISTRATION_CHANGES: AtomicUsize = AtomicUsize::new(0);
 static HEAT_REGISTRATION_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -49,37 +53,46 @@ fn initialize_heat_statics() {
 	*TURF_HEAT.write() = Some(new_turf_heat());
 }
 
-// Called by the exported DM shutdown hook after all heat work has stopped.
+// Called by the exported DM shutdown hook before the remaining arenas are released.
 #[allow(dead_code)]
-pub fn shutdown_turf_heat() {
+pub fn shutdown_turf_heat() -> Result<()> {
 	HEAT_SHUTDOWN.store(true, Ordering::Release);
+	let _ = HEAT_CHANNEL.0.try_send(HeatWorkerMessage::Shutdown);
+	let Some(worker) = HEAT_WORKER.lock().take() else {
+		if HEAT_WORKER_RUNNING.load(Ordering::Acquire) {
+			return Err(eyre::eyre!(
+				"Heat worker is running without an owned thread handle"
+			));
+		}
+		TURF_HEAT.write().take();
+		return Ok(());
+	};
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-	while HEAT_WORKER_RUNNING.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-		let _ = HEAT_CHANNEL.0.try_send(SSheatInfo {
-			time_delta: 0.0,
-			blackbody_enabled: false,
-		});
-		std::thread::yield_now();
+	while !worker.is_finished() && std::time::Instant::now() < deadline {
+		std::thread::sleep(std::time::Duration::from_millis(1));
 	}
-	while HEAT_WORKER_RUNNING.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-		std::thread::yield_now();
+	if !worker.is_finished() {
+		*HEAT_WORKER.lock() = Some(worker);
+		return Err(eyre::eyre!(
+			"Heat worker failed to stop within 5 seconds, this may indicate a deadlock"
+		));
 	}
-	if HEAT_WORKER_RUNNING.load(Ordering::Acquire) {
-		panic!("Heat worker failed to stop within 5 seconds, this may indicate a deadlock!");
-	}
-	wait_for_tasks();
+	worker
+		.join()
+		.map_err(|_| eyre::eyre!("Heat worker panicked during shutdown"))?;
 	TURF_HEAT.write().take();
+	Ok(())
 }
 
 /// Recreates heat state and rearms the worker after a BYOND world reuses this loaded DLL.
-pub fn prepare_turf_heat_for_world() {
+pub fn prepare_turf_heat_for_world() -> Result<()> {
 	if TURF_HEAT.read().is_none() {
 		HEAT_CHANNEL.1.try_iter().for_each(std::mem::drop);
 		*TURF_HEAT.write() = Some(new_turf_heat());
 	}
 	HEAT_REGISTRATION_CHANGES.store(0, Ordering::Relaxed);
 	HEAT_SHUTDOWN.store(false, Ordering::Release);
-	start_heat_worker();
+	start_heat_worker()
 }
 
 fn with_turf_heat_read<T, F>(f: F) -> T
@@ -103,6 +116,12 @@ struct SSheatInfo {
 	blackbody_enabled: bool,
 }
 
+#[derive(Copy, Clone)]
+enum HeatWorkerMessage {
+	Process(SSheatInfo),
+	Shutdown,
+}
+
 #[derive(Default)]
 struct ThermalInfo {
 	pub id: TurfID,
@@ -115,11 +134,13 @@ struct ThermalInfo {
 	pub temperature: RwLock<f32>,
 }
 
-fn with_heat_processing_callback_receiver<T>(f: impl Fn(&flume::Receiver<SSheatInfo>) -> T) -> T {
+fn with_heat_processing_callback_receiver<T>(
+	f: impl Fn(&flume::Receiver<HeatWorkerMessage>) -> T,
+) -> T {
 	f(&HEAT_CHANNEL.1)
 }
 
-fn heat_processing_callbacks_sender() -> flume::Sender<SSheatInfo> {
+fn heat_processing_callbacks_sender() -> flume::Sender<HeatWorkerMessage> {
 	HEAT_CHANNEL.0.clone()
 }
 type HeatGraphMap = IndexMap<TurfID, NodeIndex<usize>, FxBuildHasher>;
@@ -411,10 +432,10 @@ fn process_heat_notify(src: ByondValue) -> Result<ByondValue> {
 	let blackbody_enabled = src
 		.read_number_id(byond_string!("realistic_space_radiation"))
 		.map_or(true, |v| v != 0.0);
-	_ = sender.try_send(SSheatInfo {
+	_ = sender.try_send(HeatWorkerMessage::Process(SSheatInfo {
 		time_delta,
 		blackbody_enabled,
-	});
+	}));
 	Ok(ByondValue::null())
 }
 
@@ -580,6 +601,7 @@ fn accumulate_heat_edge_deltas_into(
 mod tests {
 	use super::*;
 	use dogmos_perf::RuntimeMetric;
+	static HEAT_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 	#[test]
 	fn heat_edge_accumulation_visits_each_undirected_edge_once() {
@@ -707,6 +729,23 @@ mod tests {
 	}
 
 	#[test]
+	fn heat_worker_and_arena_are_released_before_rearm() {
+		let _guard = HEAT_LIFECYCLE_TEST_LOCK.lock().unwrap();
+		shutdown_turf_heat().unwrap();
+		assert!(!HEAT_WORKER_RUNNING.load(Ordering::Acquire));
+		assert!(HEAT_WORKER.lock().is_none());
+		assert!(TURF_HEAT.read().is_none());
+
+		prepare_turf_heat_for_world().unwrap();
+		assert!(HEAT_WORKER_RUNNING.load(Ordering::Acquire));
+		assert!(HEAT_WORKER.lock().is_some());
+		assert!(TURF_HEAT.read().is_some());
+
+		shutdown_turf_heat().unwrap();
+		prepare_turf_heat_for_world().unwrap();
+	}
+
+	#[test]
 	fn heat_reregistration_refreshes_turf_generation() {
 		let mut arena = TurfHeat {
 			graph: StableDiGraph::<ThermalInfo, (), usize>::with_capacity(0, 0),
@@ -774,325 +813,362 @@ impl Drop for HeatWorkerGuard {
 	}
 }
 
-// Fires the task into the thread pool once per live BYOND world.
-fn start_heat_worker() {
-	if HEAT_SHUTDOWN.load(Ordering::Acquire) || !try_start_heat_worker(&HEAT_WORKER_RUNNING) {
-		return;
+// Starts one owned worker thread per live BYOND world.
+fn start_heat_worker() -> Result<()> {
+	if HEAT_SHUTDOWN.load(Ordering::Acquire) {
+		return Ok(());
 	}
-	rayon::spawn(|| {
-		let _worker_guard = HeatWorkerGuard;
-		let mut scratch = HeatProcessingScratch::default();
-		loop {
-			//this will block until process_turf_heat is called
-			let info = with_heat_processing_callback_receiver(|receiver| receiver.recv());
-			let Ok(info) = info else {
-				break;
-			};
-			if HEAT_SHUTDOWN.load(Ordering::Acquire) {
-				break;
-			}
-			let task_lock = TASKS.read();
-			let start_time = Instant::now();
-			let emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * info.time_delta;
-			let radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * info.time_delta;
-			let elapsed_heat_scale = info.time_delta as f32 / BASE_HEAT_STEP_SECONDS;
-			// Extracted before the closures below, which shadow the name `info` with each turf's own
-			// ThermalInfo - this is SSheatInfo's toggle, not a per-turf value.
-			let blackbody_enabled = info.blackbody_enabled;
-			let mut heat_graph_nodes = 0;
-			let mut heat_nodes_changed = 0;
-			let mut heat_edge_attempts = 0;
-			let mut heat_edges_applied = 0_u64;
-			let mut heat_lock_contention = 0;
-			let mut heat_processing_error = None;
-			with_turf_heat_read(|arena| {
-				heat_graph_nodes = arena.map.len();
-				with_turf_gases_read(|air_arena| {
-					// Keep one read view of the global mixture slice for both snapshot filtering and gas exchange.
-					// Per-mixture locks still protect concurrent gas mutation; only the slice lookup lock is shared.
-					GasArena::with_all_mixtures(|all_mixtures| {
-						let adjacencies_to_consider = arena
-							.map
-							.par_iter()
-							.filter_map(|(&turf_id, &heat_index)| {
-								/*
-									If it has no thermal conductivity, low thermal capacity or has no adjacencies,
-									then it's not gonna interact, or at least shouldn't.
-								*/
-								let info = arena.get(heat_index).unwrap();
-								let temp = { *info.temperature.read() };
-								//can share w/ adjacents?
-								if arena.adjacent_heats(heat_index).any(|item| {
-									(temp - *item.temperature.read()).abs()
-										> MINIMUM_TEMPERATURE_DELTA_TO_CONSIDER
-								}) {
-									return Some((turf_id, heat_index, true));
-								}
-								if temp > MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION {
-									//can share w/ space/air?
-									if info.adjacent_to_space
-										|| air_arena
-											.get_id(turf_id)
-											.and_then(|nodeid| {
-												air_arena.get(nodeid)?.enabled().then_some(())
-											})
-											.is_some()
-									{
-										Some((turf_id, heat_index, false))
+	let mut worker_owner = HEAT_WORKER.lock();
+	if worker_owner
+		.as_ref()
+		.is_some_and(|worker| !worker.is_finished())
+	{
+		return Ok(());
+	}
+	if let Some(worker) = worker_owner.take() {
+		worker
+			.join()
+			.map_err(|_| eyre::eyre!("Previous heat worker panicked"))?;
+	}
+	if !try_start_heat_worker(&HEAT_WORKER_RUNNING) {
+		return Ok(());
+	}
+	let worker = match std::thread::Builder::new()
+		.name("dogmos-heat".into())
+		.spawn(|| {
+			let _worker_guard = HeatWorkerGuard;
+			let mut scratch = HeatProcessingScratch::default();
+			while let Ok(HeatWorkerMessage::Process(info)) =
+				with_heat_processing_callback_receiver(|receiver| receiver.recv())
+			{
+				if HEAT_SHUTDOWN.load(Ordering::Acquire) {
+					break;
+				}
+				let task_lock = TASKS.read();
+				let start_time = Instant::now();
+				let emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * info.time_delta;
+				let radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * info.time_delta;
+				let elapsed_heat_scale = info.time_delta as f32 / BASE_HEAT_STEP_SECONDS;
+				// Extracted before the closures below, which shadow the name `info` with each turf's own
+				// ThermalInfo - this is SSheatInfo's toggle, not a per-turf value.
+				let blackbody_enabled = info.blackbody_enabled;
+				let mut heat_graph_nodes = 0;
+				let mut heat_nodes_changed = 0;
+				let mut heat_edge_attempts = 0;
+				let mut heat_edges_applied = 0_u64;
+				let mut heat_lock_contention = 0;
+				let mut heat_processing_error = None;
+				with_turf_heat_read(|arena| {
+					heat_graph_nodes = arena.map.len();
+					with_turf_gases_read(|air_arena| {
+						// Keep one read view of the global mixture slice for both snapshot filtering and gas exchange.
+						// Per-mixture locks still protect concurrent gas mutation; only the slice lookup lock is shared.
+						GasArena::with_all_mixtures(|all_mixtures| {
+							let adjacencies_to_consider = arena
+								.map
+								.par_iter()
+								.filter_map(|(&turf_id, &heat_index)| {
+									/*
+										If it has no thermal conductivity, low thermal capacity or has no adjacencies,
+										then it's not gonna interact, or at least shouldn't.
+									*/
+									let info = arena.get(heat_index).unwrap();
+									let temp = { *info.temperature.read() };
+									//can share w/ adjacents?
+									if arena.adjacent_heats(heat_index).any(|item| {
+										(temp - *item.temperature.read()).abs()
+											> MINIMUM_TEMPERATURE_DELTA_TO_CONSIDER
+									}) {
+										return Some((turf_id, heat_index, true));
+									}
+									if temp > MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION {
+										//can share w/ space/air?
+										if info.adjacent_to_space
+											|| air_arena
+												.get_id(turf_id)
+												.and_then(|nodeid| {
+													air_arena.get(nodeid)?.enabled().then_some(())
+												})
+												.is_some()
+										{
+											Some((turf_id, heat_index, false))
+										} else {
+											None
+										}
+									} else if let Some(node) = air_arena.get_id(turf_id) {
+										let cur_mix = air_arena.get(node).unwrap();
+										if !cur_mix.enabled() {
+											return None;
+										}
+										let air_temp = all_mixtures.get(cur_mix.mix)?.try_read();
+										air_temp.as_ref()?;
+										let air_temp = air_temp.unwrap().get_temperature();
+
+										if air_temp < MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION {
+											return None;
+										}
+										if (temp - air_temp).abs()
+											> MINIMUM_TEMPERATURE_DELTA_TO_CONSIDER
+										{
+											Some((turf_id, heat_index, false))
+										} else {
+											None
+										}
 									} else {
 										None
 									}
-								} else if let Some(node) = air_arena.get_id(turf_id) {
-									let cur_mix = air_arena.get(node).unwrap();
-									if !cur_mix.enabled() {
-										return None;
-									}
-									let air_temp = all_mixtures.get(cur_mix.mix)?.try_read();
-									air_temp.as_ref()?;
-									let air_temp = air_temp.unwrap().get_temperature();
+								})
+								.filter_map(|(id, node_index, has_adjacents)| {
+									let info = arena.get(node_index).unwrap();
+									let Some(mut temp_write) = info.temperature.try_write() else {
+										return has_adjacents.then_some(node_index);
+									};
 
-									if air_temp < MINIMUM_TEMPERATURE_FOR_SUPERCONDUCTION {
-										return None;
+									if info.adjacent_to_space && *temp_write > T0C {
+										if blackbody_enabled {
+											*temp_write = blackbody_temperature_after_cooling(
+												*temp_write,
+												info.heat_capacity,
+												emissivity_constant,
+												radiation_from_space_tick,
+											);
+										} else if *temp_write > T20C {
+											let delta = *temp_write - TCMB;
+											let energy = get_share_energy(
+												info.thermal_conductivity
+													* elapsed_heat_scale * delta,
+												HEAT_CAPACITY_VACUUM,
+												info.heat_capacity,
+											);
+											*temp_write -= energy / info.heat_capacity;
+										}
 									}
-									if (temp - air_temp).abs()
-										> MINIMUM_TEMPERATURE_DELTA_TO_CONSIDER
-									{
-										Some((turf_id, heat_index, false))
-									} else {
-										None
-									}
-								} else {
-									None
-								}
-							})
-							.filter_map(|(id, node_index, has_adjacents)| {
-								let info = arena.get(node_index).unwrap();
-								let Some(mut temp_write) = info.temperature.try_write() else {
-									return has_adjacents.then_some(node_index);
-								};
 
-								if info.adjacent_to_space && *temp_write > T0C {
-									if blackbody_enabled {
-										*temp_write = blackbody_temperature_after_cooling(
-											*temp_write,
-											info.heat_capacity,
-											emissivity_constant,
-											radiation_from_space_tick,
-										);
-									} else if *temp_write > T20C {
-										let delta = *temp_write - TCMB;
-										let energy = get_share_energy(
-											info.thermal_conductivity * elapsed_heat_scale * delta,
-											HEAT_CAPACITY_VACUUM,
-											info.heat_capacity,
-										);
-										*temp_write -= energy / info.heat_capacity;
-									}
-								}
-
-								//share w/ air
-								if let Some(air_node) = air_arena.get_id(id) {
-									let tmix = air_arena.get(air_node).unwrap();
-									if tmix.enabled() {
-										if let Some(entry) = all_mixtures.get(tmix.mix) {
-											if let Some(mut gas) = entry.try_write() {
-												*temp_write = gas.temperature_share_non_gas(
-													/*
-														This value should be lower than the
-														turf-to-turf conductivity for balance reasons
-														as well as realism, otherwise fires will
-														just sort of solve theirselves over time.
-													*/
-													info.thermal_conductivity
-														* OPEN_HEAT_TRANSFER_COEFFICIENT,
-													*temp_write,
-													info.heat_capacity,
-												);
+									//share w/ air
+									if let Some(air_node) = air_arena.get_id(id) {
+										let tmix = air_arena.get(air_node).unwrap();
+										if tmix.enabled() {
+											if let Some(entry) = all_mixtures.get(tmix.mix) {
+												if let Some(mut gas) = entry.try_write() {
+													*temp_write = gas.temperature_share_non_gas(
+														/*
+															This value should be lower than the
+															turf-to-turf conductivity for balance reasons
+															as well as realism, otherwise fires will
+															just sort of solve theirselves over time.
+														*/
+														info.thermal_conductivity
+															* OPEN_HEAT_TRANSFER_COEFFICIENT,
+														*temp_write,
+														info.heat_capacity,
+													);
+												}
 											}
 										}
 									}
-								}
 
-								if !temp_write.is_normal() {
-									*temp_write = TCMB;
-								}
+									if !temp_write.is_normal() {
+										*temp_write = TCMB;
+									}
 
-								if *temp_write > MINIMUM_TEMPERATURE_START_SUPERCONDUCTION
-									&& *temp_write > info.heat_capacity
-								{
-									// not what heat capacity means but whatever
-									let generation = info.generation;
-									auxcallback::queue_callback(Box::new(move || {
-										if !crate::turfs::turf_callback_is_current(id, generation) {
-											return Ok(());
-										}
-										let mut turf = ByondValue::new_ref(ValueType::Turf, id);
-										turf.write_var_id(
-											byond_string!("to_be_destroyed"),
-											&1.0_f32.into(),
-										)?;
-										Ok(())
-									}));
-								}
-								has_adjacents.then_some(node_index)
-							})
-							.collect::<Vec<_>>();
+									if *temp_write > MINIMUM_TEMPERATURE_START_SUPERCONDUCTION
+										&& *temp_write > info.heat_capacity
+									{
+										// not what heat capacity means but whatever
+										let generation = info.generation;
+										let _ = auxcallback::queue_callback(
+											Box::new(move || {
+												if !crate::turfs::turf_callback_is_current(
+													id, generation,
+												) {
+													return Ok(());
+												}
+												let mut turf =
+													ByondValue::new_ref(ValueType::Turf, id);
+												turf.write_var_id(
+													byond_string!("to_be_destroyed"),
+													&1.0_f32.into(),
+												)?;
+												Ok(())
+											}),
+											0,
+										);
+									}
+									has_adjacents.then_some(node_index)
+								})
+								.collect::<Vec<_>>();
 
-						// Read every undirected edge from a stable snapshot. The core applies deterministic,
-						// conservative substeps using SSair's elapsed time before each node is written once.
-						unique_heat_edges_into(
-							adjacencies_to_consider.iter().flat_map(|&cur_index| {
-								arena
-									.adjacent_node_ids(cur_index)
-									.map(move |other_index| (cur_index, other_index))
-							}),
-							&mut scratch.seen_edges,
-							&mut scratch.unique_edges,
-						);
-						heat_edge_attempts = scratch.unique_edges.len();
-						scratch.touched_nodes.clear();
-						scratch.touched_nodes.extend(
+							// Read every undirected edge from a stable snapshot. The core applies deterministic,
+							// conservative substeps using SSair's elapsed time before each node is written once.
+							unique_heat_edges_into(
+								adjacencies_to_consider.iter().flat_map(|&cur_index| {
+									arena
+										.adjacent_node_ids(cur_index)
+										.map(move |other_index| (cur_index, other_index))
+								}),
+								&mut scratch.seen_edges,
+								&mut scratch.unique_edges,
+							);
+							heat_edge_attempts = scratch.unique_edges.len();
+							scratch.touched_nodes.clear();
+							scratch.touched_nodes.extend(
+								scratch
+									.unique_edges
+									.iter()
+									.flat_map(|&(first, second)| [first, second]),
+							);
 							scratch
-								.unique_edges
-								.iter()
-								.flat_map(|&(first, second)| [first, second]),
-						);
-						scratch
-							.touched_nodes
-							.sort_by_key(|node_index| node_index.index());
-						scratch.touched_nodes.dedup();
-
-						let touched_node_count = scratch.touched_nodes.len();
-						heat_nodes_changed = touched_node_count;
-						scratch.temperatures.clear();
-						scratch.temperatures.resize(touched_node_count, 0.0);
-						scratch.conductivities.clear();
-						scratch.conductivities.resize(touched_node_count, 0.0);
-						scratch.heat_capacities.clear();
-						scratch.heat_capacities.resize(touched_node_count, 0.0);
-						for (dense_index, &node_index) in scratch.touched_nodes.iter().enumerate() {
-							let info = arena.get(node_index).unwrap();
-							scratch.temperatures[dense_index] = *info.temperature.read();
-							scratch.conductivities[dense_index] = info.thermal_conductivity;
-							scratch.heat_capacities[dense_index] = info.heat_capacity;
-						}
-
-						scratch.dense_edges.clear();
-						for &(first, second) in &scratch.unique_edges {
-							let first_dense = scratch
 								.touched_nodes
-								.binary_search_by_key(&first.index(), |node_index| {
-									node_index.index()
-								});
-							let second_dense = scratch
-								.touched_nodes
-								.binary_search_by_key(&second.index(), |node_index| {
-									node_index.index()
-								});
-							let (Ok(first_dense), Ok(second_dense)) = (first_dense, second_dense)
-							else {
-								heat_processing_error = Some(
-									"heat edge endpoint was absent from the dense node snapshot"
-										.to_owned(),
-								);
-								break;
-							};
-							scratch
-								.dense_edges
-								.push((first_dense as u32, second_dense as u32));
-						}
+								.sort_by_key(|node_index| node_index.index());
+							scratch.touched_nodes.dedup();
 
-						if heat_processing_error.is_none() {
-							match conduction_step(
-								&mut scratch.temperatures,
-								&scratch.conductivities,
-								&scratch.heat_capacities,
-								&scratch.dense_edges,
-								info.time_delta as f32,
-							) {
-								Ok(stats) => heat_edges_applied = stats.edges_applied,
-								Err(error) => heat_processing_error = Some(error.to_string()),
-							}
-						}
-						if heat_processing_error.is_none() {
+							let touched_node_count = scratch.touched_nodes.len();
+							heat_nodes_changed = touched_node_count;
+							scratch.temperatures.clear();
+							scratch.temperatures.resize(touched_node_count, 0.0);
+							scratch.conductivities.clear();
+							scratch.conductivities.resize(touched_node_count, 0.0);
+							scratch.heat_capacities.clear();
+							scratch.heat_capacities.resize(touched_node_count, 0.0);
 							for (dense_index, &node_index) in
 								scratch.touched_nodes.iter().enumerate()
 							{
 								let info = arena.get(node_index).unwrap();
-								let mut temp_write = match info.temperature.try_write() {
-									Some(temperature) => temperature,
-									None => {
-										heat_lock_contention += 1;
-										info.temperature.write()
-									}
+								scratch.temperatures[dense_index] = *info.temperature.read();
+								scratch.conductivities[dense_index] = info.thermal_conductivity;
+								scratch.heat_capacities[dense_index] = info.heat_capacity;
+							}
+
+							scratch.dense_edges.clear();
+							for &(first, second) in &scratch.unique_edges {
+								let first_dense = scratch
+									.touched_nodes
+									.binary_search_by_key(&first.index(), |node_index| {
+										node_index.index()
+									});
+								let second_dense = scratch
+									.touched_nodes
+									.binary_search_by_key(&second.index(), |node_index| {
+										node_index.index()
+									});
+								let (Ok(first_dense), Ok(second_dense)) =
+									(first_dense, second_dense)
+								else {
+									heat_processing_error = Some(
+									"heat edge endpoint was absent from the dense node snapshot"
+										.to_owned(),
+								);
+									break;
 								};
-								*temp_write = scratch.temperatures[dense_index];
-								if !temp_write.is_normal() {
-									*temp_write = TCMB;
+								scratch
+									.dense_edges
+									.push((first_dense as u32, second_dense as u32));
+							}
+
+							if heat_processing_error.is_none() {
+								match conduction_step(
+									&mut scratch.temperatures,
+									&scratch.conductivities,
+									&scratch.heat_capacities,
+									&scratch.dense_edges,
+									info.time_delta as f32,
+								) {
+									Ok(stats) => heat_edges_applied = stats.edges_applied,
+									Err(error) => heat_processing_error = Some(error.to_string()),
 								}
 							}
-						}
+							if heat_processing_error.is_none() {
+								for (dense_index, &node_index) in
+									scratch.touched_nodes.iter().enumerate()
+								{
+									let info = arena.get(node_index).unwrap();
+									let mut temp_write = match info.temperature.try_write() {
+										Some(temperature) => temperature,
+										None => {
+											heat_lock_contention += 1;
+											info.temperature.write()
+										}
+									};
+									*temp_write = scratch.temperatures[dense_index];
+									if !temp_write.is_normal() {
+										*temp_write = TCMB;
+									}
+								}
+							}
+						});
 					});
 				});
-			});
-			record_heat_metrics(
-				&crate::DOGMOS_TELEMETRY,
-				heat_graph_nodes,
-				heat_nodes_changed,
-				heat_edge_attempts,
-				heat_edges_applied,
-			);
-			let bench = start_time.elapsed().as_millis();
-			let registration_changes = HEAT_REGISTRATION_CHANGES.swap(0, Ordering::Relaxed);
-			auxcallback::queue_callback(Box::new(move || {
-				let mut ssair = ByondValue::new_global_ref().read_var_id(byond_string!("SSair"))?;
-				let prev_cost = ssair
-					.read_number_id(byond_string!("cost_superconductivity"))
-					.map_err(|_| {
-						eyre::eyre!(
-							"Attempt to interpret non-number value as number {} {}:{}",
-							std::file!(),
-							std::line!(),
-							std::column!()
-						)
-					})?;
-				ssair.write_var_id(
-					byond_string!("cost_superconductivity"),
-					&(0.8 * prev_cost + 0.2 * (bench as f32)).into(),
-				)?;
-				ssair.write_var_id(
-					byond_string!("dogmos_heat_graph_nodes"),
-					&(heat_graph_nodes as f32).into(),
-				)?;
-				ssair.write_var_id(
-					byond_string!("dogmos_heat_edge_attempts"),
-					&(heat_edge_attempts as f32).into(),
-				)?;
-				ssair.write_var_id(
-					byond_string!("dogmos_heat_edges_applied"),
-					&(heat_edges_applied as f32).into(),
-				)?;
-				ssair.write_var_id(
-					byond_string!("dogmos_heat_lock_contention"),
-					&(heat_lock_contention as f32).into(),
-				)?;
-				ssair.write_var_id(
-					byond_string!("dogmos_heat_registration_changes"),
-					&(registration_changes as f32).into(),
-				)?;
-				if let Some(error) = heat_processing_error {
-					return Err(eyre::eyre!(
-						"Dogmos TurfHeat numerical step rejected: {error}"
-					));
-				}
-				Ok(())
-			}));
-			drop(task_lock);
+				record_heat_metrics(
+					&crate::DOGMOS_TELEMETRY,
+					heat_graph_nodes,
+					heat_nodes_changed,
+					heat_edge_attempts,
+					heat_edges_applied,
+				);
+				let bench = start_time.elapsed().as_millis();
+				let registration_changes = HEAT_REGISTRATION_CHANGES.swap(0, Ordering::Relaxed);
+				let owned_bytes = heat_processing_error.as_ref().map_or(0, String::capacity);
+				let _ = auxcallback::queue_callback(
+					Box::new(move || {
+						let mut ssair =
+							ByondValue::new_global_ref().read_var_id(byond_string!("SSair"))?;
+						let prev_cost = ssair
+							.read_number_id(byond_string!("cost_superconductivity"))
+							.map_err(|_| {
+								eyre::eyre!(
+									"Attempt to interpret non-number value as number {} {}:{}",
+									std::file!(),
+									std::line!(),
+									std::column!()
+								)
+							})?;
+						ssair.write_var_id(
+							byond_string!("cost_superconductivity"),
+							&(0.8 * prev_cost + 0.2 * (bench as f32)).into(),
+						)?;
+						ssair.write_var_id(
+							byond_string!("dogmos_heat_graph_nodes"),
+							&(heat_graph_nodes as f32).into(),
+						)?;
+						ssair.write_var_id(
+							byond_string!("dogmos_heat_edge_attempts"),
+							&(heat_edge_attempts as f32).into(),
+						)?;
+						ssair.write_var_id(
+							byond_string!("dogmos_heat_edges_applied"),
+							&(heat_edges_applied as f32).into(),
+						)?;
+						ssair.write_var_id(
+							byond_string!("dogmos_heat_lock_contention"),
+							&(heat_lock_contention as f32).into(),
+						)?;
+						ssair.write_var_id(
+							byond_string!("dogmos_heat_registration_changes"),
+							&(registration_changes as f32).into(),
+						)?;
+						if let Some(error) = heat_processing_error {
+							return Err(eyre::eyre!(
+								"Dogmos TurfHeat numerical step rejected: {error}"
+							));
+						}
+						Ok(())
+					}),
+					owned_bytes,
+				);
+				drop(task_lock);
+			}
+		}) {
+		Ok(worker) => worker,
+		Err(error) => {
+			HEAT_WORKER_RUNNING.store(false, Ordering::Release);
+			return Err(error.into());
 		}
-	});
+	};
+	*worker_owner = Some(worker);
+	Ok(())
 }
 
 #[auxmacros::init]
 fn process_heat_start() {
-	start_heat_worker();
+	let _ = start_heat_worker();
 }

@@ -13,6 +13,8 @@ use std::{
 	time::Duration,
 };
 
+const REQUEST_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(crate) struct ServiceSession {
 	pub(crate) client: BoundedDogmosClient,
 	service: Child,
@@ -70,12 +72,16 @@ impl ServiceSession {
 		let kill_result = self.service.kill();
 		let wait_result = self.service.wait();
 		self.reaped = true;
-		match (kill_result, wait_result) {
+		let process_state = match (kill_result, wait_result) {
 			(_, Ok(status)) => format!("terminated ({status})"),
 			(Err(error), Err(wait_error)) => {
 				format!("termination failed ({error}); wait failed ({wait_error})")
 			}
 			(Ok(()), Err(error)) => format!("terminated; wait failed ({error})"),
+		};
+		match self.client.close(REQUEST_WORKER_SHUTDOWN_TIMEOUT) {
+			Ok(()) => process_state,
+			Err(error) => format!("{process_state}; request worker close failed ({error})"),
 		}
 	}
 
@@ -111,11 +117,12 @@ impl ServiceSession {
 
 	pub(crate) fn shutdown(&mut self) -> eyre::Result<()> {
 		self.request_without_response(OperationKind::Shutdown, &[])?;
-		if !self.service.wait()?.success() {
-			self.reaped = true;
+		let status = self.service.wait()?;
+		self.reaped = true;
+		self.client.close(REQUEST_WORKER_SHUTDOWN_TIMEOUT)?;
+		if !status.success() {
 			return Err(eyre::eyre!("dogmosd did not shut down cleanly"));
 		}
-		self.reaped = true;
 		Ok(())
 	}
 }

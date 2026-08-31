@@ -35,7 +35,9 @@ pub enum RuntimeMetric {
 	HeatEdgesAttempted,
 	HeatEdgesApplied,
 	CallbackItemsEnqueued,
-	CallbackOwnedBytes,
+	CallbackOwnedBytesLowerBoundCurrent,
+	CallbackOwnedBytesLowerBoundHighWater,
+	CallbackOwnedBytesLowerBoundEnqueued,
 	CallbackQueueDepth,
 	CallbackQueueDepthHighWater,
 	CallbackOldestAgeNanoseconds,
@@ -60,7 +62,7 @@ pub enum RuntimeMetric {
 }
 
 impl RuntimeMetric {
-	pub const COUNT: usize = 29;
+	pub const COUNT: usize = 31;
 
 	#[must_use]
 	pub const fn name(self) -> &'static str {
@@ -72,7 +74,13 @@ impl RuntimeMetric {
 			Self::HeatEdgesAttempted => "heat_edges_attempted",
 			Self::HeatEdgesApplied => "heat_edges_applied",
 			Self::CallbackItemsEnqueued => "callback_items_enqueued",
-			Self::CallbackOwnedBytes => "callback_owned_bytes",
+			Self::CallbackOwnedBytesLowerBoundCurrent => "callback_owned_bytes_lower_bound_current",
+			Self::CallbackOwnedBytesLowerBoundHighWater => {
+				"callback_owned_bytes_lower_bound_high_water"
+			}
+			Self::CallbackOwnedBytesLowerBoundEnqueued => {
+				"callback_owned_bytes_lower_bound_enqueued"
+			}
 			Self::CallbackQueueDepth => "callback_queue_depth",
 			Self::CallbackQueueDepthHighWater => "callback_queue_depth_high_water",
 			Self::CallbackOldestAgeNanoseconds => "callback_oldest_age_nanoseconds",
@@ -106,7 +114,9 @@ impl RuntimeMetric {
 			Self::HeatEdgesAttempted,
 			Self::HeatEdgesApplied,
 			Self::CallbackItemsEnqueued,
-			Self::CallbackOwnedBytes,
+			Self::CallbackOwnedBytesLowerBoundCurrent,
+			Self::CallbackOwnedBytesLowerBoundHighWater,
+			Self::CallbackOwnedBytesLowerBoundEnqueued,
 			Self::CallbackQueueDepth,
 			Self::CallbackQueueDepthHighWater,
 			Self::CallbackOldestAgeNanoseconds,

@@ -162,6 +162,25 @@ struct QueuedCallback {
 	enqueued_ticks: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackEnqueueCheckpoint {
+	CallbackReserve,
+	ContinuationReserve,
+	Commit,
+}
+
+struct PreparedCallbackBatch {
+	callbacks: Vec<CallbackEvent>,
+	continuations: Vec<(u64, PendingContinuation)>,
+	event_count: u32,
+	continuation_count: u32,
+	new_callback_depth: u32,
+	new_continuation_count: u32,
+	next_sequence: u64,
+	scope: CallbackScope,
+	transaction_id: u64,
+}
+
 struct ReactionCallbackQueue {
 	callbacks: VecDeque<QueuedCallback>,
 	next_sequence: u64,
@@ -185,7 +204,6 @@ pub struct ServiceState {
 	callback_drained_by_kind: [u64; CALLBACK_EVENT_KIND_COUNT],
 	callback_rejected_by_kind: [u64; CALLBACK_EVENT_KIND_COUNT],
 	next_callback_sequence: u64,
-	world_events: Vec<WorldEvent>,
 	pending_callback_scratch: Vec<CallbackEvent>,
 	pending_continuation_scratch: Vec<(u64, PendingContinuation)>,
 	expired_continuation_scratch: Vec<(u64, CoreContinuationToken)>,
@@ -198,6 +216,8 @@ pub struct ServiceState {
 	protocol_errors: u64,
 	world_generation: u32,
 	session_started_at: Instant,
+	#[cfg(test)]
+	callback_enqueue_failure: Option<CallbackEnqueueCheckpoint>,
 }
 
 impl ServiceState {
@@ -240,7 +260,6 @@ impl ServiceState {
 			callback_drained_by_kind: [0; CALLBACK_EVENT_KIND_COUNT],
 			callback_rejected_by_kind: [0; CALLBACK_EVENT_KIND_COUNT],
 			next_callback_sequence: 1,
-			world_events: Vec::new(),
 			pending_callback_scratch: Vec::new(),
 			pending_continuation_scratch: Vec::new(),
 			expired_continuation_scratch: Vec::new(),
@@ -253,6 +272,8 @@ impl ServiceState {
 			protocol_errors: 0,
 			world_generation,
 			session_started_at: Instant::now(),
+			#[cfg(test)]
+			callback_enqueue_failure: None,
 		}
 	}
 
@@ -1043,10 +1064,19 @@ impl ServiceState {
 		} = request
 		{
 			let transaction_id = self.begin_reaction_transaction()?;
+			let now_ticks = self.current_ticks();
 			let event_limit = self
 				.max_callback_events
 				.checked_sub(self.pending_callback_count)
 				.ok_or(StateError::CallbackBackpressure)?;
+			if let Err(error) = self.reserve_world_event_enqueue_capacity(
+				event_limit,
+				CallbackScope::Reaction,
+				transaction_id,
+			) {
+				self.remove_reaction_transaction(transaction_id);
+				return Err(error);
+			}
 			let progress = match self
 				.world
 				.react_mixture_with_event_limit(
@@ -1065,7 +1095,7 @@ impl ServiceState {
 			};
 			self.enqueue_world_events_at(
 				event_limit,
-				self.current_ticks(),
+				now_ticks,
 				CallbackScope::Reaction,
 				transaction_id,
 			)?;
@@ -1343,12 +1373,10 @@ impl ServiceState {
 			.max_callback_events
 			.checked_sub(self.pending_callback_count)
 			.ok_or(StateError::CallbackBackpressure)?;
-		self.world_events
-			.try_reserve_exact(event_limit as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
+		self.reserve_world_event_enqueue_capacity(event_limit, CallbackScope::General, 0)?;
 		let result = self
 			.world
-			.process_stage_chunk_cancellable(
+			.process_stage_chunk_cancellable_with_event_limit(
 				CoreStageChunkRequest {
 					stage,
 					frontier_epoch,
@@ -1356,6 +1384,7 @@ impl ServiceState {
 					work_limit,
 					seconds_per_tick,
 				},
+				event_limit,
 				should_cancel,
 			)
 			.map_err(map_world_error)?;
@@ -1387,26 +1416,11 @@ impl ServiceState {
 			SimulationStage::ProcessTurfHeat => WorldStage::TurfHeat,
 			SimulationStage::ProcessReactions => WorldStage::React,
 		};
-		let remaining_capacity = self
+		let event_limit = self
 			.max_callback_events
 			.checked_sub(self.pending_callback_count)
 			.ok_or(StateError::CallbackBackpressure)?;
-		let event_limit = remaining_capacity;
-		self.next_callback_sequence
-			.checked_add(u64::from(event_limit))
-			.ok_or(StateError::CallbackSequenceExhausted)?;
-		self.general_callbacks
-			.try_reserve_exact(event_limit as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
-		self.world_events
-			.try_reserve_exact(event_limit as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
-		self.pending_callback_scratch
-			.try_reserve_exact(event_limit as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
-		self.pending_continuation_scratch
-			.try_reserve_exact(event_limit as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
+		self.reserve_world_event_enqueue_capacity(event_limit, CallbackScope::General, 0)?;
 		let result = self
 			.world
 			.process_stage_cancellable_with_event_limit(
@@ -1488,18 +1502,15 @@ impl ServiceState {
 			.checked_sub(self.pending_callback_count)
 			.ok_or(StateError::CallbackBackpressure)?;
 		let event_limit = remaining_callbacks;
+		let scope = callback_scope(continuation.transaction_id);
+		self.reserve_world_event_enqueue_capacity(event_limit, scope, continuation.transaction_id)?;
 		let updated = self
 			.world
 			.resume_reaction_with_event_limit(continuation.core_token, event_limit)
 			.map_err(map_world_error)?;
 		self.pending_continuations.remove(&token.id);
 		self.remove_queued_continuation(token.id);
-		self.enqueue_world_events_at(
-			event_limit,
-			now_ticks,
-			callback_scope(continuation.transaction_id),
-			continuation.transaction_id,
-		)?;
+		self.enqueue_world_events_at(event_limit, now_ticks, scope, continuation.transaction_id)?;
 		if continuation.transaction_id != 0 {
 			self.finish_reaction_transaction(continuation.transaction_id, true)?;
 		}
@@ -1517,6 +1528,8 @@ impl ServiceState {
 			.max_callback_events
 			.checked_sub(self.pending_callback_count)
 			.ok_or(StateError::CallbackBackpressure)?;
+		let scope = callback_scope(continuation.transaction_id);
+		self.reserve_world_event_enqueue_capacity(event_limit, scope, continuation.transaction_id)?;
 		let progress = self
 			.world
 			.resume_reaction_with_result_and_event_limit(
@@ -1527,12 +1540,7 @@ impl ServiceState {
 			.map_err(map_world_error)?;
 		self.pending_continuations.remove(&token.id);
 		self.remove_queued_continuation(token.id);
-		self.enqueue_world_events_at(
-			event_limit,
-			now_ticks,
-			callback_scope(continuation.transaction_id),
-			continuation.transaction_id,
-		)?;
+		self.enqueue_world_events_at(event_limit, now_ticks, scope, continuation.transaction_id)?;
 		if continuation.transaction_id != 0 {
 			self.finish_reaction_transaction(continuation.transaction_id, !progress.pending)?;
 		}
@@ -1645,22 +1653,106 @@ impl ServiceState {
 		Ok(())
 	}
 
-	fn enqueue_world_events_at(
+	#[cfg(test)]
+	fn fail_next_callback_enqueue_at(&mut self, checkpoint: CallbackEnqueueCheckpoint) {
+		self.callback_enqueue_failure = Some(checkpoint);
+	}
+
+	#[cfg(test)]
+	fn callback_enqueue_checkpoint(
+		&mut self,
+		checkpoint: CallbackEnqueueCheckpoint,
+	) -> Result<(), StateError> {
+		if self.callback_enqueue_failure == Some(checkpoint) {
+			self.callback_enqueue_failure = None;
+			return Err(StateError::AllocationFailed);
+		}
+		Ok(())
+	}
+
+	#[cfg(not(test))]
+	fn callback_enqueue_checkpoint(
+		&mut self,
+		_checkpoint: CallbackEnqueueCheckpoint,
+	) -> Result<(), StateError> {
+		Ok(())
+	}
+
+	fn reserve_world_event_enqueue_capacity(
+		&mut self,
+		maximum: u32,
+		scope: CallbackScope,
+		transaction_id: u64,
+	) -> Result<(), StateError> {
+		self.prepare_callback_enqueue(maximum)?;
+		let first_sequence = match scope {
+			CallbackScope::General if transaction_id == 0 => self.next_callback_sequence,
+			CallbackScope::Reaction if transaction_id != 0 => {
+				self.reaction_callbacks
+					.get(&transaction_id)
+					.ok_or(StateError::UnknownReactionTransaction(transaction_id))?
+					.next_sequence
+			}
+			_ => return Err(StateError::UnknownReactionTransaction(transaction_id)),
+		};
+		first_sequence
+			.checked_add(u64::from(maximum))
+			.ok_or(StateError::CallbackSequenceExhausted)?;
+		let continuation_capacity = self
+			.max_pending_continuations
+			.saturating_sub(self.pending_continuation_count())
+			.min(maximum);
+		self.next_continuation_id
+			.checked_add(u64::from(continuation_capacity))
+			.ok_or(StateError::ContinuationIdExhausted)?;
+		self.callback_enqueue_checkpoint(CallbackEnqueueCheckpoint::ContinuationReserve)?;
+		self.pending_callback_scratch
+			.try_reserve_exact(maximum as usize)
+			.map_err(|_| StateError::AllocationFailed)?;
+		self.pending_continuation_scratch
+			.try_reserve_exact(continuation_capacity as usize)
+			.map_err(|_| StateError::AllocationFailed)?;
+		self.callback_enqueue_checkpoint(CallbackEnqueueCheckpoint::CallbackReserve)?;
+		match scope {
+			CallbackScope::General => self
+				.general_callbacks
+				.try_reserve_exact(maximum as usize)
+				.map_err(|_| StateError::AllocationFailed)?,
+			CallbackScope::Reaction => self
+				.reaction_callbacks
+				.get_mut(&transaction_id)
+				.expect("reaction callback queue was validated before reservation")
+				.callbacks
+				.try_reserve_exact(maximum as usize)
+				.map_err(|_| StateError::AllocationFailed)?,
+		}
+		Ok(())
+	}
+
+	fn prepare_callback_batch(
 		&mut self,
 		maximum: u32,
 		now_ticks: u64,
 		scope: CallbackScope,
 		transaction_id: u64,
-	) -> Result<u32, StateError> {
-		let event_count = self
-			.world
-			.drain_events_into(maximum, &mut self.world_events);
-		let new_depth = match self.prepare_callback_enqueue(event_count) {
+	) -> Result<PreparedCallbackBatch, StateError> {
+		let event_count = self.world.pending_events(maximum).len() as u32;
+		let new_callback_depth = match self.prepare_callback_enqueue(event_count) {
 			Ok(prepared) => prepared,
 			Err(StateError::CallbackBackpressure) => {
-				for index in 0..self.world_events.len() {
-					let kind = world_event_kind(self.world_events[index]);
-					self.record_callback_rejected(kind, 1);
+				let mut rejected_by_kind = [0_u32; CALLBACK_EVENT_KIND_COUNT];
+				for event in self.world.pending_events(maximum).iter().copied() {
+					rejected_by_kind[callback_kind_index(world_event_kind(event))] += 1;
+				}
+				self.callback_rejected = self
+					.callback_rejected
+					.saturating_add(u64::from(event_count));
+				for (counter, count) in self
+					.callback_rejected_by_kind
+					.iter_mut()
+					.zip(rejected_by_kind)
+				{
+					*counter = counter.saturating_add(u64::from(count));
 				}
 				return Err(StateError::CallbackBackpressure);
 			}
@@ -1681,8 +1773,8 @@ impl ServiceState {
 			.ok_or(StateError::CallbackSequenceExhausted)?;
 		self.pending_callback_scratch.clear();
 		self.pending_continuation_scratch.clear();
-		let continuation_count = self
-			.world_events
+		let events = self.world.pending_events(maximum);
+		let continuation_count = events
 			.iter()
 			.filter(|event| matches!(event, WorldEvent::RunDmReaction { .. }))
 			.count();
@@ -1707,7 +1799,7 @@ impl ServiceState {
 		self.next_continuation_id
 			.checked_add(u64::from(continuation_count))
 			.ok_or(StateError::ContinuationIdExhausted)?;
-		for (index, event) in self.world_events.iter().copied().enumerate() {
+		for (index, event) in events.iter().copied().enumerate() {
 			let continuation = match event {
 				WorldEvent::RunDmReaction {
 					turf,
@@ -1738,9 +1830,6 @@ impl ServiceState {
 				}
 				_ => None,
 			};
-			// Build the scoped value once here, validate it, and push that same value - it used
-			// to be scoped, encoded purely to validate, and discarded here, then scoped again
-			// with identical arguments when actually enqueued below.
 			let callback = pending_callback_from_world_event(event, continuation).scoped(
 				scope,
 				transaction_id,
@@ -1751,49 +1840,80 @@ impl ServiceState {
 				.map_err(|error| StateError::State(error.to_string()))?;
 			self.pending_callback_scratch.push(callback);
 		}
-		self.next_continuation_id += u64::from(continuation_count);
-		for (id, continuation) in self.pending_continuation_scratch.drain(..) {
+		self.callback_enqueue_checkpoint(CallbackEnqueueCheckpoint::Commit)?;
+		Ok(PreparedCallbackBatch {
+			callbacks: std::mem::take(&mut self.pending_callback_scratch),
+			continuations: std::mem::take(&mut self.pending_continuation_scratch),
+			event_count,
+			continuation_count,
+			new_callback_depth,
+			new_continuation_count,
+			next_sequence,
+			scope,
+			transaction_id,
+		})
+	}
+
+	fn commit_prepared_callback_batch(
+		&mut self,
+		mut batch: PreparedCallbackBatch,
+		now_ticks: u64,
+	) -> u32 {
+		self.world
+			.discard_pending_events(batch.event_count)
+			.expect("prepared callback events must remain pending until commit");
+		self.next_continuation_id += u64::from(batch.continuation_count);
+		for (id, continuation) in batch.continuations.drain(..) {
 			self.pending_continuations.insert(id, continuation);
 		}
-		self.continuation_high_water = self.continuation_high_water.max(new_continuation_count);
-		match scope {
+		self.continuation_high_water = self
+			.continuation_high_water
+			.max(batch.new_continuation_count);
+		match batch.scope {
 			CallbackScope::General => {
-				self.general_callbacks
-					.try_reserve_exact(event_count as usize)
-					.map_err(|_| StateError::AllocationFailed)?;
-				for callback in self.pending_callback_scratch.iter().copied() {
+				for callback in batch.callbacks.iter().copied() {
 					self.general_callbacks.push_back(QueuedCallback {
 						event: callback,
 						enqueued_ticks: now_ticks,
 					});
 				}
-				self.next_callback_sequence = next_sequence;
+				self.next_callback_sequence = batch.next_sequence;
 			}
 			CallbackScope::Reaction => {
 				let queue = self
 					.reaction_callbacks
-					.get_mut(&transaction_id)
-					.ok_or(StateError::UnknownReactionTransaction(transaction_id))?;
-				queue
-					.callbacks
-					.try_reserve_exact(event_count as usize)
-					.map_err(|_| StateError::AllocationFailed)?;
-				for callback in self.pending_callback_scratch.iter().copied() {
+					.get_mut(&batch.transaction_id)
+					.expect("reaction callback queue was validated during preparation");
+				for callback in batch.callbacks.iter().copied() {
 					queue.callbacks.push_back(QueuedCallback {
 						event: callback,
 						enqueued_ticks: now_ticks,
 					});
 				}
-				queue.next_sequence = next_sequence;
+				queue.next_sequence = batch.next_sequence;
 			}
 		}
-		for index in 0..self.pending_callback_scratch.len() {
-			self.record_callback_enqueued(self.pending_callback_scratch[index].kind, 1);
+		for callback in batch.callbacks.iter() {
+			self.record_callback_enqueued(callback.kind, 1);
 		}
-		self.pending_callback_scratch.clear();
-		self.pending_callback_count = new_depth;
-		self.callback_high_water = self.callback_high_water.max(new_depth);
-		Ok(event_count)
+		batch.callbacks.clear();
+		batch.continuations.clear();
+		self.pending_callback_scratch = batch.callbacks;
+		self.pending_continuation_scratch = batch.continuations;
+		self.pending_callback_count = batch.new_callback_depth;
+		self.callback_high_water = self.callback_high_water.max(batch.new_callback_depth);
+		batch.event_count
+	}
+
+	fn enqueue_world_events_at(
+		&mut self,
+		maximum: u32,
+		now_ticks: u64,
+		scope: CallbackScope,
+		transaction_id: u64,
+	) -> Result<u32, StateError> {
+		let batch = self.prepare_callback_batch(maximum, now_ticks, scope, transaction_id)?;
+		Ok(self.commit_prepared_callback_batch(batch, now_ticks))
 	}
 
 	fn remove_queued_continuation(&mut self, continuation_id: u64) {
@@ -2110,6 +2230,9 @@ fn map_world_error(error: WorldError) -> StateError {
 			StateError::ContinuationCapacityExceeded
 		}
 		WorldError::EventCapacityExceeded { .. } => StateError::CallbackBackpressure,
+		error @ WorldError::PendingEventCountExceeded { .. } => {
+			StateError::State(error.to_string())
+		}
 		WorldError::InvalidConductivity => StateError::InvalidConductivity,
 		WorldError::InvalidEqualizeHardTurfLimit => {
 			StateError::State(WorldError::InvalidEqualizeHardTurfLimit.to_string())
@@ -2186,6 +2309,135 @@ mod tests {
 
 	fn handle(slot: u32, generation: u32) -> WireHandle {
 		WireHandle { slot, generation }
+	}
+
+	fn equalize_room_to_space_state(callback_capacity: u32) -> (ServiceState, MixtureHandle) {
+		let room_mixture = MixtureHandle {
+			slot: 0,
+			generation: 1,
+		};
+		let space_mixture = MixtureHandle {
+			slot: 1,
+			generation: 1,
+		};
+		let room_turf = TurfHandle {
+			slot: 0,
+			generation: 1,
+		};
+		let space_turf = TurfHandle {
+			slot: 1,
+			generation: 1,
+		};
+		let mut state = ServiceState::new(1024 * 1024, callback_capacity);
+		state
+			.world
+			.apply_lifecycle(&[
+				CoreLifecycleMutation {
+					action: CoreLifecycleAction::Register,
+					handle: room_mixture,
+				},
+				CoreLifecycleMutation {
+					action: CoreLifecycleAction::Register,
+					handle: space_mixture,
+				},
+			])
+			.unwrap();
+		let mut room_gases = [0.0; MAX_GAS_SLOTS];
+		room_gases[0] = 100.0;
+		state
+			.world
+			.apply_mixture_state(&[
+				CoreMixtureStateMutation {
+					handle: room_mixture,
+					expected_revision: 0,
+					temperature: 293.15,
+					volume: 2500.0,
+					gases: room_gases,
+				},
+				CoreMixtureStateMutation {
+					handle: space_mixture,
+					expected_revision: 0,
+					temperature: 293.15,
+					volume: 2500.0,
+					gases: [0.0; MAX_GAS_SLOTS],
+				},
+			])
+			.unwrap();
+		state
+			.world
+			.apply_command(Command::MarkImmutable {
+				handle: space_mixture,
+			})
+			.unwrap();
+		state
+			.world
+			.apply_turf_lifecycle(&[
+				TurfLifecycleMutation::Register {
+					handle: room_turf,
+					mixture: Some(room_mixture),
+				},
+				TurfLifecycleMutation::Register {
+					handle: space_turf,
+					mixture: Some(space_mixture),
+				},
+			])
+			.unwrap();
+		state
+			.world
+			.apply_turf_adjacency(&[TurfAdjacencyMutation {
+				left: room_turf,
+				right: space_turf,
+				connected: true,
+			}])
+			.unwrap();
+		state.world.begin_frontier(1, 2).unwrap();
+		state
+			.world
+			.append_frontier(1, 0, &[room_turf, space_turf])
+			.unwrap();
+		state.world.commit_frontier(1).unwrap();
+		(state, room_mixture)
+	}
+
+	fn dm_reaction_state() -> (ServiceState, WireHandle, WireHandle) {
+		let mixture = handle(0, 1);
+		let holder = handle(41, 9);
+		let mut state = ServiceState::new_for_world(1024 * 1024, 8, 1, 1, 7);
+		state
+			.install_gases(vec![GasMetadataRegistration {
+				id: 0,
+				key: "o2".into(),
+				name: "Oxygen".into(),
+				flags: 0,
+				specific_heat: ScalarValue(20.0),
+				fusion_power: ScalarValue(0.0),
+				moles_visible: None,
+				enthalpy: ScalarValue(0.0),
+				fire_radiation_released: ScalarValue(0.0),
+				fire_role: WireGasFireRole::None,
+				fire_products: None,
+			}])
+			.unwrap();
+		state
+			.install_reactions(vec![ReactionMetadataRegistration {
+				id: 0,
+				key: "dm".into(),
+				priority: ScalarValue(1.0),
+				minimum_temperature: None,
+				maximum_temperature: None,
+				minimum_energy: None,
+				minimum_fire_reagents: None,
+				gas_requirements: Vec::new(),
+				execution: WireReactionExecution::Dm,
+			}])
+			.unwrap();
+		state
+			.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: mixture,
+			}])
+			.unwrap();
+		(state, mixture, holder)
 	}
 
 	#[test]
@@ -2737,6 +2989,99 @@ mod tests {
 	}
 
 	#[test]
+	fn chunked_stage_rejects_event_batch_that_exceeds_remaining_callback_capacity() {
+		let (mut state, room_mixture) = equalize_room_to_space_state(2);
+		let snapshot_before = state.world.snapshot(room_mixture).unwrap();
+		state.enqueue_diagnostic_callbacks(1).unwrap();
+		let callbacks_before = state.pending_callback_count;
+
+		let terminal_result = (0..16)
+			.find_map(|_| {
+				match state.process_stage_chunk_cancellable(
+					SimulationStage::ProcessTurfEqualize,
+					1,
+					1,
+					32,
+					0.5,
+					|| false,
+				) {
+					Ok(result) if result.pending => None,
+					result => Some(result),
+				}
+			})
+			.expect("the bounded component stage must terminate");
+		assert_eq!(terminal_result, Err(StateError::CallbackBackpressure));
+		assert_eq!(state.pending_callback_count, callbacks_before);
+		assert_eq!(state.world.snapshot(room_mixture).unwrap(), snapshot_before);
+		assert_eq!(state.world.pending_stage_epoch(), None);
+		let mut events = Vec::new();
+		assert_eq!(state.world.drain_events_into(2, &mut events), 0);
+	}
+
+	#[test]
+	fn callback_reservation_failure_preserves_world_events_for_retry() {
+		let (mut state, _) = equalize_room_to_space_state(2);
+		state
+			.world
+			.process_stage_cancellable_with_event_limit(WorldStage::Equalize, 0.5, 2, || false)
+			.unwrap();
+		state.fail_next_callback_enqueue_at(CallbackEnqueueCheckpoint::Commit);
+
+		assert_eq!(
+			state.enqueue_world_events_at(2, 10, CallbackScope::General, 0),
+			Err(StateError::AllocationFailed)
+		);
+		assert!(state.general_callbacks.is_empty());
+		assert!(state.pending_continuations.is_empty());
+		assert_eq!(state.pending_callback_count, 0);
+		assert_eq!(state.next_callback_sequence, 1);
+
+		assert_eq!(
+			state.enqueue_world_events_at(2, 10, CallbackScope::General, 0),
+			Ok(2)
+		);
+		assert_eq!(state.general_callbacks.len(), 2);
+		assert_eq!(state.pending_callback_count, 2);
+	}
+
+	#[test]
+	fn general_callback_reservations_fail_before_core_mutation() {
+		for checkpoint in [
+			CallbackEnqueueCheckpoint::ContinuationReserve,
+			CallbackEnqueueCheckpoint::CallbackReserve,
+		] {
+			let (mut state, room_mixture) = equalize_room_to_space_state(2);
+			let snapshot_before = state.world.snapshot(room_mixture).unwrap();
+			state.fail_next_callback_enqueue_at(checkpoint);
+
+			assert_eq!(
+				state.process_stage_cancellable_at(
+					SimulationStage::ProcessTurfEqualize,
+					0.5,
+					10,
+					|| false,
+				),
+				Err(StateError::AllocationFailed)
+			);
+			assert_eq!(state.world.snapshot(room_mixture).unwrap(), snapshot_before);
+			assert!(state.world.pending_events(2).is_empty());
+			assert!(state.general_callbacks.is_empty());
+			assert!(state.pending_continuations.is_empty());
+			assert_eq!(state.next_callback_sequence, 1);
+			assert_eq!(state.next_continuation_id, 1);
+
+			let retry = state
+				.process_stage_cancellable_at(SimulationStage::ProcessTurfEqualize, 0.5, 11, || {
+					false
+				})
+				.unwrap();
+			assert_eq!(retry.callback_events, 2);
+			assert_eq!(state.general_callbacks.len(), 2);
+			assert_eq!(state.next_callback_sequence, 3);
+		}
+	}
+
+	#[test]
 	fn wire_turf_batches_construct_authoritative_core_topology() {
 		let mixture = handle(0, 1);
 		let other_mixture = handle(1, 1);
@@ -2916,6 +3261,90 @@ mod tests {
 				.unwrap(),
 			MixtureCommandResponse::Boolean(true)
 		);
+	}
+
+	#[test]
+	fn reaction_callback_reservation_fails_before_core_mutation() {
+		for checkpoint in [
+			CallbackEnqueueCheckpoint::ContinuationReserve,
+			CallbackEnqueueCheckpoint::CallbackReserve,
+		] {
+			let (mut state, mixture, holder) = dm_reaction_state();
+			let snapshot_before = state.snapshot(mixture).unwrap();
+			state.fail_next_callback_enqueue_at(checkpoint);
+
+			assert_eq!(
+				state.apply_mixture_command(MixtureCommandRequest::React {
+					handle: mixture,
+					target: holder,
+					reaction_profile_threshold_ms: None,
+				}),
+				Err(StateError::AllocationFailed)
+			);
+			assert_eq!(state.snapshot(mixture).unwrap(), snapshot_before);
+			assert!(state.reaction_callbacks.is_empty());
+			assert!(state.pending_continuations.is_empty());
+			assert_eq!(state.next_callback_sequence, 1);
+			assert_eq!(state.next_continuation_id, 1);
+			assert_eq!(state.world.pending_reaction_continuations(), 0);
+			assert!(state.world.pending_events(8).is_empty());
+
+			let retry = state
+				.apply_mixture_command(MixtureCommandRequest::React {
+					handle: mixture,
+					target: holder,
+					reaction_profile_threshold_ms: None,
+				})
+				.unwrap();
+			assert!(matches!(
+				retry,
+				MixtureCommandResponse::ReactionProgress { pending: true, .. }
+			));
+			assert_eq!(state.pending_continuations.len(), 1);
+			assert_eq!(state.pending_callback_count, 1);
+		}
+	}
+
+	#[test]
+	fn reaction_callback_commit_failure_is_retryable_without_duplicate_ownership() {
+		let (mut state, mixture, holder) = dm_reaction_state();
+		let transaction_id = state.begin_reaction_transaction().unwrap();
+		state
+			.reserve_world_event_enqueue_capacity(8, CallbackScope::Reaction, transaction_id)
+			.unwrap();
+		let progress = state
+			.world
+			.react_mixture_with_event_limit(
+				core_handle(mixture),
+				core_gameplay_handle(holder),
+				None,
+				8,
+			)
+			.unwrap();
+		assert!(progress.pending);
+		state.fail_next_callback_enqueue_at(CallbackEnqueueCheckpoint::Commit);
+
+		assert_eq!(
+			state.enqueue_world_events_at(8, 10, CallbackScope::Reaction, transaction_id),
+			Err(StateError::AllocationFailed)
+		);
+		let queue = state.reaction_callbacks.get(&transaction_id).unwrap();
+		assert!(queue.callbacks.is_empty());
+		assert_eq!(queue.next_sequence, 1);
+		assert!(state.pending_continuations.is_empty());
+		assert_eq!(state.next_continuation_id, 1);
+		assert_eq!(state.world.pending_events(8).len(), 1);
+
+		assert_eq!(
+			state.enqueue_world_events_at(8, 11, CallbackScope::Reaction, transaction_id),
+			Ok(1)
+		);
+		let queue = state.reaction_callbacks.get(&transaction_id).unwrap();
+		assert_eq!(queue.callbacks.len(), 1);
+		assert_eq!(queue.next_sequence, 2);
+		assert_eq!(state.pending_continuations.len(), 1);
+		assert_eq!(state.next_continuation_id, 2);
+		assert!(state.world.pending_events(8).is_empty());
 	}
 
 	#[test]

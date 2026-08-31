@@ -279,6 +279,15 @@ impl FrontierState {
 			+ self.upload_seen.capacity() * std::mem::size_of::<TurfHandle>()) as u64
 	}
 
+	pub(crate) fn committed_storage_bytes_lower_bound(&self) -> u64 {
+		(self.committed.capacity() * std::mem::size_of::<TurfHandle>()
+			+ self.committed_set.capacity() * std::mem::size_of::<TurfHandle>()) as u64
+	}
+
+	pub(crate) fn committed_capacities(&self) -> (usize, usize) {
+		(self.committed.capacity(), self.committed_set.capacity())
+	}
+
 	fn is_received(&self, index: u32) -> bool {
 		let index = index as usize;
 		self.received_bits[index / u64::BITS as usize] & (1 << (index % u64::BITS as usize)) != 0

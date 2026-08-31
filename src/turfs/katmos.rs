@@ -609,28 +609,38 @@ fn flood_fill_zones(
 
 				if adj_mixture.is_immutable() {
 					// An opening to immutable space triggers decompression.
-					auxcallback::queue_callback(Box::new(move || {
-						if !crate::turfs::turf_callback_is_current(cur_turf_id, cur_turf_generation)
-						{
-							return Ok(());
-						}
-						explosively_depressurize(cur_turf_id, equalize_hard_turf_limit)
-							.wrap_err("Decompressing")
-					}));
+					let _ = auxcallback::queue_callback(
+						Box::new(move || {
+							if !crate::turfs::turf_callback_is_current(
+								cur_turf_id,
+								cur_turf_generation,
+							) {
+								return Ok(());
+							}
+							explosively_depressurize(cur_turf_id, equalize_hard_turf_limit)
+								.wrap_err("Decompressing")
+						}),
+						0,
+					);
 					ignore_zone = true;
 				}
 
 				if adj_mixture.planetary_atmos.is_some()
 					&& weight.contains(AdjacentFlags::ATMOS_ADJACENT_FIRELOCK)
 				{
-					auxcallback::queue_callback(Box::new(move || {
-						if !crate::turfs::turf_callback_is_current(cur_turf_id, cur_turf_generation)
-						{
-							return Ok(());
-						}
-						planet_equalize(cur_turf_id, equalize_hard_turf_limit)
-							.wrap_err("Equalising planet air")
-					}));
+					let _ = auxcallback::queue_callback(
+						Box::new(move || {
+							if !crate::turfs::turf_callback_is_current(
+								cur_turf_id,
+								cur_turf_generation,
+							) {
+								return Ok(());
+							}
+							planet_equalize(cur_turf_id, equalize_hard_turf_limit)
+								.wrap_err("Equalising planet air")
+						}),
+						0,
+					);
 				}
 			}
 		}
@@ -883,31 +893,44 @@ fn send_pressure_differences(pressures: Vec<PressureDifference>) {
 	while !pressures.is_empty() {
 		let batch_len = PRESSURE_CALLBACK_BATCH_SIZE.min(pressures.len());
 		let batch = pressures.drain(..batch_len).collect::<Vec<_>>();
-		auxcallback::queue_callback(Box::new(move || {
-			let mut first_error = None;
-			for (amount, current_turf, current_generation, adjacent_turf, adjacent_generation) in
-				batch
-			{
-				if !crate::turfs::turf_callback_is_current(current_turf, current_generation)
-					|| !crate::turfs::turf_callback_is_current(adjacent_turf, adjacent_generation)
+		let owned_bytes = batch
+			.capacity()
+			.saturating_mul(std::mem::size_of::<PressureDifference>());
+		let _ = auxcallback::queue_callback(
+			Box::new(move || {
+				let mut first_error = None;
+				for (
+					amount,
+					current_turf,
+					current_generation,
+					adjacent_turf,
+					adjacent_generation,
+				) in batch
 				{
-					continue;
+					if !crate::turfs::turf_callback_is_current(current_turf, current_generation)
+						|| !crate::turfs::turf_callback_is_current(
+							adjacent_turf,
+							adjacent_generation,
+						) {
+						continue;
+					}
+					let turf = ByondValue::new_ref(ValueType::Turf, current_turf);
+					let other_turf = ByondValue::new_ref(ValueType::Turf, adjacent_turf);
+					let result = turf
+						.call_id(
+							byond_string!("consider_pressure_difference"),
+							&[other_turf, amount.into()],
+						)
+						.map(|_| ())
+						.wrap_err("Katmos considering pressure differences");
+					if let Err(error) = result {
+						first_error.get_or_insert(error);
+					}
 				}
-				let turf = ByondValue::new_ref(ValueType::Turf, current_turf);
-				let other_turf = ByondValue::new_ref(ValueType::Turf, adjacent_turf);
-				let result = turf
-					.call_id(
-						byond_string!("consider_pressure_difference"),
-						&[other_turf, amount.into()],
-					)
-					.map(|_| ())
-					.wrap_err("Katmos considering pressure differences");
-				if let Err(error) = result {
-					first_error.get_or_insert(error);
-				}
-			}
-			first_error.map_or(Ok(()), Err)
-		}));
+				first_error.map_or(Ok(()), Err)
+			}),
+			owned_bytes,
+		);
 	}
 }
 

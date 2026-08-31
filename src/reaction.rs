@@ -73,6 +73,39 @@ pub fn reaction_name_by_id(id: ReactionIdentifier) -> Option<String> {
 	REACTION_VALUES.with_borrow(|r| r.get(&id).map(|(_side, name)| name.clone()))
 }
 
+pub(crate) fn clear_reaction_values() {
+	REACTION_VALUES.with_borrow_mut(|values| values.clear());
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_reaction_value(
+	id: ReactionIdentifier,
+	name: &str,
+	byond_side: bool,
+) -> Reaction {
+	fn rust_reaction(_src: ByondValue, _holder: ByondValue) -> Result<ByondValue> {
+		Ok(ByondValue::null())
+	}
+
+	let side = if byond_side {
+		ReactionSide::ByondSide(ByondValue::null())
+	} else {
+		ReactionSide::RustSide(rust_reaction)
+	};
+	REACTION_VALUES.with_borrow_mut(|values| {
+		values.insert(id, (side, name.into()));
+	});
+	Reaction {
+		id,
+		priority: FloatOrd(id as f32),
+		min_temp_req: None,
+		max_temp_req: None,
+		min_ener_req: None,
+		min_fire_req: None,
+		min_gas_reqs: Vec::new(),
+	}
+}
+
 impl Reaction {
 	/// Takes a `/datum/gas_reaction` and makes a byond reaction out of it.
 	pub fn from_byond_reaction(reaction: ByondValue) -> Result<Self> {
@@ -197,6 +230,11 @@ impl Reaction {
 	#[must_use]
 	pub fn get_priority(&self) -> ReactionPriority {
 		self.priority
+	}
+	pub(crate) fn owned_bytes_lower_bound(&self) -> usize {
+		self.min_gas_reqs
+			.capacity()
+			.saturating_mul(std::mem::size_of::<(GasIDX, f32)>())
 	}
 	/// Calls the reaction with the given arguments.
 	/// # Errors

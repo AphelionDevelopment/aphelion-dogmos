@@ -486,45 +486,69 @@ fn fdm(
 					while !pressure_callbacks.is_empty() {
 						let batch_len = PRESSURE_CALLBACK_BATCH_SIZE.min(pressure_callbacks.len());
 						let batch = pressure_callbacks.drain(..batch_len).collect::<Vec<_>>();
-						auxcallback::queue_callback(Box::new(move || {
-							let mut first_error = None;
-							for (id, generation, diffs) in batch {
-								let turf = ByondValue::new_ref(ValueType::Turf, id);
-								if !crate::turfs::turf_callback_is_current(id, generation) {
-									continue;
+						let owned_bytes = batch
+							.capacity()
+							.saturating_mul(std::mem::size_of_val(&batch[0]))
+							.saturating_add(batch.iter().fold(0_usize, |total, (_, _, diffs)| {
+								if diffs.is_heap() {
+									total.saturating_add(
+										diffs.capacity().saturating_mul(std::mem::size_of::<(
+											TurfID,
+											u32,
+											f32,
+										)>()),
+									)
+								} else {
+									total
 								}
-								for (id, generation, diff) in diffs {
-									if id == 0
-										|| !crate::turfs::turf_callback_is_current(id, generation)
-									{
+							}));
+						let _ = auxcallback::queue_callback(
+							Box::new(move || {
+								let mut first_error = None;
+								for (id, generation, diffs) in batch {
+									let turf = ByondValue::new_ref(ValueType::Turf, id);
+									if !crate::turfs::turf_callback_is_current(id, generation) {
 										continue;
 									}
-									let enemy_tile = ByondValue::new_ref(ValueType::Turf, id);
-									if diff > 5.0 {
-										let result = turf
-											.call_id(
-												byond_string!("consider_pressure_difference"),
-												&[enemy_tile, diff.into()],
-											)
-											.wrap_err("Processing consider pressure differences");
-										if let Err(error) = result {
-											first_error.get_or_insert(error);
+									for (id, generation, diff) in diffs {
+										if id == 0
+											|| !crate::turfs::turf_callback_is_current(
+												id, generation,
+											) {
+											continue;
 										}
-									} else if diff < -5.0 {
-										let result = enemy_tile
-											.call_id(
-												byond_string!("consider_pressure_difference"),
-												&[turf, (-diff).into()],
-											)
-											.wrap_err("Processing consider pressure differences");
-										if let Err(error) = result {
-											first_error.get_or_insert(error);
+										let enemy_tile = ByondValue::new_ref(ValueType::Turf, id);
+										if diff > 5.0 {
+											let result = turf
+												.call_id(
+													byond_string!("consider_pressure_difference"),
+													&[enemy_tile, diff.into()],
+												)
+												.wrap_err(
+													"Processing consider pressure differences",
+												);
+											if let Err(error) = result {
+												first_error.get_or_insert(error);
+											}
+										} else if diff < -5.0 {
+											let result = enemy_tile
+												.call_id(
+													byond_string!("consider_pressure_difference"),
+													&[turf, (-diff).into()],
+												)
+												.wrap_err(
+													"Processing consider pressure differences",
+												);
+											if let Err(error) = result {
+												first_error.get_or_insert(error);
+											}
 										}
 									}
 								}
-							}
-							first_error.map_or(Ok(()), Err)
-						}));
+								first_error.map_or(Ok(()), Err)
+							}),
+							owned_bytes,
+						);
 					}
 				}
 			});
@@ -583,33 +607,39 @@ fn post_process() {
 				let generation = tmix.generation;
 
 				if should_react {
-					auxcallback::queue_callback(Box::new(move || {
-						if !crate::turfs::turf_callback_is_current(id, generation) {
-							return Ok(());
-						}
-						let turf = ByondValue::new_ref(ValueType::Turf, id);
-						match turf.read_var_id(byond_string!("air")) {
-							Ok(air) if !air.is_null() => {
-								react_hook(air, turf).wrap_err("Reacting")?;
-								Ok(())
+					let _ = auxcallback::queue_callback(
+						Box::new(move || {
+							if !crate::turfs::turf_callback_is_current(id, generation) {
+								return Ok(());
 							}
-							//turf is no longer valid for reactions
-							_ => Ok(()),
-						}
-					}));
+							let turf = ByondValue::new_ref(ValueType::Turf, id);
+							match turf.read_var_id(byond_string!("air")) {
+								Ok(air) if !air.is_null() => {
+									react_hook(air, turf).wrap_err("Reacting")?;
+									Ok(())
+								}
+								//turf is no longer valid for reactions
+								_ => Ok(()),
+							}
+						}),
+						0,
+					);
 				}
 
 				if should_update_vis {
-					auxcallback::queue_callback(Box::new(move || {
-						if !crate::turfs::turf_callback_is_current(id, generation) {
-							return Ok(());
-						}
-						let turf = ByondValue::new_ref(ValueType::Turf, id);
+					let _ = auxcallback::queue_callback(
+						Box::new(move || {
+							if !crate::turfs::turf_callback_is_current(id, generation) {
+								return Ok(());
+							}
+							let turf = ByondValue::new_ref(ValueType::Turf, id);
 
-						//turf is checked for validity in update_visuals
-						update_visuals(turf).wrap_err("Updating Visuals")?;
-						Ok(())
-					}));
+							//turf is checked for validity in update_visuals
+							update_visuals(turf).wrap_err("Updating Visuals")?;
+							Ok(())
+						}),
+						0,
+					);
 				}
 			});
 	});

@@ -82,15 +82,19 @@ pub fn initialize_gases() {
 	MIXTURE_SLOT_HIGH_WATER.store(0, Ordering::Relaxed);
 }
 
+pub fn prepare_gases_for_world() {
+	if GAS_MIXTURES.read().is_none() || NEXT_GAS_IDS.read().is_none() {
+		initialize_gases();
+	}
+}
+
 pub fn shut_down_gases() {
 	#[cfg(feature = "turf_processing")]
 	crate::turfs::wait_for_tasks();
-	if let Some(gas_mixtures) = GAS_MIXTURES.write().as_mut() {
-		gas_mixtures.clear();
-	}
-	if let Some(next_gas_ids) = NEXT_GAS_IDS.write().as_mut() {
-		next_gas_ids.clear();
-	}
+	GAS_MIXTURES.write().take();
+	NEXT_GAS_IDS.write().take();
+	ACTIVE_MIXTURE_SLOTS.store(0, Ordering::Relaxed);
+	MIXTURE_SLOT_HIGH_WATER.store(0, Ordering::Relaxed);
 }
 
 #[cfg(all(test, feature = "katmos", feature = "superconductivity"))]
@@ -123,7 +127,9 @@ impl GasArena {
 		F: FnOnce(&Mixture) -> Result<T>,
 	{
 		let lock = GAS_MIXTURES.read();
-		let gas_mixtures = lock.as_ref().unwrap();
+		let gas_mixtures = lock
+			.as_ref()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
 		let mix = gas_mixtures
 			.get(id)
 			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {id} exists!"))?
@@ -140,7 +146,9 @@ impl GasArena {
 		F: FnOnce(&mut Mixture) -> Result<T>,
 	{
 		let lock = GAS_MIXTURES.read();
-		let gas_mixtures = lock.as_ref().unwrap();
+		let gas_mixtures = lock
+			.as_ref()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
 		let mut mix = gas_mixtures
 			.get(id)
 			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {id} exists!"))?
@@ -157,7 +165,9 @@ impl GasArena {
 		F: FnOnce(&Mixture, &Mixture) -> Result<T>,
 	{
 		let lock = GAS_MIXTURES.read();
-		let gas_mixtures = lock.as_ref().unwrap();
+		let gas_mixtures = lock
+			.as_ref()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
 		let src_gas = gas_mixtures
 			.get(src)
 			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?
@@ -178,7 +188,9 @@ impl GasArena {
 		F: FnOnce(&mut Mixture, &mut Mixture) -> Result<T>,
 	{
 		let lock = GAS_MIXTURES.read();
-		let gas_mixtures = lock.as_ref().unwrap();
+		let gas_mixtures = lock
+			.as_ref()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
 		let src_lock = gas_mixtures
 			.get(src)
 			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?;
@@ -206,7 +218,9 @@ impl GasArena {
 		F: FnOnce(&RwLock<Mixture>, &RwLock<Mixture>) -> Result<T>,
 	{
 		let lock = GAS_MIXTURES.read();
-		let gas_mixtures = lock.as_ref().unwrap();
+		let gas_mixtures = lock
+			.as_ref()
+			.ok_or_else(|| eyre::eyre!("Gas arena is not initialized"))?;
 		let src_lock = gas_mixtures
 			.get(src)
 			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?;
@@ -370,14 +384,19 @@ where
 /// # Panics
 /// if `GAS_MIXTURES` hasn't been initialized, somehow.
 pub fn amt_gases() -> usize {
-	GAS_MIXTURES.read().as_ref().unwrap().len() - NEXT_GAS_IDS.read().as_ref().unwrap().len()
+	let gas_mixtures = GAS_MIXTURES.read();
+	let next_gas_ids = NEXT_GAS_IDS.read();
+	match (gas_mixtures.as_ref(), next_gas_ids.as_ref()) {
+		(Some(gas_mixtures), Some(next_gas_ids)) => gas_mixtures.len() - next_gas_ids.len(),
+		_ => 0,
+	}
 }
 
 /// Gets the amount of gases that are allocated, but not necessarily active in byond.
 /// # Panics
 /// if `GAS_MIXTURES` hasn't been initialized, somehow.
 pub fn tot_gases() -> usize {
-	GAS_MIXTURES.read().as_ref().unwrap().len()
+	GAS_MIXTURES.read().as_ref().map_or(0, Vec::len)
 }
 
 pub(crate) fn gas_runtime_metrics() -> GasRuntimeMetrics {
@@ -416,7 +435,8 @@ pub(crate) fn gas_runtime_metrics() -> GasRuntimeMetrics {
 mod tests {
 	use super::{
 		ensure_distinct_mixture_slots, gas_runtime_metrics, gas_slot_from_number, initialize_gases,
-		GAS_TEST_LOCK,
+		prepare_gases_for_world, shut_down_gases, GasArena, GAS_MIXTURES, GAS_TEST_LOCK,
+		NEXT_GAS_IDS,
 	};
 
 	#[test]
@@ -443,5 +463,23 @@ mod tests {
 		assert_eq!(metrics.mixture_lock_bytes, 64);
 		assert_eq!(metrics.arena_capacity, 240_000);
 		assert_eq!(metrics.active_slots, 0);
+	}
+
+	#[test]
+	fn gas_arenas_are_released_and_recreated_for_world_reuse() {
+		let _guard = GAS_TEST_LOCK.lock().unwrap();
+		initialize_gases();
+		shut_down_gases();
+		assert!(GAS_MIXTURES.read().is_none());
+		assert!(NEXT_GAS_IDS.read().is_none());
+		let metrics = gas_runtime_metrics();
+		assert_eq!(metrics.arena_capacity, 0);
+		assert_eq!(metrics.active_slots, 0);
+		assert_eq!(metrics.slot_high_water, 0);
+		let error = GasArena::with_gas_mixture(0, |_| Ok(())).unwrap_err();
+		assert!(error.to_string().contains("not initialized"));
+
+		prepare_gases_for_world();
+		assert_eq!(gas_runtime_metrics().arena_capacity, 240_000);
 	}
 }

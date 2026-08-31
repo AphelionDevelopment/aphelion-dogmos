@@ -40,8 +40,16 @@ fn refresh_runtime_metrics() {
 		callbacks.items_enqueued as u64,
 	);
 	DOGMOS_TELEMETRY.set_metric(
-		RuntimeMetric::CallbackOwnedBytes,
-		callbacks.owned_bytes_current as u64,
+		RuntimeMetric::CallbackOwnedBytesLowerBoundCurrent,
+		callbacks.owned_bytes_lower_bound_current as u64,
+	);
+	DOGMOS_TELEMETRY.set_metric(
+		RuntimeMetric::CallbackOwnedBytesLowerBoundHighWater,
+		callbacks.owned_bytes_lower_bound_high_water as u64,
+	);
+	DOGMOS_TELEMETRY.set_metric(
+		RuntimeMetric::CallbackOwnedBytesLowerBoundEnqueued,
+		callbacks.owned_bytes_lower_bound_enqueued as u64,
 	);
 	DOGMOS_TELEMETRY.set_metric(
 		RuntimeMetric::CallbackQueueDepth,
@@ -345,7 +353,7 @@ fn dogmos_shutdown_hook() -> Result<ByondValue> {
 	#[cfg(feature = "turf_processing")]
 	{
 		#[cfg(feature = "superconductivity")]
-		crate::turfs::shutdown_turf_heat();
+		crate::turfs::shutdown_turf_heat()?;
 		crate::turfs::shutdown_turfs();
 	}
 	auxcallback::clean_callbacks();
