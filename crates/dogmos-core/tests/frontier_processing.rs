@@ -565,31 +565,34 @@ fn rejected_component_stage_aborts_and_retries_cleanly() {
 }
 
 #[test]
-fn chunked_turf_heat_processes_the_registered_heat_graph_outside_the_gas_frontier() {
+fn chunked_turf_heat_processes_only_hot_active_turfs_outside_the_gas_frontier() {
 	let active = turf(0, 1);
 	let inactive = turf(1, 1);
 	let mut world = DogmosWorld::new(1024 * 1024);
 	register_turfs(&mut world, &[active, inactive]);
-	let state = TurfHeatState {
-		temperature: 500.0,
+	let active_state = TurfHeatState {
+		temperature: 700.0,
 		thermal_conductivity: 1.0,
 		heat_capacity: 100.0,
 		adjacent_to_space: true,
+	};
+	let inactive_state = TurfHeatState {
+		temperature: 500.0,
+		..active_state
 	};
 	world
 		.apply_turf_heat(&[
 			TurfHeatMutation {
 				handle: active,
-				state: Some(state),
+				state: Some(active_state),
 			},
 			TurfHeatMutation {
 				handle: inactive,
-				state: Some(state),
+				state: Some(inactive_state),
 			},
 		])
 		.unwrap();
-	world.begin_frontier(1, 1).unwrap();
-	world.append_frontier(1, 0, &[active]).unwrap();
+	world.begin_frontier(1, 0).unwrap();
 	world.commit_frontier(1).unwrap();
 	let request = StageChunkRequest {
 		stage: WorldStage::TurfHeat,
@@ -610,8 +613,120 @@ fn chunked_turf_heat_processes_the_registered_heat_graph_outside_the_gas_frontie
 		}
 	}
 	assert!(completed);
-	assert_ne!(world.turf_heat(active).unwrap(), Some(state));
-	assert_ne!(world.turf_heat(inactive).unwrap(), Some(state));
+	assert_ne!(world.turf_heat(active).unwrap(), Some(active_state));
+	assert_eq!(world.turf_heat(inactive).unwrap(), Some(inactive_state));
+}
+
+#[test]
+fn chunked_turf_heat_drops_an_active_turf_after_an_authoritative_cool_update() {
+	let handle = turf(0, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &[handle]);
+	let hot = TurfHeatState {
+		temperature: 700.0,
+		thermal_conductivity: 1.0,
+		heat_capacity: 100.0,
+		adjacent_to_space: true,
+	};
+	let cool = TurfHeatState {
+		temperature: 300.0,
+		..hot
+	};
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle,
+			state: Some(hot),
+		}])
+		.unwrap();
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle,
+			state: Some(cool),
+		}])
+		.unwrap();
+	world.begin_frontier(1, 0).unwrap();
+	world.commit_frontier(1).unwrap();
+	let chunk = world
+		.process_stage_chunk_cancellable(
+			StageChunkRequest {
+				stage: WorldStage::TurfHeat,
+				frontier_epoch: 1,
+				stage_epoch: 1,
+				work_limit: 1,
+				seconds_per_tick: 0.5,
+			},
+			|| false,
+		)
+		.unwrap();
+
+	assert!(!chunk.pending);
+	assert_eq!(chunk.work_items, 0);
+	assert_eq!(world.turf_heat(handle).unwrap(), Some(cool));
+}
+
+#[test]
+fn turf_heat_active_storage_is_accounted_and_generation_safe() {
+	let first = turf(0, 1);
+	let replacement = turf(0, 2);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &[first]);
+	let hot = TurfHeatState {
+		temperature: 700.0,
+		thermal_conductivity: 1.0,
+		heat_capacity: 100.0,
+		adjacent_to_space: true,
+	};
+	let reusable_before = world.reusable_workset_bytes();
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle: first,
+			state: Some(hot),
+		}])
+		.unwrap();
+	assert!(
+		world.reusable_workset_bytes()
+			>= reusable_before + std::mem::size_of::<TurfHandle>() as u64
+	);
+	world
+		.apply_turf_lifecycle(&[
+			TurfLifecycleMutation::Unregister { handle: first },
+			TurfLifecycleMutation::Register {
+				handle: replacement,
+				mixture: None,
+			},
+		])
+		.unwrap();
+	let replacement_state = TurfHeatState {
+		temperature: 500.0,
+		..hot
+	};
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle: replacement,
+			state: Some(replacement_state),
+		}])
+		.unwrap();
+	world.begin_frontier(1, 0).unwrap();
+	world.commit_frontier(1).unwrap();
+	let chunk = world
+		.process_stage_chunk_cancellable(
+			StageChunkRequest {
+				stage: WorldStage::TurfHeat,
+				frontier_epoch: 1,
+				stage_epoch: 1,
+				work_limit: 1,
+				seconds_per_tick: 0.5,
+			},
+			|| false,
+		)
+		.unwrap();
+
+	assert!(!chunk.pending);
+	assert_eq!(chunk.work_items, 0);
+	assert_eq!(
+		world.turf_heat(replacement).unwrap(),
+		Some(replacement_state)
+	);
 }
 
 #[test]
