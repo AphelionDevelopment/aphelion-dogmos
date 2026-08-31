@@ -565,7 +565,7 @@ fn rejected_component_stage_aborts_and_retries_cleanly() {
 }
 
 #[test]
-fn chunked_turf_heat_is_confined_to_the_committed_frontier() {
+fn chunked_turf_heat_processes_the_registered_heat_graph_outside_the_gas_frontier() {
 	let active = turf(0, 1);
 	let inactive = turf(1, 1);
 	let mut world = DogmosWorld::new(1024 * 1024);
@@ -611,7 +611,7 @@ fn chunked_turf_heat_is_confined_to_the_committed_frontier() {
 	}
 	assert!(completed);
 	assert_ne!(world.turf_heat(active).unwrap(), Some(state));
-	assert_eq!(world.turf_heat(inactive).unwrap(), Some(state));
+	assert_ne!(world.turf_heat(inactive).unwrap(), Some(state));
 }
 
 #[test]

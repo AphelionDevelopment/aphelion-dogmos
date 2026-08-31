@@ -2373,7 +2373,11 @@ impl DogmosWorld {
 			Some(_) => {}
 		}
 
-		let frontier_len = u32::try_from(self.frontier.committed().len()).unwrap_or(u32::MAX);
+		let preparation_len = if request.stage == WorldStage::TurfHeat {
+			u32::try_from(self.turfs.len()).unwrap_or(u32::MAX)
+		} else {
+			u32::try_from(self.frontier.committed().len()).unwrap_or(u32::MAX)
+		};
 		if self
 			.stage_cursor
 			.as_ref()
@@ -2385,7 +2389,7 @@ impl DogmosWorld {
 		while self
 			.stage_cursor
 			.as_ref()
-			.is_some_and(|cursor| cursor.next_frontier_index < frontier_len)
+			.is_some_and(|cursor| cursor.next_frontier_index < preparation_len)
 			&& work_items < request.work_limit
 		{
 			if should_cancel() {
@@ -2396,12 +2400,20 @@ impl DogmosWorld {
 				.as_ref()
 				.expect("stage cursor was created")
 				.next_frontier_index;
-			if request.stage == WorldStage::ProcessTurfs {
+			if request.stage == WorldStage::TurfHeat {
+				let handle = self.turfs.get(index as usize).and_then(|slot| {
+					slot.turf.as_ref()?;
+					Some(TurfHandle {
+						slot: index,
+						generation: slot.generation?,
+					})
+				});
+				if let Some(handle) = handle {
+					self.prepare_stage_heat_turf(handle)?;
+				}
+			} else if request.stage == WorldStage::ProcessTurfs {
 				let handle = self.frontier.committed()[index as usize];
 				self.prepare_stage_diffusion_turf(handle)?;
-			} else if request.stage == WorldStage::TurfHeat {
-				let handle = self.frontier.committed()[index as usize];
-				self.prepare_stage_heat_turf(handle)?;
 			} else if request.stage == WorldStage::React {
 				let handle = self.frontier.committed()[index as usize];
 				self.prepare_stage_reaction_turf(handle);
@@ -2418,7 +2430,7 @@ impl DogmosWorld {
 				.next_frontier_index += 1;
 			work_items += 1;
 		}
-		let remaining_estimate = frontier_len.saturating_sub(
+		let remaining_estimate = preparation_len.saturating_sub(
 			self.stage_cursor
 				.as_ref()
 				.expect("stage cursor was created")
