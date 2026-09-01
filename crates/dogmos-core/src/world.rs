@@ -1184,13 +1184,6 @@ impl DogmosWorld {
 	}
 
 	pub fn apply_lifecycle(&mut self, mutations: &[LifecycleMutation]) -> Result<u32, WorldError> {
-		if self.stage_cursor.is_some() {
-			return Err(WorldError::StageConflict(
-				StageConflictReason::ActiveStageMutation {
-					operation: "apply mixture lifecycle",
-				},
-			));
-		}
 		let mut projected = BTreeMap::<u32, ProjectedSlot>::new();
 		let mut changed = false;
 		let mut required_slots = self.mixtures.len();
@@ -1204,6 +1197,19 @@ impl DogmosWorld {
 				.get(&mutation.handle.slot)
 				.copied()
 				.unwrap_or_else(|| self.projected_slot(mutation.handle.slot));
+			let conflicts_with_active_stage = match mutation.action {
+				LifecycleAction::Register => {
+					current.occupied && current.generation != Some(mutation.handle.generation)
+				}
+				LifecycleAction::Unregister => true,
+			};
+			if self.stage_cursor.is_some() && conflicts_with_active_stage {
+				return Err(WorldError::StageConflict(
+					StageConflictReason::ActiveStageMutation {
+						operation: "apply mixture lifecycle",
+					},
+				));
+			}
 			match mutation.action {
 				LifecycleAction::Register => {
 					if let Some(generation) = current.generation {
@@ -6470,6 +6476,111 @@ mod tests {
 			))
 		);
 		assert!(world.snapshot(left_mixture).is_ok());
+		assert_eq!(world.topology_revision(), topology_revision);
+	}
+
+	#[test]
+	fn mixture_lifecycle_allows_fresh_registration_during_active_stage() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let topology_revision = world.topology_revision();
+		let request = StageChunkRequest {
+			stage: WorldStage::ProcessTurfs,
+			frontier_epoch: 1,
+			stage_epoch: 1,
+			work_limit: 1,
+			seconds_per_tick: 0.5,
+		};
+		world.stage_cursor = Some(StageCursor::new(request, topology_revision));
+		let fresh_mixture = handle(0);
+
+		assert_eq!(
+			world.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: fresh_mixture,
+			}]),
+			Ok(1)
+		);
+		assert!(world.snapshot(fresh_mixture).is_ok());
+		assert_eq!(world.topology_revision(), topology_revision);
+	}
+
+	#[test]
+	fn mixture_lifecycle_allows_retired_slot_reuse_during_active_stage() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let original = handle(0);
+		world
+			.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: original,
+			}])
+			.unwrap();
+		world
+			.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Unregister,
+				handle: original,
+			}])
+			.unwrap();
+		let topology_revision = world.topology_revision();
+		let request = StageChunkRequest {
+			stage: WorldStage::ProcessTurfs,
+			frontier_epoch: 1,
+			stage_epoch: 1,
+			work_limit: 1,
+			seconds_per_tick: 0.5,
+		};
+		world.stage_cursor = Some(StageCursor::new(request, topology_revision));
+		let reused = MixtureHandle {
+			slot: original.slot,
+			generation: original.generation + 1,
+		};
+
+		assert_eq!(
+			world.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: reused,
+			}]),
+			Ok(1)
+		);
+		assert!(world.snapshot(reused).is_ok());
+		assert_eq!(world.topology_revision(), topology_revision);
+	}
+
+	#[test]
+	fn mixture_lifecycle_rejects_generation_replacement_during_active_stage() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let original = handle(0);
+		world
+			.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: original,
+			}])
+			.unwrap();
+		let topology_revision = world.topology_revision();
+		let request = StageChunkRequest {
+			stage: WorldStage::ProcessTurfs,
+			frontier_epoch: 1,
+			stage_epoch: 1,
+			work_limit: 1,
+			seconds_per_tick: 0.5,
+		};
+		world.stage_cursor = Some(StageCursor::new(request, topology_revision));
+		let replacement = MixtureHandle {
+			slot: original.slot,
+			generation: original.generation + 1,
+		};
+
+		assert_eq!(
+			world.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: replacement,
+			}]),
+			Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply mixture lifecycle",
+				},
+			))
+		);
+		assert!(world.snapshot(original).is_ok());
 		assert_eq!(world.topology_revision(), topology_revision);
 	}
 
