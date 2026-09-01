@@ -1184,6 +1184,13 @@ impl DogmosWorld {
 	}
 
 	pub fn apply_lifecycle(&mut self, mutations: &[LifecycleMutation]) -> Result<u32, WorldError> {
+		if self.stage_cursor.is_some() {
+			return Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply mixture lifecycle",
+				},
+			));
+		}
 		let mut projected = BTreeMap::<u32, ProjectedSlot>::new();
 		let mut changed = false;
 		let mut required_slots = self.mixtures.len();
@@ -6395,6 +6402,75 @@ mod tests {
 		assert!(world.stage_components.is_none());
 		assert!(world.stage_component_turfs.is_none());
 		assert!(!world.use_committed_frontier);
+	}
+
+	#[test]
+	fn mixture_lifecycle_rejects_active_stage_before_mutating_topology() {
+		let mut world = DogmosWorld::new(1024 * 1024);
+		let left_mixture = handle(0);
+		let right_mixture = handle(1);
+		world
+			.apply_lifecycle(&[
+				LifecycleMutation {
+					action: LifecycleAction::Register,
+					handle: left_mixture,
+				},
+				LifecycleMutation {
+					action: LifecycleAction::Register,
+					handle: right_mixture,
+				},
+			])
+			.unwrap();
+		let left_turf = TurfHandle {
+			slot: 0,
+			generation: 1,
+		};
+		let right_turf = TurfHandle {
+			slot: 1,
+			generation: 1,
+		};
+		world
+			.apply_turf_lifecycle(&[
+				TurfLifecycleMutation::Register {
+					handle: left_turf,
+					mixture: Some(left_mixture),
+				},
+				TurfLifecycleMutation::Register {
+					handle: right_turf,
+					mixture: Some(right_mixture),
+				},
+			])
+			.unwrap();
+		world
+			.apply_turf_adjacency(&[TurfAdjacencyMutation {
+				left: left_turf,
+				right: right_turf,
+				connected: true,
+			}])
+			.unwrap();
+		let topology_revision = world.topology_revision();
+		let request = StageChunkRequest {
+			stage: WorldStage::ProcessTurfs,
+			frontier_epoch: 1,
+			stage_epoch: 1,
+			work_limit: 1,
+			seconds_per_tick: 0.5,
+		};
+		world.stage_cursor = Some(StageCursor::new(request, topology_revision));
+
+		assert_eq!(
+			world.apply_lifecycle(&[LifecycleMutation {
+				action: LifecycleAction::Unregister,
+				handle: left_mixture,
+			}]),
+			Err(WorldError::StageConflict(
+				StageConflictReason::ActiveStageMutation {
+					operation: "apply mixture lifecycle",
+				},
+			))
+		);
+		assert!(world.snapshot(left_mixture).is_ok());
+		assert_eq!(world.topology_revision(), topology_revision);
 	}
 
 	#[test]

@@ -118,7 +118,7 @@ fn pipenet_reconcile_response_round_trips_handles_and_fixed_snapshots() {
 			volume: ScalarValue(2500.0),
 			minimum_heat_capacity: ScalarValue(0.0),
 			total_moles: ScalarValue(12.5),
-			pressure: ScalarValue(f64::from(12.171_243_75_f32)),
+			pressure: ScalarValue(f64::from(12.171_244_f32)),
 			heat_capacity: ScalarValue(250.0),
 			immutable: false,
 			gases,
@@ -140,10 +140,12 @@ fn oversized_dm_pipenet_response_fits_the_negotiated_control_buffer() {
 	const OVERSIZED_DM_PIPELINE_MIXTURES: usize = 228;
 	const PRODUCTION_CONTROL_PAYLOAD: usize = 64 * 1024;
 
-	assert!(
-		4 + OVERSIZED_DM_PIPELINE_MIXTURES * PIPENET_RECONCILE_SNAPSHOT_LEN
-			<= PRODUCTION_CONTROL_PAYLOAD
-	);
+	const {
+		assert!(
+			4 + OVERSIZED_DM_PIPELINE_MIXTURES * PIPENET_RECONCILE_SNAPSHOT_LEN
+				<= PRODUCTION_CONTROL_PAYLOAD
+		);
+	}
 }
 
 #[test]
