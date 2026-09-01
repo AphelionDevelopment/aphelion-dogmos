@@ -14,7 +14,7 @@ pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 2;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 10;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 11;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 176;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
@@ -22,6 +22,13 @@ pub const MAX_CALLBACK_EVENTS: u32 = 1024 * 1024;
 pub const MAX_GAS_SLOTS: usize = 32;
 pub const MIXTURE_SNAPSHOT_LEN: usize = 64 + MAX_GAS_SLOTS * 8;
 pub const MIXTURE_STATE_MUTATION_LEN: usize = 32 + MAX_GAS_SLOTS * 8;
+pub const MIXTURE_STATE_UPLOAD_BEGIN_REQUEST_LEN: usize = 8;
+pub const MIXTURE_STATE_UPLOAD_BEGIN_RESPONSE_LEN: usize = 8;
+pub const MIXTURE_STATE_UPLOAD_APPEND_HEADER_LEN: usize = 16;
+pub const MIXTURE_STATE_UPLOAD_APPEND_RESPONSE_LEN: usize = 4;
+pub const MIXTURE_STATE_UPLOAD_COMMIT_REQUEST_LEN: usize = 8;
+pub const MIXTURE_STATE_UPLOAD_COMMIT_RESPONSE_LEN: usize = 4;
+pub const MIXTURE_STATE_UPLOAD_ABORT_REQUEST_LEN: usize = 8;
 pub const LIFECYCLE_MUTATION_LEN: usize = 12;
 pub const ADJACENCY_MUTATION_LEN: usize = 24;
 pub const TURF_LIFECYCLE_MUTATION_LEN: usize = 24;
@@ -95,6 +102,10 @@ pub enum OperationKind {
 	FrontierCommit = 40,
 	FrontierAdd = 41,
 	FrontierRemove = 42,
+	MixtureStateUploadBegin = 43,
+	MixtureStateUploadAppend = 44,
+	MixtureStateUploadCommit = 45,
+	MixtureStateUploadAbort = 46,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +134,8 @@ pub enum ServiceErrorCode {
 	FrontierConflict = 21,
 	FrontierIncomplete = 22,
 	StageConflict = 23,
+	MixtureStateUploadConflict = 24,
+	MixtureStateUploadIncomplete = 25,
 }
 
 impl ServiceErrorCode {
@@ -160,6 +173,8 @@ impl ServiceErrorCode {
 			21 => Ok(Self::FrontierConflict),
 			22 => Ok(Self::FrontierIncomplete),
 			23 => Ok(Self::StageConflict),
+			24 => Ok(Self::MixtureStateUploadConflict),
+			25 => Ok(Self::MixtureStateUploadIncomplete),
 			actual => Err(ProtocolError::UnknownServiceErrorCode(actual)),
 		}
 	}
@@ -206,6 +221,10 @@ impl TryFrom<u16> for OperationKind {
 			40 => Ok(Self::FrontierCommit),
 			41 => Ok(Self::FrontierAdd),
 			42 => Ok(Self::FrontierRemove),
+			43 => Ok(Self::MixtureStateUploadBegin),
+			44 => Ok(Self::MixtureStateUploadAppend),
+			45 => Ok(Self::MixtureStateUploadCommit),
+			46 => Ok(Self::MixtureStateUploadAbort),
 			actual => Err(ProtocolError::UnknownOperationKind(actual)),
 		}
 	}
@@ -1312,6 +1331,209 @@ pub struct MixtureStateMutation {
 	pub gases: [ScalarValue; MAX_GAS_SLOTS],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureStateUploadBeginRequest {
+	pub expected_count: u32,
+}
+
+impl MixtureStateUploadBeginRequest {
+	pub fn encode(self) -> Result<[u8; MIXTURE_STATE_UPLOAD_BEGIN_REQUEST_LEN], ProtocolError> {
+		if self.expected_count == 0 {
+			return Err(ProtocolError::InvalidMixtureStateUploadCount(0));
+		}
+		let mut output = [0_u8; MIXTURE_STATE_UPLOAD_BEGIN_REQUEST_LEN];
+		output[0..4].copy_from_slice(&self.expected_count.to_le_bytes());
+		Ok(output)
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_STATE_UPLOAD_BEGIN_REQUEST_LEN)?;
+		let expected_count = read_u32(input, 0);
+		if expected_count == 0 {
+			return Err(ProtocolError::InvalidMixtureStateUploadCount(0));
+		}
+		let reserved = read_u32(input, 4);
+		if reserved != 0 {
+			return Err(ProtocolError::ReservedMixtureStateUploadField(reserved));
+		}
+		Ok(Self { expected_count })
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureStateUploadBeginResponse {
+	pub upload_id: u64,
+}
+
+impl MixtureStateUploadBeginResponse {
+	pub fn encode(self) -> Result<[u8; MIXTURE_STATE_UPLOAD_BEGIN_RESPONSE_LEN], ProtocolError> {
+		validate_mixture_state_upload_id(self.upload_id)?;
+		Ok(self.upload_id.to_le_bytes())
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_STATE_UPLOAD_BEGIN_RESPONSE_LEN)?;
+		let upload_id = read_u64(input, 0);
+		validate_mixture_state_upload_id(upload_id)?;
+		Ok(Self { upload_id })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixtureStateUploadAppendRequest {
+	pub upload_id: u64,
+	pub offset: u32,
+	pub mutations: Vec<MixtureStateMutation>,
+}
+
+impl MixtureStateUploadAppendRequest {
+	pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+		validate_mixture_state_upload_id(self.upload_id)?;
+		let count = checked_mixture_state_upload_count(self.mutations.len())?;
+		let mut output = Vec::with_capacity(
+			MIXTURE_STATE_UPLOAD_APPEND_HEADER_LEN
+				+ self.mutations.len() * MIXTURE_STATE_MUTATION_LEN,
+		);
+		output.extend_from_slice(&self.upload_id.to_le_bytes());
+		output.extend_from_slice(&self.offset.to_le_bytes());
+		output.extend_from_slice(&count.to_le_bytes());
+		encode_mixture_state_records(&self.mutations, &mut output)?;
+		Ok(output)
+	}
+
+	pub fn decode(input: &[u8], maximum: u32) -> Result<Self, ProtocolError> {
+		if input.len() < MIXTURE_STATE_UPLOAD_APPEND_HEADER_LEN {
+			return Err(ProtocolError::InvalidPayloadLength {
+				expected: MIXTURE_STATE_UPLOAD_APPEND_HEADER_LEN as u32,
+				actual: input.len() as u32,
+			});
+		}
+		let upload_id = read_u64(input, 0);
+		validate_mixture_state_upload_id(upload_id)?;
+		let count = read_u32(input, 12);
+		if count == 0 {
+			return Err(ProtocolError::InvalidMixtureStateUploadCount(0));
+		}
+		if count > maximum {
+			return Err(ProtocolError::OperationCountExceeded {
+				actual: count,
+				maximum,
+			});
+		}
+		let expected = MIXTURE_STATE_UPLOAD_APPEND_HEADER_LEN
+			.checked_add(
+				(count as usize)
+					.checked_mul(MIXTURE_STATE_MUTATION_LEN)
+					.ok_or(ProtocolError::InvalidPayloadLength {
+						expected: u32::MAX,
+						actual: input.len().min(u32::MAX as usize) as u32,
+					})?,
+			)
+			.ok_or(ProtocolError::InvalidPayloadLength {
+				expected: u32::MAX,
+				actual: input.len().min(u32::MAX as usize) as u32,
+			})?;
+		require_exact_len(input, expected)?;
+		Ok(Self {
+			upload_id,
+			offset: read_u32(input, 8),
+			mutations: decode_mixture_state_records(
+				&input[MIXTURE_STATE_UPLOAD_APPEND_HEADER_LEN..],
+				count,
+			)?,
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureStateUploadAppendResponse {
+	pub accepted_count: u32,
+}
+
+impl MixtureStateUploadAppendResponse {
+	pub fn encode(self) -> [u8; MIXTURE_STATE_UPLOAD_APPEND_RESPONSE_LEN] {
+		self.accepted_count.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_STATE_UPLOAD_APPEND_RESPONSE_LEN)?;
+		Ok(Self {
+			accepted_count: read_u32(input, 0),
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureStateUploadCommitRequest {
+	pub upload_id: u64,
+}
+
+impl MixtureStateUploadCommitRequest {
+	pub fn encode(self) -> [u8; MIXTURE_STATE_UPLOAD_COMMIT_REQUEST_LEN] {
+		self.upload_id.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_STATE_UPLOAD_COMMIT_REQUEST_LEN)?;
+		let upload_id = read_u64(input, 0);
+		validate_mixture_state_upload_id(upload_id)?;
+		Ok(Self { upload_id })
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureStateUploadCommitResponse {
+	pub committed_count: u32,
+}
+
+impl MixtureStateUploadCommitResponse {
+	pub fn encode(self) -> [u8; MIXTURE_STATE_UPLOAD_COMMIT_RESPONSE_LEN] {
+		self.committed_count.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_STATE_UPLOAD_COMMIT_RESPONSE_LEN)?;
+		Ok(Self {
+			committed_count: read_u32(input, 0),
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureStateUploadAbortRequest {
+	pub upload_id: u64,
+}
+
+impl MixtureStateUploadAbortRequest {
+	pub fn encode(self) -> [u8; MIXTURE_STATE_UPLOAD_ABORT_REQUEST_LEN] {
+		self.upload_id.to_le_bytes()
+	}
+
+	pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+		require_exact_len(input, MIXTURE_STATE_UPLOAD_ABORT_REQUEST_LEN)?;
+		let upload_id = read_u64(input, 0);
+		validate_mixture_state_upload_id(upload_id)?;
+		Ok(Self { upload_id })
+	}
+}
+
+fn validate_mixture_state_upload_id(upload_id: u64) -> Result<(), ProtocolError> {
+	if upload_id == 0 {
+		return Err(ProtocolError::InvalidMixtureStateUploadId);
+	}
+	Ok(())
+}
+
+fn checked_mixture_state_upload_count(count: usize) -> Result<u32, ProtocolError> {
+	if count == 0 {
+		return Err(ProtocolError::InvalidMixtureStateUploadCount(0));
+	}
+	u32::try_from(count).map_err(|_| ProtocolError::OperationCountExceeded {
+		actual: u32::MAX,
+		maximum: u32::MAX,
+	})
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MixtureAdjustment {
 	pub gas_id: u16,
@@ -1400,6 +1622,13 @@ pub fn encode_mixture_state_batch(
 	output.clear();
 	output.reserve(4 + entries.len() * MIXTURE_STATE_MUTATION_LEN);
 	output.extend_from_slice(&count.to_le_bytes());
+	encode_mixture_state_records(entries, output)
+}
+
+fn encode_mixture_state_records(
+	entries: &[MixtureStateMutation],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
 	for entry in entries {
 		output.extend_from_slice(&entry.handle.encode());
 		output.extend_from_slice(&entry.expected_revision.to_le_bytes());
@@ -1418,9 +1647,16 @@ pub fn decode_mixture_state_batch(
 	maximum: u32,
 ) -> Result<Vec<MixtureStateMutation>, ProtocolError> {
 	let count = validate_mixture_state_batch(input, maximum)?;
+	decode_mixture_state_records(&input[4..], count)
+}
+
+fn decode_mixture_state_records(
+	input: &[u8],
+	count: u32,
+) -> Result<Vec<MixtureStateMutation>, ProtocolError> {
 	let mut entries = Vec::with_capacity(count as usize);
 	for index in 0..count as usize {
-		let offset = 4 + index * MIXTURE_STATE_MUTATION_LEN;
+		let offset = index * MIXTURE_STATE_MUTATION_LEN;
 		let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
 		for (gas_index, value) in gases.iter_mut().enumerate() {
 			let gas_offset = offset + 32 + gas_index * 8;
@@ -2727,6 +2963,9 @@ pub enum ProtocolError {
 	},
 	UnknownLifecycleAction(u32),
 	ReservedMixtureStateField(u32),
+	InvalidMixtureStateUploadId,
+	InvalidMixtureStateUploadCount(u32),
+	ReservedMixtureStateUploadField(u32),
 	UnknownSimulationStage(u32),
 	InvalidStageWorkLimit(u32),
 	UnknownSimulationStageFlags(u32),

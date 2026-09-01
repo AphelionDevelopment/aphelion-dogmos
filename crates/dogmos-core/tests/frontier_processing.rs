@@ -412,7 +412,18 @@ fn stage_chunks_resume_only_an_identical_request_and_skip_tombstones() {
 	};
 	assert_eq!(
 		world.process_stage_chunk_cancellable(changed, || false),
-		Err(WorldError::StageConflict)
+		Err(WorldError::StageConflict(
+			dogmos_core::world::StageConflictReason::CursorIdentity {
+				requested_stage: WorldStage::ProcessTurfs,
+				requested_frontier_epoch: 1,
+				requested_stage_epoch: 8,
+				requested_seconds_per_tick_bits: 0.5_f64.to_bits(),
+				active_stage: WorldStage::ProcessTurfs,
+				active_frontier_epoch: 1,
+				active_stage_epoch: 7,
+				active_seconds_per_tick_bits: 0.5_f64.to_bits(),
+			}
+		))
 	);
 	let mut completed = false;
 	for _ in 0..4 {
@@ -443,9 +454,12 @@ fn stage_chunk_validates_frontier_epoch_and_work_limit() {
 		work_limit: 1,
 		seconds_per_tick: 0.5,
 	};
+	let error = world
+		.process_stage_chunk_cancellable(request, || false)
+		.unwrap_err();
 	assert_eq!(
-		world.process_stage_chunk_cancellable(request, || false),
-		Err(WorldError::StageConflict)
+		error.to_string(),
+		"stage conflict: requested frontier epoch 2, committed frontier epoch Some(1)"
 	);
 	assert_eq!(
 		world.process_stage_chunk_cancellable(
@@ -511,7 +525,18 @@ fn rejected_component_stage_aborts_and_retries_cleanly() {
 	};
 	assert_eq!(
 		world.process_stage_chunk_cancellable(retry, || false),
-		Err(WorldError::StageConflict)
+		Err(WorldError::StageConflict(
+			dogmos_core::world::StageConflictReason::CursorIdentity {
+				requested_stage: WorldStage::Equalize,
+				requested_frontier_epoch: 1,
+				requested_stage_epoch: 2,
+				requested_seconds_per_tick_bits: 0.5_f64.to_bits(),
+				active_stage: WorldStage::Equalize,
+				active_frontier_epoch: 1,
+				active_stage_epoch: 1,
+				active_seconds_per_tick_bits: 0.5_f64.to_bits(),
+			}
+		))
 	);
 	assert_eq!(world.pending_stage_epoch(), None);
 	for _ in 0..8 {
@@ -565,31 +590,34 @@ fn rejected_component_stage_aborts_and_retries_cleanly() {
 }
 
 #[test]
-fn chunked_turf_heat_is_confined_to_the_committed_frontier() {
+fn chunked_turf_heat_processes_only_hot_active_turfs_outside_the_gas_frontier() {
 	let active = turf(0, 1);
 	let inactive = turf(1, 1);
 	let mut world = DogmosWorld::new(1024 * 1024);
 	register_turfs(&mut world, &[active, inactive]);
-	let state = TurfHeatState {
-		temperature: 500.0,
+	let active_state = TurfHeatState {
+		temperature: 700.0,
 		thermal_conductivity: 1.0,
 		heat_capacity: 100.0,
 		adjacent_to_space: true,
+	};
+	let inactive_state = TurfHeatState {
+		temperature: 500.0,
+		..active_state
 	};
 	world
 		.apply_turf_heat(&[
 			TurfHeatMutation {
 				handle: active,
-				state: Some(state),
+				state: Some(active_state),
 			},
 			TurfHeatMutation {
 				handle: inactive,
-				state: Some(state),
+				state: Some(inactive_state),
 			},
 		])
 		.unwrap();
-	world.begin_frontier(1, 1).unwrap();
-	world.append_frontier(1, 0, &[active]).unwrap();
+	world.begin_frontier(1, 0).unwrap();
 	world.commit_frontier(1).unwrap();
 	let request = StageChunkRequest {
 		stage: WorldStage::TurfHeat,
@@ -610,8 +638,120 @@ fn chunked_turf_heat_is_confined_to_the_committed_frontier() {
 		}
 	}
 	assert!(completed);
-	assert_ne!(world.turf_heat(active).unwrap(), Some(state));
-	assert_eq!(world.turf_heat(inactive).unwrap(), Some(state));
+	assert_ne!(world.turf_heat(active).unwrap(), Some(active_state));
+	assert_eq!(world.turf_heat(inactive).unwrap(), Some(inactive_state));
+}
+
+#[test]
+fn chunked_turf_heat_drops_an_active_turf_after_an_authoritative_cool_update() {
+	let handle = turf(0, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &[handle]);
+	let hot = TurfHeatState {
+		temperature: 700.0,
+		thermal_conductivity: 1.0,
+		heat_capacity: 100.0,
+		adjacent_to_space: true,
+	};
+	let cool = TurfHeatState {
+		temperature: 300.0,
+		..hot
+	};
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle,
+			state: Some(hot),
+		}])
+		.unwrap();
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle,
+			state: Some(cool),
+		}])
+		.unwrap();
+	world.begin_frontier(1, 0).unwrap();
+	world.commit_frontier(1).unwrap();
+	let chunk = world
+		.process_stage_chunk_cancellable(
+			StageChunkRequest {
+				stage: WorldStage::TurfHeat,
+				frontier_epoch: 1,
+				stage_epoch: 1,
+				work_limit: 1,
+				seconds_per_tick: 0.5,
+			},
+			|| false,
+		)
+		.unwrap();
+
+	assert!(!chunk.pending);
+	assert_eq!(chunk.work_items, 0);
+	assert_eq!(world.turf_heat(handle).unwrap(), Some(cool));
+}
+
+#[test]
+fn turf_heat_active_storage_is_accounted_and_generation_safe() {
+	let first = turf(0, 1);
+	let replacement = turf(0, 2);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	register_turfs(&mut world, &[first]);
+	let hot = TurfHeatState {
+		temperature: 700.0,
+		thermal_conductivity: 1.0,
+		heat_capacity: 100.0,
+		adjacent_to_space: true,
+	};
+	let reusable_before = world.reusable_workset_bytes();
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle: first,
+			state: Some(hot),
+		}])
+		.unwrap();
+	assert!(
+		world.reusable_workset_bytes()
+			>= reusable_before + std::mem::size_of::<TurfHandle>() as u64
+	);
+	world
+		.apply_turf_lifecycle(&[
+			TurfLifecycleMutation::Unregister { handle: first },
+			TurfLifecycleMutation::Register {
+				handle: replacement,
+				mixture: None,
+			},
+		])
+		.unwrap();
+	let replacement_state = TurfHeatState {
+		temperature: 500.0,
+		..hot
+	};
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle: replacement,
+			state: Some(replacement_state),
+		}])
+		.unwrap();
+	world.begin_frontier(1, 0).unwrap();
+	world.commit_frontier(1).unwrap();
+	let chunk = world
+		.process_stage_chunk_cancellable(
+			StageChunkRequest {
+				stage: WorldStage::TurfHeat,
+				frontier_epoch: 1,
+				stage_epoch: 1,
+				work_limit: 1,
+				seconds_per_tick: 0.5,
+			},
+			|| false,
+		)
+		.unwrap();
+
+	assert!(!chunk.pending);
+	assert_eq!(chunk.work_items, 0);
+	assert_eq!(
+		world.turf_heat(replacement).unwrap(),
+		Some(replacement_state)
+	);
 }
 
 #[test]
@@ -1081,6 +1221,115 @@ fn equalize_never_exceeds_the_chunk_work_limit_and_preserves_the_event_transcrip
 			moles: 50.0,
 		}]
 	);
+}
+
+#[test]
+fn resumed_excited_groups_complete_before_deferred_topology_is_applied() {
+	const TURF_COUNT: usize = 128;
+	const WORK_LIMIT: u32 = 7;
+
+	let turfs = (0..TURF_COUNT)
+		.map(|slot| turf(slot as u32, 1))
+		.collect::<Vec<_>>();
+	let mixtures = (0..TURF_COUNT)
+		.map(|slot| mixture(slot as u32))
+		.collect::<Vec<_>>();
+	let mut world = DogmosWorld::new(16 * 1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(
+			&mixtures
+				.iter()
+				.map(|handle| LifecycleMutation {
+					action: LifecycleAction::Register,
+					handle: *handle,
+				})
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+	for (index, handle) in mixtures.iter().copied().enumerate() {
+		let mut gases = [0.0; MAX_GAS_SLOTS];
+		gases[0] = if index % 2 == 0 { 100.0 } else { 0.0 };
+		world
+			.apply_mixture_state(&[MixtureStateMutation {
+				handle,
+				expected_revision: 0,
+				temperature: 293.15,
+				volume: 2500.0,
+				gases,
+			}])
+			.unwrap();
+	}
+	world
+		.apply_turf_lifecycle(
+			&turfs
+				.iter()
+				.copied()
+				.zip(mixtures.iter().copied())
+				.map(|(handle, mixture)| TurfLifecycleMutation::Register {
+					handle,
+					mixture: Some(mixture),
+				})
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+	world
+		.apply_turf_adjacency(
+			&turfs
+				.windows(2)
+				.map(|pair| TurfAdjacencyMutation {
+					left: pair[0],
+					right: pair[1],
+					connected: true,
+				})
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+	world.begin_frontier(1, TURF_COUNT as u32).unwrap();
+	world.append_frontier(1, 0, &turfs).unwrap();
+	world.commit_frontier(1).unwrap();
+
+	let request = StageChunkRequest {
+		stage: WorldStage::ExcitedGroups,
+		frontier_epoch: 1,
+		stage_epoch: 1,
+		work_limit: WORK_LIMIT,
+		seconds_per_tick: 0.5,
+	};
+	let deferred_topology = TurfAdjacencyMutation {
+		left: turfs[TURF_COUNT / 2 - 1],
+		right: turfs[TURF_COUNT / 2],
+		connected: false,
+	};
+	let mut chunks = 0;
+	loop {
+		let chunk = world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap();
+		assert!(chunk.work_items <= WORK_LIMIT);
+		chunks += 1;
+		if !chunk.pending {
+			break;
+		}
+		assert!(chunks < 2048, "excited groups did not converge");
+	}
+	assert!(chunks > 2, "the regression must exercise resumed chunks");
+
+	assert_eq!(world.apply_turf_adjacency(&[deferred_topology]), Ok(1));
+	let next_request = StageChunkRequest {
+		stage_epoch: 2,
+		..request
+	};
+	for _ in 0..2048 {
+		if !world
+			.process_stage_chunk_cancellable(next_request, || false)
+			.unwrap()
+			.pending
+		{
+			return;
+		}
+	}
+	panic!("excited groups did not complete after deferred topology was applied");
 }
 
 #[test]

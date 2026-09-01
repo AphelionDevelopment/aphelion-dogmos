@@ -9,9 +9,13 @@ use dogmos_protocol::{
 	read_frame_into, write_frame, CallbackBatchRequest, ContinuationCommandRequest,
 	ContinuationResumeRequest, ContinuationToken, FrontierAppendResponse, FrontierBeginRequest,
 	FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse, FrontierMutateResponse,
-	HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest, OperationKind, ProtocolHeader,
-	ServiceErrorCode, SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest,
-	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
+	HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest,
+	MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
+	MixtureStateUploadAppendResponse, MixtureStateUploadBeginRequest,
+	MixtureStateUploadBeginResponse, MixtureStateUploadCommitRequest,
+	MixtureStateUploadCommitResponse, OperationKind, ProtocolHeader, ServiceErrorCode,
+	SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR,
+	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -325,7 +329,7 @@ fn handle_primary(
 				let snapshot = match service_state.snapshot(snapshot_request.handle) {
 					Ok(snapshot) => snapshot,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -342,7 +346,7 @@ fn handle_primary(
 				let snapshot = match service_state.turf_heat_snapshot(snapshot_request.turf) {
 					Ok(snapshot) => snapshot,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -357,7 +361,7 @@ fn handle_primary(
 				let response = match service_state.apply_mixture_command(command) {
 					Ok(response) => response,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -374,7 +378,7 @@ fn handle_primary(
 				let response = match service_state.apply_adjust_multiple(handle, &adjustments) {
 					Ok(response) => response,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -392,7 +396,7 @@ fn handle_primary(
 				{
 					Ok(response) => response,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -413,7 +417,7 @@ fn handle_primary(
 				) {
 					Ok(response) => response,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -430,7 +434,7 @@ fn handle_primary(
 				{
 					Ok(response) => response,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -443,7 +447,7 @@ fn handle_primary(
 					continue;
 				};
 				if let Err(error) = service_state.cancel_continuation(token) {
-					write_error_response(&mut stream, request, service_error_code(&error))?;
+					write_state_error_response(&mut stream, request, &error)?;
 					continue;
 				}
 				write_response(&mut stream, request, &[])?;
@@ -457,7 +461,7 @@ fn handle_primary(
 				let count = match service_state.install_gases(entries) {
 					Ok(count) => count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -472,7 +476,7 @@ fn handle_primary(
 				let count = match service_state.install_reactions(entries) {
 					Ok(count) => count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -490,7 +494,7 @@ fn handle_primary(
 				let operation_count = match service_state.apply_lifecycle(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -508,11 +512,94 @@ fn handle_primary(
 				let operation_count = match service_state.apply_mixture_state(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
 				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+			}
+			OperationKind::MixtureStateUploadBegin => {
+				let Ok(upload) = MixtureStateUploadBeginRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let upload_id = match service_state.begin_mixture_state_upload(
+					upload.expected_count,
+					expected.capacities.max_batch_operations,
+				) {
+					Ok(upload_id) => upload_id,
+					Err(error) => {
+						write_state_error_response(&mut stream, request, &error)?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&MixtureStateUploadBeginResponse { upload_id }.encode()?,
+				)?;
+			}
+			OperationKind::MixtureStateUploadAppend => {
+				let Ok(upload) = MixtureStateUploadAppendRequest::decode(
+					&payload[..payload_len],
+					expected.capacities.max_batch_operations,
+				) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let accepted_count = match service_state.append_mixture_state_upload(
+					upload.upload_id,
+					upload.offset,
+					&upload.mutations,
+				) {
+					Ok(count) => count,
+					Err(error) => {
+						write_state_error_response(&mut stream, request, &error)?;
+						continue;
+					}
+				};
+				write_response(
+					&mut stream,
+					request,
+					&MixtureStateUploadAppendResponse { accepted_count }.encode(),
+				)?;
+			}
+			OperationKind::MixtureStateUploadCommit => {
+				let Ok(upload) = MixtureStateUploadCommitRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let committed_count =
+					match service_state.commit_mixture_state_upload(upload.upload_id) {
+						Ok(count) => count,
+						Err(error) => {
+							write_state_error_response(&mut stream, request, &error)?;
+							continue;
+						}
+					};
+				write_response(
+					&mut stream,
+					request,
+					&MixtureStateUploadCommitResponse { committed_count }.encode(),
+				)?;
+			}
+			OperationKind::MixtureStateUploadAbort => {
+				let Ok(upload) = MixtureStateUploadAbortRequest::decode(&payload[..payload_len])
+				else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				if let Err(error) = service_state.abort_mixture_state_upload(upload.upload_id) {
+					write_state_error_response(&mut stream, request, &error)?;
+					continue;
+				}
+				write_response(&mut stream, request, &[])?;
 			}
 			OperationKind::AdjacencyBatch => {
 				let Ok(mutations) = decode_adjacency_batch(
@@ -526,7 +613,7 @@ fn handle_primary(
 				let operation_count = match service_state.apply_adjacency(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -544,7 +631,7 @@ fn handle_primary(
 				let operation_count = match service_state.apply_turf_lifecycle(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -562,7 +649,7 @@ fn handle_primary(
 				let operation_count = match service_state.apply_turf_adjacency(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -580,7 +667,7 @@ fn handle_primary(
 				let operation_count = match service_state.apply_turf_heat(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -598,7 +685,7 @@ fn handle_primary(
 				let operation_count = match service_state.apply_turf_heat_adjacency(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -626,9 +713,7 @@ fn handle_primary(
 				) {
 					Ok(result) => result,
 					Err(error) => {
-						let code = service_error_code(&error);
-						eprintln!("{}", service_error_diagnostic(request, code, &error));
-						write_error_response(&mut stream, request, code)?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -659,7 +744,7 @@ fn handle_primary(
 				if let Err(error) = service_state
 					.begin_frontier(frontier_request.epoch, frontier_request.expected_count)
 				{
-					write_error_response(&mut stream, request, service_error_code(&error))?;
+					write_state_error_response(&mut stream, request, &error)?;
 					continue;
 				}
 				write_response(
@@ -686,7 +771,7 @@ fn handle_primary(
 				) {
 					Ok(count) => count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -706,7 +791,7 @@ fn handle_primary(
 				let count = match service_state.commit_frontier(frontier_request.epoch) {
 					Ok(count) => count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -731,7 +816,7 @@ fn handle_primary(
 				let count = match service_state.add_frontier(header.epoch, &frontier_handles) {
 					Ok(count) => count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -752,7 +837,7 @@ fn handle_primary(
 				let count = match service_state.remove_frontier(header.epoch, &frontier_handles) {
 					Ok(count) => count,
 					Err(error) => {
-						write_error_response(&mut stream, request, service_error_code(&error))?;
+						write_state_error_response(&mut stream, request, &error)?;
 						continue;
 					}
 				};
@@ -797,7 +882,13 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		}
 		state::StateError::FrontierConflict => ServiceErrorCode::FrontierConflict,
 		state::StateError::FrontierIncomplete => ServiceErrorCode::FrontierIncomplete,
-		state::StateError::StageConflict => ServiceErrorCode::StageConflict,
+		state::StateError::StageConflict(_) => ServiceErrorCode::StageConflict,
+		state::StateError::MixtureStateUploadConflict => {
+			ServiceErrorCode::MixtureStateUploadConflict
+		}
+		state::StateError::MixtureStateUploadIncomplete => {
+			ServiceErrorCode::MixtureStateUploadIncomplete
+		}
 		state::StateError::ContinuationCapacityExceeded => {
 			ServiceErrorCode::ContinuationCapacityExceeded
 		}
@@ -821,6 +912,7 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		| state::StateError::CallbackOutputTooSmall
 		| state::StateError::CallbackSequenceExhausted
 		| state::StateError::ReactionTransactionIdExhausted
+		| state::StateError::MixtureStateUploadIdExhausted
 		| state::StateError::ContinuationIdExhausted
 		| state::StateError::ContinuationDeadlineExhausted => ServiceErrorCode::Internal,
 	}
@@ -840,6 +932,16 @@ fn service_error_diagnostic(
 		request.request_id,
 		operation,
 	)
+}
+
+fn write_state_error_response(
+	stream: &mut Stream,
+	request: ProtocolHeader,
+	error: &state::StateError,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+	let code = service_error_code(error);
+	eprintln!("{}", service_error_diagnostic(request, code, error));
+	write_error_response(stream, request, code)
 }
 
 fn write_response(

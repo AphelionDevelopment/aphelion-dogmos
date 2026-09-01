@@ -21,6 +21,7 @@ pub enum ClientError {
 		source: Box<ClientError>,
 		process_id: u32,
 		process_state: String,
+		service_diagnostic: Option<String>,
 	},
 	ConnectTimeout,
 	RequestTimeout,
@@ -35,10 +36,17 @@ impl fmt::Display for ClientError {
 				source,
 				process_id,
 				process_state,
-			} => write!(
-				formatter,
-				"{source}; dogmosd pid={process_id} status={process_state}"
-			),
+				service_diagnostic,
+			} => {
+				write!(
+					formatter,
+					"{source}; dogmosd pid={process_id} status={process_state}"
+				)?;
+				if let Some(diagnostic) = service_diagnostic {
+					write!(formatter, "; diagnostic={diagnostic}")?;
+				}
+				Ok(())
+			}
 			_ => write!(formatter, "{self:?}"),
 		}
 	}
@@ -518,11 +526,14 @@ mod tests {
 			source: Box::new(ClientError::Server(ServiceErrorCode::Internal)),
 			process_id: 42,
 			process_state: "running".into(),
+			service_diagnostic: Some(
+				"DOGMOS SERVICE ERROR: operation=SimulationStage detail=stage conflict".into(),
+			),
 		};
 
 		assert_eq!(
 			error.to_string(),
-			"Server(Internal); dogmosd pid=42 status=running"
+			"Server(Internal); dogmosd pid=42 status=running; diagnostic=DOGMOS SERVICE ERROR: operation=SimulationStage detail=stage conflict"
 		);
 	}
 }

@@ -4,8 +4,8 @@ Date: 2026-08-31
 
 ## Scope and source state
 
-This handoff records the uncommitted implementation of
-`docs/superpowers/plans/2026-08-30-performance-resource-resolution-plan.md` against source revision
+This handoff records the implementation of
+`docs/superpowers/plans/2026-08-30-performance-resource-resolution-plan.md` from base revision
 `d8dc92d8fd3d268abd89463c5818f174bf077b48`. No protected manifest, workflow, dependency,
 transport, release, generated-binding, or deployment file was changed.
 

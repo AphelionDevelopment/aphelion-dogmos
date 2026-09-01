@@ -189,6 +189,8 @@ fn service_error_codes_are_fixed_width_and_reject_unknown_values() {
 		ServiceErrorCode::FrontierConflict,
 		ServiceErrorCode::FrontierIncomplete,
 		ServiceErrorCode::StageConflict,
+		ServiceErrorCode::MixtureStateUploadConflict,
+		ServiceErrorCode::MixtureStateUploadIncomplete,
 	];
 	for (index, error) in errors.into_iter().enumerate() {
 		let expected = (index as u32 + 1).to_le_bytes();

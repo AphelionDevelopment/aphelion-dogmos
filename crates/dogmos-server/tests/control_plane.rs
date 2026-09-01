@@ -8,8 +8,10 @@ use dogmos_protocol::{
 	CallbackBatchRequest, CallbackEvent, CallbackScope, CapacityLimits, FrontierBeginRequest,
 	FrontierCommitRequest, GasMetadataRegistration, HandshakePayload, LifecycleAction,
 	LifecycleMutation, MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation,
-	OperationKind, ProtocolHeader, ScalarValue, ServiceErrorCode, ServiceTelemetry,
-	SimulationStage, SimulationStageRequest, TurfHeatMutation, TurfHeatSnapshot,
+	MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
+	MixtureStateUploadBeginRequest, MixtureStateUploadBeginResponse,
+	MixtureStateUploadCommitRequest, OperationKind, ProtocolHeader, ScalarValue, ServiceErrorCode,
+	ServiceTelemetry, SimulationStage, SimulationStageRequest, TurfHeatMutation, TurfHeatSnapshot,
 	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireGasFireRole, WireHandle,
 	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
 	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
@@ -395,6 +397,154 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 		),
 		Err(ClientError::Server(ServiceErrorCode::RevisionMismatch))
 	));
+
+	let upload_mutations = [
+		MixtureStateMutation {
+			handle: WireHandle {
+				slot: 0,
+				generation: 1,
+			},
+			expected_revision: 1,
+			temperature: ScalarValue(300.0),
+			volume: ScalarValue(2500.0),
+			gases: [ScalarValue(0.0); MAX_GAS_SLOTS],
+		},
+		MixtureStateMutation {
+			handle: WireHandle {
+				slot: 1,
+				generation: 1,
+			},
+			expected_revision: 1,
+			temperature: ScalarValue(301.0),
+			volume: ScalarValue(2500.0),
+			gases: [ScalarValue(0.0); MAX_GAS_SLOTS],
+		},
+	];
+	let mut upload_response = [0_u8; 8];
+	client
+		.round_trip_into(
+			OperationKind::MixtureStateUploadBegin,
+			&MixtureStateUploadBeginRequest { expected_count: 2 }
+				.encode()
+				.unwrap(),
+			&mut upload_response,
+		)
+		.unwrap();
+	let upload_id = MixtureStateUploadBeginResponse::decode(&upload_response)
+		.unwrap()
+		.upload_id;
+	let append = MixtureStateUploadAppendRequest {
+		upload_id,
+		offset: 0,
+		mutations: vec![upload_mutations[0]],
+	}
+	.encode()
+	.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::MixtureStateUploadAppend,
+			&append,
+			&mut processed,
+		)
+		.unwrap();
+	let mut first_snapshot = [0_u8; MIXTURE_SNAPSHOT_LEN];
+	client
+		.round_trip_into(
+			OperationKind::MixtureSnapshot,
+			&MixtureSnapshotRequest {
+				handle: upload_mutations[0].handle,
+			}
+			.encode(),
+			&mut first_snapshot,
+		)
+		.unwrap();
+	assert_eq!(
+		MixtureSnapshot::decode(&first_snapshot).unwrap().revision,
+		1
+	);
+	assert!(matches!(
+		client.round_trip_into(
+			OperationKind::MixtureStateUploadCommit,
+			&MixtureStateUploadCommitRequest { upload_id }.encode(),
+			&mut processed,
+		),
+		Err(ClientError::Server(
+			ServiceErrorCode::MixtureStateUploadIncomplete
+		))
+	));
+	let append = MixtureStateUploadAppendRequest {
+		upload_id,
+		offset: 1,
+		mutations: vec![upload_mutations[1]],
+	}
+	.encode()
+	.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::MixtureStateUploadAppend,
+			&append,
+			&mut processed,
+		)
+		.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::MixtureStateUploadCommit,
+			&MixtureStateUploadCommitRequest { upload_id }.encode(),
+			&mut processed,
+		)
+		.unwrap();
+	assert_eq!(u32::from_le_bytes(processed), 2);
+
+	client
+		.round_trip_into(
+			OperationKind::MixtureStateUploadBegin,
+			&MixtureStateUploadBeginRequest { expected_count: 2 }
+				.encode()
+				.unwrap(),
+			&mut upload_response,
+		)
+		.unwrap();
+	let upload_id = MixtureStateUploadBeginResponse::decode(&upload_response)
+		.unwrap()
+		.upload_id;
+	let append = MixtureStateUploadAppendRequest {
+		upload_id,
+		offset: 0,
+		mutations: vec![MixtureStateMutation {
+			expected_revision: 2,
+			temperature: ScalarValue(500.0),
+			..upload_mutations[0]
+		}],
+	}
+	.encode()
+	.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::MixtureStateUploadAppend,
+			&append,
+			&mut processed,
+		)
+		.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::MixtureStateUploadAbort,
+			&MixtureStateUploadAbortRequest { upload_id }.encode(),
+			&mut [],
+		)
+		.unwrap();
+	client
+		.round_trip_into(
+			OperationKind::MixtureSnapshot,
+			&MixtureSnapshotRequest {
+				handle: upload_mutations[0].handle,
+			}
+			.encode(),
+			&mut first_snapshot,
+		)
+		.unwrap();
+	let first_snapshot = MixtureSnapshot::decode(&first_snapshot).unwrap();
+	assert_eq!(first_snapshot.revision, 2);
+	assert_eq!(first_snapshot.temperature, ScalarValue(300.0));
 
 	let snapshot_request = MixtureSnapshotRequest {
 		handle: WireHandle {
