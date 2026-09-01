@@ -14,8 +14,8 @@ use dogmos_protocol::{
 	FRONTIER_APPEND_RESPONSE_LEN, FRONTIER_BEGIN_REQUEST_LEN, FRONTIER_BEGIN_RESPONSE_LEN,
 	FRONTIER_COMMIT_REQUEST_LEN, FRONTIER_COMMIT_RESPONSE_LEN, FRONTIER_MUTATE_HEADER_LEN,
 	FRONTIER_MUTATE_RESPONSE_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES,
-	MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN,
-	SIMULATION_STAGE_RESPONSE_LEN,
+	MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN,
+	PIPENET_RECONCILE_SNAPSHOT_LEN, SIMULATION_STAGE_REQUEST_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 
 fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -114,11 +114,11 @@ fn pipenet_reconcile_response_round_trips_handles_and_fixed_snapshots() {
 		snapshot: MixtureSnapshot {
 			revision: 19,
 			gas_count: 1,
-			temperature: ScalarValue(293.15),
+			temperature: ScalarValue(f64::from(293.15_f32)),
 			volume: ScalarValue(2500.0),
 			minimum_heat_capacity: ScalarValue(0.0),
 			total_moles: ScalarValue(12.5),
-			pressure: ScalarValue(12.171_243_75),
+			pressure: ScalarValue(f64::from(12.171_243_75_f32)),
 			heat_capacity: ScalarValue(250.0),
 			immutable: false,
 			gases,
@@ -126,12 +126,23 @@ fn pipenet_reconcile_response_round_trips_handles_and_fixed_snapshots() {
 	};
 	let mut encoded = Vec::new();
 	encode_pipenet_reconcile_response(&[entry], &mut encoded).unwrap();
-	assert_eq!(encoded.len(), 4 + 8 + MIXTURE_SNAPSHOT_LEN);
+	assert_eq!(encoded.len(), 4 + PIPENET_RECONCILE_SNAPSHOT_LEN);
 	assert_eq!(&encoded[0..4], &1_u32.to_le_bytes());
 	assert_eq!(&encoded[4..12], &entry.handle.encode());
 	assert_eq!(
 		decode_pipenet_reconcile_response(&encoded, 1).unwrap(),
 		[entry]
+	);
+}
+
+#[test]
+fn oversized_dm_pipenet_response_fits_the_negotiated_control_buffer() {
+	const OVERSIZED_DM_PIPELINE_MIXTURES: usize = 228;
+	const PRODUCTION_CONTROL_PAYLOAD: usize = 64 * 1024;
+
+	assert!(
+		4 + OVERSIZED_DM_PIPELINE_MIXTURES * PIPENET_RECONCILE_SNAPSHOT_LEN
+			<= PRODUCTION_CONTROL_PAYLOAD
 	);
 }
 

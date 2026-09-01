@@ -21,7 +21,7 @@ pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
 pub const MAX_CALLBACK_EVENTS: u32 = 1024 * 1024;
 pub const MAX_GAS_SLOTS: usize = 32;
 pub const MIXTURE_SNAPSHOT_LEN: usize = 64 + MAX_GAS_SLOTS * 8;
-pub const PIPENET_RECONCILE_SNAPSHOT_LEN: usize = 8 + MIXTURE_SNAPSHOT_LEN;
+pub const PIPENET_RECONCILE_SNAPSHOT_LEN: usize = 8 + 36 + MAX_GAS_SLOTS * 4;
 pub const MAX_PIPENET_RECONCILE_MIXTURES: usize =
 	(MAX_CONTROL_PAYLOAD as usize - 4) / PIPENET_RECONCILE_SNAPSHOT_LEN;
 pub const MIXTURE_STATE_MUTATION_LEN: usize = 32 + MAX_GAS_SLOTS * 8;
@@ -1370,7 +1370,7 @@ pub fn encode_pipenet_reconcile_response(
 	output.extend_from_slice(&count.to_le_bytes());
 	for entry in entries {
 		output.extend_from_slice(&entry.handle.encode());
-		output.extend_from_slice(&entry.snapshot.encode()?);
+		encode_pipenet_reconcile_snapshot(entry.snapshot, output)?;
 	}
 	Ok(())
 }
@@ -1385,12 +1385,58 @@ pub fn decode_pipenet_reconcile_response(
 		let offset = 4 + index * PIPENET_RECONCILE_SNAPSHOT_LEN;
 		entries.push(PipenetReconcileSnapshot {
 			handle: WireHandle::decode(&input[offset..offset + 8])?,
-			snapshot: MixtureSnapshot::decode(
+			snapshot: decode_pipenet_reconcile_snapshot(
 				&input[offset + 8..offset + PIPENET_RECONCILE_SNAPSHOT_LEN],
 			)?,
 		});
 	}
 	Ok(entries)
+}
+
+fn encode_pipenet_reconcile_snapshot(
+	snapshot: MixtureSnapshot,
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	validate_gas_count(snapshot.gas_count)?;
+	output.extend_from_slice(&snapshot.revision.to_le_bytes());
+	output.extend_from_slice(&snapshot.gas_count.to_le_bytes());
+	for scalar in [
+		snapshot.temperature,
+		snapshot.volume,
+		snapshot.minimum_heat_capacity,
+		snapshot.total_moles,
+		snapshot.pressure,
+		snapshot.heat_capacity,
+	] {
+		output.extend_from_slice(&encode_compact_scalar(scalar)?);
+	}
+	output.extend_from_slice(&u32::from(snapshot.immutable).to_le_bytes());
+	for gas in snapshot.gases {
+		output.extend_from_slice(&encode_compact_scalar(gas)?);
+	}
+	Ok(())
+}
+
+fn decode_pipenet_reconcile_snapshot(input: &[u8]) -> Result<MixtureSnapshot, ProtocolError> {
+	require_exact_len(input, PIPENET_RECONCILE_SNAPSHOT_LEN - 8)?;
+	let gas_count = read_u32(input, 4);
+	validate_gas_count(gas_count)?;
+	let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
+	for (index, gas) in gases.iter_mut().enumerate() {
+		*gas = decode_compact_scalar(input, 36 + index * 4)?;
+	}
+	Ok(MixtureSnapshot {
+		revision: read_u32(input, 0),
+		gas_count,
+		temperature: decode_compact_scalar(input, 8)?,
+		volume: decode_compact_scalar(input, 12)?,
+		minimum_heat_capacity: decode_compact_scalar(input, 16)?,
+		total_moles: decode_compact_scalar(input, 20)?,
+		pressure: decode_compact_scalar(input, 24)?,
+		heat_capacity: decode_compact_scalar(input, 28)?,
+		immutable: decode_boolean(read_u32(input, 32))?,
+		gases,
+	})
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3132,6 +3178,22 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 		input[offset + 6],
 		input[offset + 7],
 	])
+}
+
+fn encode_compact_scalar(value: ScalarValue) -> Result<[u8; 4], ProtocolError> {
+	let compact = value.0 as f32;
+	if !value.0.is_finite() || !compact.is_finite() {
+		return Err(ProtocolError::NonFiniteScalar);
+	}
+	Ok(compact.to_bits().to_le_bytes())
+}
+
+fn decode_compact_scalar(input: &[u8], offset: usize) -> Result<ScalarValue, ProtocolError> {
+	let value = f32::from_bits(read_u32(input, offset));
+	if !value.is_finite() {
+		return Err(ProtocolError::NonFiniteScalar);
+	}
+	Ok(ScalarValue(f64::from(value)))
 }
 
 fn decode_boolean(value: u32) -> Result<bool, ProtocolError> {
