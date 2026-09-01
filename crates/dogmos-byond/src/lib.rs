@@ -14,9 +14,10 @@ use dogmos_process_metrics::{
 	PROCESS_WORKING_SET_AVAILABLE,
 };
 use dogmos_protocol::{
-	decode_adjust_multiple_request, encode_adjust_multiple_request,
-	encode_continuation_adjust_multiple_request, encode_gas_metadata_batch, encode_lifecycle_batch,
-	encode_mixture_state_batch, encode_reaction_metadata_batch, encode_turf_adjacency_batch,
+	decode_adjust_multiple_request, decode_pipenet_reconcile_response,
+	encode_adjust_multiple_request, encode_continuation_adjust_multiple_request,
+	encode_gas_metadata_batch, encode_lifecycle_batch, encode_mixture_state_batch,
+	encode_pipenet_reconcile_request, encode_reaction_metadata_batch, encode_turf_adjacency_batch,
 	encode_turf_heat_adjacency_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
 	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CallbackScope,
 	ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
@@ -34,11 +35,12 @@ use dogmos_protocol::{
 	WireGasFireRole, WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution,
 	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
 	GAS_METADATA_RECORD_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS,
-	MIXTURE_ADJUSTMENT_LEN, MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN,
-	MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN,
-	REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN,
-	TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN,
-	TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
+	MAX_PIPENET_RECONCILE_MIXTURES, MIXTURE_ADJUSTMENT_LEN, MIXTURE_ADJUST_MULTIPLE_HEADER_LEN,
+	MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN,
+	MIXTURE_STATE_MUTATION_LEN, PIPENET_RECONCILE_SNAPSHOT_LEN, REACTION_METADATA_RECORD_LEN,
+	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN,
+	TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN,
+	TURF_LIFECYCLE_MUTATION_LEN,
 };
 use std::{
 	fs,
@@ -71,6 +73,7 @@ const PRODUCTION_MAX_BATCH_OPERATIONS: usize = 4096;
 const PRODUCTION_MAX_MIXTURE_ADJUSTMENTS: usize =
 	(BENCHMARK_CONTROL_PAYLOAD - MIXTURE_ADJUST_MULTIPLE_HEADER_LEN) / MIXTURE_ADJUSTMENT_LEN;
 const PRODUCTION_MIXTURE_STATE_FIELDS: usize = 6 + MAX_GAS_SLOTS;
+const PRODUCTION_PIPENET_RESPONSE_FIELDS: usize = 2 + 10 + MAX_GAS_SLOTS;
 const PRODUCTION_MAX_MIXTURE_STATE_MUTATIONS: usize =
 	(BENCHMARK_CONTROL_PAYLOAD - 4) / MIXTURE_STATE_MUTATION_LEN;
 const PRODUCTION_TURF_LIFECYCLE_FIELDS: usize = 6;
@@ -882,8 +885,16 @@ fn dogmos_mixture_snapshot(fields: ByondValue) -> eyre::Result<ByondValue> {
 #[doc(hidden)]
 pub fn decode_production_mixture_snapshot(response: &[u8]) -> eyre::Result<Vec<f32>> {
 	let snapshot = MixtureSnapshot::decode(response)?;
-	let revision_words = split_u32_words(snapshot.revision);
 	let mut fields = Vec::with_capacity(10 + MAX_GAS_SLOTS);
+	append_production_mixture_snapshot(&mut fields, snapshot)?;
+	Ok(fields)
+}
+
+fn append_production_mixture_snapshot(
+	fields: &mut Vec<f32>,
+	snapshot: MixtureSnapshot,
+) -> eyre::Result<()> {
+	let revision_words = split_u32_words(snapshot.revision);
 	fields.extend([
 		f32::from(revision_words[0]),
 		f32::from(revision_words[1]),
@@ -905,6 +916,76 @@ pub fn decode_production_mixture_snapshot(response: &[u8]) -> eyre::Result<Vec<f
 			"mixture snapshot gas",
 			index,
 		)?);
+	}
+	Ok(())
+}
+
+#[auxmacros::bind("/proc/dogmos_pipenet_reconcile")]
+fn dogmos_pipenet_reconcile(entries: ByondValue) -> eyre::Result<ByondValue> {
+	let values = bounded_number_list(
+		entries,
+		"pipenet reconcile",
+		MAX_PIPENET_RECONCILE_MIXTURES * 2,
+	)?;
+	let operation_count = values.len() / 2;
+	let request = encode_production_pipenet_reconcile(&values)?;
+	let response_capacity = 4 + operation_count * PIPENET_RECONCILE_SNAPSHOT_LEN;
+	let fields = production_request_with_response(
+		OperationKind::PipenetReconcile,
+		&request,
+		response_capacity,
+		decode_production_pipenet_reconcile,
+	)?;
+	let mut output = ByondValue::new_list()?;
+	for field in fields {
+		output.push_list(field.into())?;
+	}
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn encode_production_pipenet_reconcile(values: &[f32]) -> eyre::Result<Vec<u8>> {
+	if !values.len().is_multiple_of(2) {
+		return Err(eyre::eyre!(
+			"pipenet reconcile requires slot and generation pairs"
+		));
+	}
+	let operation_count = values.len() / 2;
+	if operation_count > MAX_PIPENET_RECONCILE_MIXTURES {
+		return Err(eyre::eyre!(
+			"pipenet reconcile contains {operation_count} mixtures, maximum {MAX_PIPENET_RECONCILE_MIXTURES}"
+		));
+	}
+	let handles = values
+		.as_chunks::<2>()
+		.0
+		.iter()
+		.enumerate()
+		.map(|(index, entry)| {
+			Ok(WireHandle {
+				slot: indexed(exact_u32(entry[0], "slot"), "pipenet reconcile", index)?,
+				generation: indexed(
+					exact_u32(entry[1], "generation"),
+					"pipenet reconcile",
+					index,
+				)?,
+			})
+		})
+		.collect::<eyre::Result<Vec<_>>>()?;
+	let mut output = Vec::with_capacity(4 + handles.len() * 8);
+	encode_pipenet_reconcile_request(&handles, &mut output)?;
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn decode_production_pipenet_reconcile(response: &[u8]) -> eyre::Result<Vec<f32>> {
+	let entries =
+		decode_pipenet_reconcile_response(response, MAX_PIPENET_RECONCILE_MIXTURES as u32)?;
+	let mut fields = Vec::with_capacity(entries.len() * PRODUCTION_PIPENET_RESPONSE_FIELDS);
+	for entry in entries {
+		fields.push(entry.handle.slot as f32);
+		fields.push(entry.handle.generation as f32);
+		append_production_mixture_snapshot(&mut fields, entry.snapshot)?;
 	}
 	Ok(fields)
 }
@@ -2830,13 +2911,14 @@ mod tests {
 	use super::{
 		callback_count_from_number, decode_production_callback_batch,
 		decode_production_continuation_token, decode_production_mixture_snapshot,
-		decode_production_service_telemetry, decode_production_simulation_stage,
-		decode_production_turf_heat_snapshot, diagnostic_bytes_from_number,
-		encode_dm_mixture_command, encode_production_continuation_adjust_multiple,
-		encode_production_continuation_command, encode_production_continuation_resume,
-		encode_production_frontier_append, encode_production_frontier_begin,
-		encode_production_gas_metadata, encode_production_mixture_adjust_multiple,
-		encode_production_mixture_lifecycle_batch, encode_production_mixture_state_batch,
+		decode_production_pipenet_reconcile, decode_production_service_telemetry,
+		decode_production_simulation_stage, decode_production_turf_heat_snapshot,
+		diagnostic_bytes_from_number, encode_dm_mixture_command,
+		encode_production_continuation_adjust_multiple, encode_production_continuation_command,
+		encode_production_continuation_resume, encode_production_frontier_append,
+		encode_production_frontier_begin, encode_production_gas_metadata,
+		encode_production_mixture_adjust_multiple, encode_production_mixture_lifecycle_batch,
+		encode_production_mixture_state_batch, encode_production_pipenet_reconcile,
 		encode_production_process_metrics, encode_production_reaction_metadata,
 		encode_production_simulation_stage, encode_production_turf_adjacency_batch,
 		encode_production_turf_heat_adjacency_batch, encode_production_turf_heat_batch,
@@ -2851,17 +2933,19 @@ mod tests {
 	use dogmos_protocol::{
 		decode_adjust_multiple_request, decode_continuation_adjust_multiple_request,
 		decode_gas_metadata_batch, decode_lifecycle_batch, decode_mixture_state_batch,
-		decode_reaction_metadata_batch, decode_turf_adjacency_batch,
-		decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
-		CallbackBatchHeader, CallbackEvent, CallbackEventKind, CallbackScope,
-		ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
-		FrontierBeginRequest, GasMetadataRegistration, LifecycleAction, LifecycleMutation,
-		MixtureAdjustment, MixtureCommandRequest, MixtureSnapshot, ReactionMetadataRegistration,
-		ScalarValue, ServiceTelemetry, SimulationStage, SimulationStageRequest,
-		SimulationStageResponse, TurfAdjacencyMutation, TurfHeatAdjacencyMutation,
-		TurfHeatMutation, TurfHeatSnapshot, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
-		WireGasFireRole, WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution,
-		MAX_GAS_SLOTS, SERVICE_PROCESS_ALL_AVAILABLE,
+		decode_pipenet_reconcile_request, decode_reaction_metadata_batch,
+		decode_turf_adjacency_batch, decode_turf_heat_adjacency_batch, decode_turf_heat_batch,
+		decode_turf_lifecycle_batch, encode_pipenet_reconcile_response, CallbackBatchHeader,
+		CallbackEvent, CallbackEventKind, CallbackScope, ContinuationCommandRequest,
+		ContinuationResumeRequest, ContinuationToken, FrontierBeginRequest,
+		GasMetadataRegistration, LifecycleAction, LifecycleMutation, MixtureAdjustment,
+		MixtureCommandRequest, MixtureSnapshot, PipenetReconcileSnapshot,
+		ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
+		SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
+		TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatState,
+		TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
+		WireGasRequirement, WireHandle, WireReactionExecution, MAX_GAS_SLOTS,
+		SERVICE_PROCESS_ALL_AVAILABLE,
 	};
 
 	fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -3276,6 +3360,53 @@ mod tests {
 		);
 		assert_eq!(fields[10], 1.25);
 		assert_eq!(fields[10 + 31], 9.5);
+	}
+
+	#[test]
+	fn production_pipenet_reconcile_preserves_duplicate_request_handles() {
+		let request =
+			encode_production_pipenet_reconcile(&[7.0, 11.0, 13.0, 17.0, 7.0, 11.0]).unwrap();
+		assert_eq!(
+			decode_pipenet_reconcile_request(&request, 3).unwrap(),
+			[handle(7, 11), handle(13, 17), handle(7, 11)]
+		);
+		assert!(encode_production_pipenet_reconcile(&[7.0]).is_err());
+	}
+
+	#[test]
+	fn production_pipenet_reconcile_flattens_handle_snapshot_records_for_dm() {
+		let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
+		gases[0] = ScalarValue(5.0);
+		let snapshot = MixtureSnapshot {
+			revision: 0x1234_5678,
+			gas_count: 1,
+			temperature: ScalarValue(450.0),
+			volume: ScalarValue(100.0),
+			minimum_heat_capacity: ScalarValue(0.0),
+			total_moles: ScalarValue(5.0),
+			pressure: ScalarValue(187.0),
+			heat_capacity: ScalarValue(100.0),
+			immutable: false,
+			gases,
+		};
+		let mut response = Vec::new();
+		encode_pipenet_reconcile_response(
+			&[PipenetReconcileSnapshot {
+				handle: handle(7, 11),
+				snapshot,
+			}],
+			&mut response,
+		)
+		.unwrap();
+
+		let fields = decode_production_pipenet_reconcile(&response).unwrap();
+		assert_eq!(fields.len(), 2 + 10 + MAX_GAS_SLOTS);
+		assert_eq!(
+			&fields[0..5],
+			&[7.0, 11.0, 0x5678 as f32, 0x1234 as f32, 1.0]
+		);
+		assert_eq!(fields[5], 450.0);
+		assert_eq!(fields[12], 5.0);
 	}
 
 	#[test]

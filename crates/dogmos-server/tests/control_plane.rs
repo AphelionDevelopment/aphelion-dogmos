@@ -2,20 +2,22 @@
 
 use dogmos_byond::{ClientError, DogmosClient};
 use dogmos_protocol::{
-	encode_adjacency_batch, encode_gas_metadata_batch, encode_lifecycle_batch,
-	encode_mixture_state_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
-	read_frame_into, write_frame, AdjacencyMutation, BuildIdentity, CallbackBatchHeader,
-	CallbackBatchRequest, CallbackEvent, CallbackScope, CapacityLimits, FrontierBeginRequest,
-	FrontierCommitRequest, GasMetadataRegistration, HandshakePayload, LifecycleAction,
-	LifecycleMutation, MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation,
-	MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
-	MixtureStateUploadBeginRequest, MixtureStateUploadBeginResponse,
-	MixtureStateUploadCommitRequest, OperationKind, ProtocolHeader, ScalarValue, ServiceErrorCode,
-	ServiceTelemetry, SimulationStage, SimulationStageRequest, TurfHeatMutation, TurfHeatSnapshot,
-	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireGasFireRole, WireHandle,
-	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
-	FLAG_ERROR, HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
-	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_HEAT_SNAPSHOT_LEN,
+	decode_pipenet_reconcile_response, encode_adjacency_batch, encode_gas_metadata_batch,
+	encode_lifecycle_batch, encode_mixture_state_batch, encode_pipenet_reconcile_request,
+	encode_turf_heat_batch, encode_turf_lifecycle_batch, read_frame_into, write_frame,
+	AdjacencyMutation, BuildIdentity, CallbackBatchHeader, CallbackBatchRequest, CallbackEvent,
+	CallbackScope, CapacityLimits, FrontierBeginRequest, FrontierCommitRequest,
+	GasMetadataRegistration, HandshakePayload, LifecycleAction, LifecycleMutation, MixtureSnapshot,
+	MixtureSnapshotRequest, MixtureStateMutation, MixtureStateUploadAbortRequest,
+	MixtureStateUploadAppendRequest, MixtureStateUploadBeginRequest,
+	MixtureStateUploadBeginResponse, MixtureStateUploadCommitRequest, OperationKind,
+	ProtocolHeader, ScalarValue, ServiceErrorCode, ServiceTelemetry, SimulationStage,
+	SimulationStageRequest, TurfHeatMutation, TurfHeatSnapshot, TurfHeatSnapshotRequest,
+	TurfHeatState, TurfLifecycleMutation, WireGasFireRole, WireHandle, CALLBACK_BATCH_HEADER_LEN,
+	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, FLAG_ERROR,
+	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
+	PIPENET_RECONCILE_SNAPSHOT_LEN, SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	TURF_HEAT_SNAPSHOT_LEN,
 };
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, Stream};
 use std::{
@@ -397,6 +399,39 @@ fn cross_process_handshake_echo_single_client_and_shutdown() {
 		),
 		Err(ClientError::Server(ServiceErrorCode::RevisionMismatch))
 	));
+
+	let pipenet_handles = [
+		WireHandle {
+			slot: 62,
+			generation: 1,
+		},
+		WireHandle {
+			slot: 63,
+			generation: 1,
+		},
+	];
+	let mut pipenet_request = Vec::new();
+	encode_pipenet_reconcile_request(
+		&[pipenet_handles[0], pipenet_handles[1], pipenet_handles[0]],
+		&mut pipenet_request,
+	)
+	.unwrap();
+	let mut pipenet_response = vec![0_u8; 4 + 2 * PIPENET_RECONCILE_SNAPSHOT_LEN];
+	let response_len = client
+		.round_trip_into(
+			OperationKind::PipenetReconcile,
+			&pipenet_request,
+			&mut pipenet_response,
+		)
+		.unwrap();
+	let snapshots =
+		decode_pipenet_reconcile_response(&pipenet_response[..response_len], 2).unwrap();
+	assert_eq!(snapshots.len(), 2);
+	assert_eq!(snapshots[0].handle, pipenet_handles[0]);
+	assert_eq!(snapshots[1].handle, pipenet_handles[1]);
+	assert_eq!(snapshots[0].snapshot.revision, 2);
+	assert_eq!(snapshots[0].snapshot.gases[0], ScalarValue(63.5));
+	assert_eq!(snapshots[1].snapshot.gases[0], ScalarValue(63.5));
 
 	let upload_mutations = [
 		MixtureStateMutation {

@@ -28,13 +28,13 @@ use dogmos_protocol::{
 	AdjacencyMutation, CallbackBatchHeader, CallbackEvent, CallbackEventKind, CallbackScope,
 	ContinuationToken, GasMetadataRegistration, LifecycleAction, LifecycleMutation,
 	MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot,
-	MixtureStateMutation, ReactionMetadataRegistration, ScalarValue, ServiceTelemetry,
-	SimulationStage, TurfAdjacencyMutation, TurfDestructionReason, TurfHeatAdjacencyMutation,
-	TurfHeatMutation, TurfHeatSnapshot, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
-	WireGasFireRole, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
-	CALLBACK_EVENT_KIND_COUNT, CALLBACK_EVENT_LEN, CONTINUATION_TICK_MILLIS,
-	DEFAULT_CONTINUATION_TIMEOUT_TICKS, MAX_GAS_SLOTS, SERVICE_PROCESS_CPU_AVAILABLE,
-	SERVICE_PROCESS_RSS_AVAILABLE,
+	MixtureStateMutation, PipenetReconcileSnapshot, ReactionMetadataRegistration, ScalarValue,
+	ServiceTelemetry, SimulationStage, TurfAdjacencyMutation, TurfDestructionReason,
+	TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatState,
+	TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireHandle, WireReactionExecution,
+	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_KIND_COUNT, CALLBACK_EVENT_LEN,
+	CONTINUATION_TICK_MILLIS, DEFAULT_CONTINUATION_TIMEOUT_TICKS, MAX_GAS_SLOTS,
+	SERVICE_PROCESS_CPU_AVAILABLE, SERVICE_PROCESS_RSS_AVAILABLE,
 };
 use std::{
 	collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1109,6 +1109,33 @@ impl ServiceState {
 			immutable: mixture.immutable,
 			gases,
 		})
+	}
+
+	pub fn reconcile_pipenet(
+		&mut self,
+		handles: &[WireHandle],
+	) -> Result<Vec<PipenetReconcileSnapshot>, StateError> {
+		let mut core_handles = Vec::new();
+		core_handles
+			.try_reserve_exact(handles.len())
+			.map_err(|_| StateError::AllocationFailed)?;
+		core_handles.extend(handles.iter().copied().map(core_handle));
+		let reconciled = self
+			.world
+			.reconcile_pipenet(&core_handles)
+			.map_err(map_world_error)?;
+		let mut snapshots = Vec::new();
+		snapshots
+			.try_reserve_exact(reconciled.len())
+			.map_err(|_| StateError::AllocationFailed)?;
+		for handle in reconciled {
+			let handle = wire_handle(handle);
+			snapshots.push(PipenetReconcileSnapshot {
+				handle,
+				snapshot: self.snapshot(handle)?,
+			});
+		}
+		Ok(snapshots)
 	}
 
 	pub fn turf_heat_snapshot(&self, handle: WireHandle) -> Result<TurfHeatSnapshot, StateError> {
@@ -2412,135 +2439,6 @@ mod tests {
 		WireHandle { slot, generation }
 	}
 
-	fn equalize_room_to_space_state(callback_capacity: u32) -> (ServiceState, MixtureHandle) {
-		let room_mixture = MixtureHandle {
-			slot: 0,
-			generation: 1,
-		};
-		let space_mixture = MixtureHandle {
-			slot: 1,
-			generation: 1,
-		};
-		let room_turf = TurfHandle {
-			slot: 0,
-			generation: 1,
-		};
-		let space_turf = TurfHandle {
-			slot: 1,
-			generation: 1,
-		};
-		let mut state = ServiceState::new(1024 * 1024, callback_capacity);
-		state
-			.world
-			.apply_lifecycle(&[
-				CoreLifecycleMutation {
-					action: CoreLifecycleAction::Register,
-					handle: room_mixture,
-				},
-				CoreLifecycleMutation {
-					action: CoreLifecycleAction::Register,
-					handle: space_mixture,
-				},
-			])
-			.unwrap();
-		let mut room_gases = [0.0; MAX_GAS_SLOTS];
-		room_gases[0] = 100.0;
-		state
-			.world
-			.apply_mixture_state(&[
-				CoreMixtureStateMutation {
-					handle: room_mixture,
-					expected_revision: 0,
-					temperature: 293.15,
-					volume: 2500.0,
-					gases: room_gases,
-				},
-				CoreMixtureStateMutation {
-					handle: space_mixture,
-					expected_revision: 0,
-					temperature: 293.15,
-					volume: 2500.0,
-					gases: [0.0; MAX_GAS_SLOTS],
-				},
-			])
-			.unwrap();
-		state
-			.world
-			.apply_command(Command::MarkImmutable {
-				handle: space_mixture,
-			})
-			.unwrap();
-		state
-			.world
-			.apply_turf_lifecycle(&[
-				TurfLifecycleMutation::Register {
-					handle: room_turf,
-					mixture: Some(room_mixture),
-				},
-				TurfLifecycleMutation::Register {
-					handle: space_turf,
-					mixture: Some(space_mixture),
-				},
-			])
-			.unwrap();
-		state
-			.world
-			.apply_turf_adjacency(&[TurfAdjacencyMutation {
-				left: room_turf,
-				right: space_turf,
-				connected: true,
-			}])
-			.unwrap();
-		state.world.begin_frontier(1, 2).unwrap();
-		state
-			.world
-			.append_frontier(1, 0, &[room_turf, space_turf])
-			.unwrap();
-		state.world.commit_frontier(1).unwrap();
-		(state, room_mixture)
-	}
-
-	fn dm_reaction_state() -> (ServiceState, WireHandle, WireHandle) {
-		let mixture = handle(0, 1);
-		let holder = handle(41, 9);
-		let mut state = ServiceState::new_for_world(1024 * 1024, 8, 1, 1, 7);
-		state
-			.install_gases(vec![GasMetadataRegistration {
-				id: 0,
-				key: "o2".into(),
-				name: "Oxygen".into(),
-				flags: 0,
-				specific_heat: ScalarValue(20.0),
-				fusion_power: ScalarValue(0.0),
-				moles_visible: None,
-				enthalpy: ScalarValue(0.0),
-				fire_radiation_released: ScalarValue(0.0),
-				fire_role: WireGasFireRole::None,
-				fire_products: None,
-			}])
-			.unwrap();
-		state
-			.install_reactions(vec![ReactionMetadataRegistration {
-				id: 0,
-				key: "dm".into(),
-				priority: ScalarValue(1.0),
-				minimum_temperature: None,
-				maximum_temperature: None,
-				minimum_energy: None,
-				minimum_fire_reagents: None,
-				gas_requirements: Vec::new(),
-				execution: WireReactionExecution::Dm,
-			}])
-			.unwrap();
-		state
-			.apply_lifecycle(&[LifecycleMutation {
-				action: LifecycleAction::Register,
-				handle: mixture,
-			}])
-			.unwrap();
-		(state, mixture, holder)
-	}
-
 	#[test]
 	fn mixture_state_upload_is_invisible_until_complete_commit() {
 		let mut state = ServiceState::new(1024 * 1024, 8);
@@ -2634,6 +2532,65 @@ mod tests {
 		state
 			.abort_mixture_state_upload(replacement_upload)
 			.unwrap();
+	}
+
+	#[test]
+	fn pipenet_reconcile_returns_final_snapshots_in_first_seen_order() {
+		let handles = [handle(0, 1), handle(1, 1)];
+		let mut state = ServiceState::new(1024 * 1024, 8);
+		state
+			.install_gases(vec![GasMetadataRegistration {
+				id: 0,
+				key: "o2".into(),
+				name: "Oxygen".into(),
+				flags: 0,
+				specific_heat: ScalarValue(20.0),
+				fusion_power: ScalarValue(0.0),
+				moles_visible: None,
+				enthalpy: ScalarValue(0.0),
+				fire_radiation_released: ScalarValue(0.0),
+				fire_role: WireGasFireRole::None,
+				fire_products: None,
+			}])
+			.unwrap();
+		state
+			.apply_lifecycle(&handles.map(|handle| LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle,
+			}))
+			.unwrap();
+		let mutation = |handle, temperature, volume| {
+			let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
+			gases[0] = ScalarValue(10.0);
+			MixtureStateMutation {
+				handle,
+				expected_revision: 0,
+				temperature: ScalarValue(temperature),
+				volume: ScalarValue(volume),
+				gases,
+			}
+		};
+		state
+			.apply_mixture_state(&[
+				mutation(handles[0], 300.0, 100.0),
+				mutation(handles[1], 600.0, 300.0),
+			])
+			.unwrap();
+
+		let snapshots = state
+			.reconcile_pipenet(&[handles[0], handles[1], handles[0]])
+			.unwrap();
+		assert_eq!(
+			snapshots
+				.iter()
+				.map(|entry| entry.handle)
+				.collect::<Vec<_>>(),
+			handles
+		);
+		assert_eq!(snapshots[0].snapshot.revision, 2);
+		assert_eq!(snapshots[0].snapshot.temperature, ScalarValue(450.0));
+		assert_eq!(snapshots[0].snapshot.gases[0], ScalarValue(5.0));
+		assert_eq!(snapshots[1].snapshot.gases[0], ScalarValue(15.0));
 	}
 
 	fn equalize_room_to_space_state(callback_capacity: u32) -> (ServiceState, MixtureHandle) {

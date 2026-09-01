@@ -57,6 +57,9 @@
 /proc/dogmos_mixture_state_batch(entries)
 	return call_ext(DOGMOS, "byond:dogmos_mixture_state_batch_ffi")(entries)
 
+/proc/dogmos_pipenet_reconcile(entries)
+	return call_ext(DOGMOS, "byond:dogmos_pipenet_reconcile_ffi")(entries)
+
 /proc/dogmos_process_metrics()
 	return call_ext(DOGMOS, "byond:dogmos_process_metrics_ffi")()
 

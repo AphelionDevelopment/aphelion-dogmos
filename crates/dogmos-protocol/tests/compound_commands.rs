@@ -1,18 +1,21 @@
 use dogmos_protocol::{
 	decode_adjacency_batch, decode_frontier_append_into, decode_frontier_mutate_into,
-	decode_lifecycle_batch, decode_mixture_state_batch, encode_mixture_state_batch,
-	AdjacencyMutation, FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest,
-	FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest,
-	FrontierMutateResponse, LifecycleAction, LifecycleMutation, MixtureCommandResponse,
-	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, MixtureStateUploadAbortRequest,
+	decode_lifecycle_batch, decode_mixture_state_batch, decode_pipenet_reconcile_request,
+	decode_pipenet_reconcile_response, encode_mixture_state_batch,
+	encode_pipenet_reconcile_request, encode_pipenet_reconcile_response, AdjacencyMutation,
+	FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
+	FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest, FrontierMutateResponse,
+	LifecycleAction, LifecycleMutation, MixtureCommandResponse, MixtureSnapshot,
+	MixtureSnapshotRequest, MixtureStateMutation, MixtureStateUploadAbortRequest,
 	MixtureStateUploadAppendRequest, MixtureStateUploadBeginRequest,
-	MixtureStateUploadCommitRequest, OperationKind, ProtocolError, ScalarValue, SimulationStage,
-	SimulationStageRequest, SimulationStageResponse, WireHandle, ADJACENCY_MUTATION_LEN,
-	DOGMOS_PROTOCOL_VERSION, FRONTIER_APPEND_HEADER_LEN, FRONTIER_APPEND_RESPONSE_LEN,
-	FRONTIER_BEGIN_REQUEST_LEN, FRONTIER_BEGIN_RESPONSE_LEN, FRONTIER_COMMIT_REQUEST_LEN,
-	FRONTIER_COMMIT_RESPONSE_LEN, FRONTIER_MUTATE_HEADER_LEN, FRONTIER_MUTATE_RESPONSE_LEN,
-	LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN,
-	MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	MixtureStateUploadCommitRequest, OperationKind, PipenetReconcileSnapshot, ProtocolError,
+	ScalarValue, SimulationStage, SimulationStageRequest, SimulationStageResponse, WireHandle,
+	ADJACENCY_MUTATION_LEN, DOGMOS_PROTOCOL_VERSION, FRONTIER_APPEND_HEADER_LEN,
+	FRONTIER_APPEND_RESPONSE_LEN, FRONTIER_BEGIN_REQUEST_LEN, FRONTIER_BEGIN_RESPONSE_LEN,
+	FRONTIER_COMMIT_REQUEST_LEN, FRONTIER_COMMIT_RESPONSE_LEN, FRONTIER_MUTATE_HEADER_LEN,
+	FRONTIER_MUTATE_RESPONSE_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES,
+	MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN, SIMULATION_STAGE_REQUEST_LEN,
+	SIMULATION_STAGE_RESPONSE_LEN,
 };
 
 fn handle(slot: u32, generation: u32) -> WireHandle {
@@ -41,7 +44,7 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 #[test]
 fn compound_operation_ids_are_stable() {
-	assert_eq!(DOGMOS_PROTOCOL_VERSION, 11);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 12);
 	assert_eq!(OperationKind::MixtureSnapshot as u16, 18);
 	assert_eq!(OperationKind::MixtureLifecycleBatch as u16, 19);
 	assert_eq!(OperationKind::AdjacencyBatch as u16, 20);
@@ -61,6 +64,7 @@ fn compound_operation_ids_are_stable() {
 	assert_eq!(OperationKind::MixtureStateUploadAppend as u16, 44);
 	assert_eq!(OperationKind::MixtureStateUploadCommit as u16, 45);
 	assert_eq!(OperationKind::MixtureStateUploadAbort as u16, 46);
+	assert_eq!(OperationKind::PipenetReconcile as u16, 47);
 	assert_eq!(OperationKind::MixtureCommand as u16, 28);
 	assert_eq!(OperationKind::GasMetadataInstall as u16, 29);
 	assert_eq!(OperationKind::ReactionMetadataInstall as u16, 30);
@@ -72,6 +76,62 @@ fn compound_operation_ids_are_stable() {
 	assert_eq!(
 		OperationKind::try_from(21),
 		Ok(OperationKind::SimulationStage)
+	);
+}
+
+#[test]
+fn pipenet_reconcile_request_has_an_exact_counted_handle_layout() {
+	let handles = [handle(7, 11), handle(13, 17)];
+	let mut encoded = Vec::new();
+	encode_pipenet_reconcile_request(&handles, &mut encoded).unwrap();
+	assert_eq!(
+		encoded,
+		decode_hex_fixture(
+			"02 00 00 00
+			 07 00 00 00 0b 00 00 00
+			 0d 00 00 00 11 00 00 00"
+		)
+	);
+	assert_eq!(
+		decode_pipenet_reconcile_request(&encoded, 2).unwrap(),
+		handles
+	);
+	assert_eq!(
+		decode_pipenet_reconcile_request(&encoded, 1),
+		Err(ProtocolError::OperationCountExceeded {
+			actual: 2,
+			maximum: 1,
+		})
+	);
+}
+
+#[test]
+fn pipenet_reconcile_response_round_trips_handles_and_fixed_snapshots() {
+	let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
+	gases[0] = ScalarValue(12.5);
+	let entry = PipenetReconcileSnapshot {
+		handle: handle(7, 11),
+		snapshot: MixtureSnapshot {
+			revision: 19,
+			gas_count: 1,
+			temperature: ScalarValue(293.15),
+			volume: ScalarValue(2500.0),
+			minimum_heat_capacity: ScalarValue(0.0),
+			total_moles: ScalarValue(12.5),
+			pressure: ScalarValue(12.171_243_75),
+			heat_capacity: ScalarValue(250.0),
+			immutable: false,
+			gases,
+		},
+	};
+	let mut encoded = Vec::new();
+	encode_pipenet_reconcile_response(&[entry], &mut encoded).unwrap();
+	assert_eq!(encoded.len(), 4 + 8 + MIXTURE_SNAPSHOT_LEN);
+	assert_eq!(&encoded[0..4], &1_u32.to_le_bytes());
+	assert_eq!(&encoded[4..12], &entry.handle.encode());
+	assert_eq!(
+		decode_pipenet_reconcile_response(&encoded, 1).unwrap(),
+		[entry]
 	);
 }
 

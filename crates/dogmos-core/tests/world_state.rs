@@ -146,6 +146,77 @@ fn mixture_state_matches_legacy_temperature_and_volume_bounds() {
 }
 
 #[test]
+fn pipenet_reconcile_deduplicates_and_preserves_moles_and_thermal_energy() {
+	let first = handle(0, 1);
+	let second = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: first,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: second,
+			},
+		])
+		.unwrap();
+	let mut first_state = state(first, 0, 10.0);
+	first_state.temperature = 300.0;
+	first_state.volume = 100.0;
+	let mut second_state = state(second, 0, 10.0);
+	second_state.temperature = 600.0;
+	second_state.volume = 300.0;
+	world
+		.apply_mixture_state(&[first_state, second_state])
+		.unwrap();
+
+	assert_eq!(
+		world.reconcile_pipenet(&[first, second, first]).unwrap(),
+		[first, second]
+	);
+	let first_after = world.snapshot(first).unwrap();
+	let second_after = world.snapshot(second).unwrap();
+	assert_eq!(first_after.revision, 2);
+	assert_eq!(second_after.revision, 2);
+	assert_eq!(first_after.temperature, 450.0);
+	assert_eq!(second_after.temperature, 450.0);
+	assert_eq!(first_after.gases[0], 5.0);
+	assert_eq!(second_after.gases[0], 15.0);
+	assert_eq!(first_after.gases[0] + second_after.gases[0], 20.0);
+	assert_eq!(
+		first_after.temperature * first_after.heat_capacity
+			+ second_after.temperature * second_after.heat_capacity,
+		180_000.0
+	);
+}
+
+#[test]
+fn pipenet_reconcile_validates_every_handle_before_mutating() {
+	let mixture = handle(0, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle: mixture,
+		}])
+		.unwrap();
+	world
+		.apply_mixture_state(&[state(mixture, 0, 10.0)])
+		.unwrap();
+	let before = world.snapshot(mixture).unwrap();
+
+	assert!(matches!(
+		world.reconcile_pipenet(&[mixture, handle(1, 9)]),
+		Err(WorldError::UnknownHandle(_))
+	));
+	assert_eq!(world.snapshot(mixture).unwrap(), before);
+}
+
+#[test]
 fn world_owns_generation_checked_mixtures_adjacency_and_stage_state() {
 	let mut world = DogmosWorld::new(1024 * 1024);
 	assert_eq!(

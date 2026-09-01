@@ -1710,6 +1710,68 @@ impl DogmosWorld {
 		Ok(mutations.len() as u32)
 	}
 
+	pub fn reconcile_pipenet(
+		&mut self,
+		handles: &[MixtureHandle],
+	) -> Result<Vec<MixtureHandle>, WorldError> {
+		let mut unique_handles = Vec::new();
+		unique_handles
+			.try_reserve_exact(handles.len())
+			.map_err(|_| WorldError::AllocationFailed)?;
+		let mut seen = BTreeSet::new();
+		for handle in handles {
+			if !seen.insert(*handle) {
+				continue;
+			}
+			let mixture = self.require_handle(*handle)?;
+			if !mixture.immutable && mixture.revision == u32::MAX {
+				return Err(WorldError::RevisionExhausted(*handle));
+			}
+			unique_handles.push(*handle);
+		}
+
+		let mut total_gases = [0.0; MAX_GAS_SLOTS];
+		let mut total_thermal_energy = 0.0;
+		let mut total_heat_capacity = 0.0;
+		let mut volume_sum = 0.0;
+		for handle in &unique_handles {
+			let mixture = self.require_handle(*handle)?;
+			let heat_capacity = self.heat_capacity(mixture)?;
+			volume_sum += mixture.volume;
+			total_heat_capacity += heat_capacity;
+			total_thermal_energy += mixture.temperature * heat_capacity;
+			for (total, amount) in total_gases.iter_mut().zip(mixture.gases) {
+				*total += amount;
+			}
+		}
+		if volume_sum == 0.0 {
+			return Ok(unique_handles);
+		}
+
+		let equalized_temperature = if total_heat_capacity == 0.0 {
+			MINIMUM_TEMPERATURE_K
+		} else {
+			(total_thermal_energy / total_heat_capacity).max(MINIMUM_TEMPERATURE_K)
+		};
+		let mut mutations = Vec::new();
+		mutations
+			.try_reserve_exact(unique_handles.len())
+			.map_err(|_| WorldError::AllocationFailed)?;
+		for handle in &unique_handles {
+			let mixture = self.require_handle(*handle)?;
+			let volume_ratio = mixture.volume / volume_sum;
+			mutations.push(MixtureStateMutation {
+				handle: *handle,
+				expected_revision: mixture.revision,
+				temperature: equalized_temperature,
+				volume: mixture.volume,
+				gases: total_gases.map(|amount| amount * volume_ratio),
+			});
+		}
+		self.apply_mixture_state(&mutations)?;
+		Ok(unique_handles)
+	}
+
 	pub fn apply_command(&mut self, command: Command) -> Result<CommandResult, WorldError> {
 		match command {
 			Command::Snapshot { handle } => Ok(CommandResult::Snapshot(self.snapshot(handle)?)),

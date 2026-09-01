@@ -8,7 +8,7 @@ use dogmos_protocol::{
 fn service_telemetry_operation_and_layout_are_stable() {
 	assert_eq!(OperationKind::ServiceTelemetry as u16, 36);
 	assert_eq!(CALLBACK_EVENT_KIND_COUNT, 8);
-	assert_eq!(DOGMOS_PROTOCOL_VERSION, 11);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 12);
 	assert_eq!(SERVICE_TELEMETRY_LEN, 368);
 	assert_eq!(SERVICE_PROCESS_RSS_AVAILABLE, 1);
 	assert_eq!(SERVICE_PROCESS_CPU_AVAILABLE, 2);

@@ -4,18 +4,18 @@ use dogmos_protocol::{
 	decode_adjacency_batch, decode_adjust_multiple_request,
 	decode_continuation_adjust_multiple_request, decode_frontier_append_into,
 	decode_frontier_mutate_into, decode_gas_metadata_batch, decode_lifecycle_batch,
-	decode_mixture_state_batch, decode_reaction_metadata_batch, decode_turf_adjacency_batch,
-	decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
-	read_frame_into, write_frame, CallbackBatchRequest, ContinuationCommandRequest,
-	ContinuationResumeRequest, ContinuationToken, FrontierAppendResponse, FrontierBeginRequest,
-	FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse, FrontierMutateResponse,
-	HandshakePayload, MixtureCommandRequest, MixtureSnapshotRequest,
-	MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
+	decode_mixture_state_batch, decode_pipenet_reconcile_request, decode_reaction_metadata_batch,
+	decode_turf_adjacency_batch, decode_turf_heat_adjacency_batch, decode_turf_heat_batch,
+	decode_turf_lifecycle_batch, encode_pipenet_reconcile_response, read_frame_into, write_frame,
+	CallbackBatchRequest, ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
+	FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse, FrontierCommitRequest,
+	FrontierCommitResponse, FrontierMutateResponse, HandshakePayload, MixtureCommandRequest,
+	MixtureSnapshotRequest, MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
 	MixtureStateUploadAppendResponse, MixtureStateUploadBeginRequest,
 	MixtureStateUploadBeginResponse, MixtureStateUploadCommitRequest,
 	MixtureStateUploadCommitResponse, OperationKind, ProtocolHeader, ServiceErrorCode,
 	SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR,
-	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD,
+	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_PIPENET_RECONCILE_MIXTURES,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -334,6 +334,29 @@ fn handle_primary(
 					}
 				};
 				let response = snapshot.encode()?;
+				write_response(&mut stream, request, &response)?;
+			}
+			OperationKind::PipenetReconcile => {
+				let Ok(handles) = decode_pipenet_reconcile_request(
+					&payload[..payload_len],
+					expected
+						.capacities
+						.max_batch_operations
+						.min(MAX_PIPENET_RECONCILE_MIXTURES as u32),
+				) else {
+					service_state.record_protocol_error();
+					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					continue;
+				};
+				let snapshots = match service_state.reconcile_pipenet(&handles) {
+					Ok(snapshots) => snapshots,
+					Err(error) => {
+						write_state_error_response(&mut stream, request, &error)?;
+						continue;
+					}
+				};
+				let mut response = Vec::new();
+				encode_pipenet_reconcile_response(&snapshots, &mut response)?;
 				write_response(&mut stream, request, &response)?;
 			}
 			OperationKind::TurfHeatSnapshot => {

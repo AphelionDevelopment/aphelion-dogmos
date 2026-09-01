@@ -14,13 +14,16 @@ pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 2;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 11;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 12;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 176;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
 pub const MAX_CALLBACK_EVENTS: u32 = 1024 * 1024;
 pub const MAX_GAS_SLOTS: usize = 32;
 pub const MIXTURE_SNAPSHOT_LEN: usize = 64 + MAX_GAS_SLOTS * 8;
+pub const PIPENET_RECONCILE_SNAPSHOT_LEN: usize = 8 + MIXTURE_SNAPSHOT_LEN;
+pub const MAX_PIPENET_RECONCILE_MIXTURES: usize =
+	(MAX_CONTROL_PAYLOAD as usize - 4) / PIPENET_RECONCILE_SNAPSHOT_LEN;
 pub const MIXTURE_STATE_MUTATION_LEN: usize = 32 + MAX_GAS_SLOTS * 8;
 pub const MIXTURE_STATE_UPLOAD_BEGIN_REQUEST_LEN: usize = 8;
 pub const MIXTURE_STATE_UPLOAD_BEGIN_RESPONSE_LEN: usize = 8;
@@ -106,6 +109,7 @@ pub enum OperationKind {
 	MixtureStateUploadAppend = 44,
 	MixtureStateUploadCommit = 45,
 	MixtureStateUploadAbort = 46,
+	PipenetReconcile = 47,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +229,7 @@ impl TryFrom<u16> for OperationKind {
 			44 => Ok(Self::MixtureStateUploadAppend),
 			45 => Ok(Self::MixtureStateUploadCommit),
 			46 => Ok(Self::MixtureStateUploadAbort),
+			47 => Ok(Self::PipenetReconcile),
 			actual => Err(ProtocolError::UnknownOperationKind(actual)),
 		}
 	}
@@ -1320,6 +1325,72 @@ impl MixtureSnapshot {
 			gases,
 		})
 	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PipenetReconcileSnapshot {
+	pub handle: WireHandle,
+	pub snapshot: MixtureSnapshot,
+}
+
+pub fn encode_pipenet_reconcile_request(
+	handles: &[WireHandle],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	let count = checked_encode_count(handles.len())?;
+	output.clear();
+	output.reserve(4 + handles.len() * 8);
+	output.extend_from_slice(&count.to_le_bytes());
+	for handle in handles {
+		output.extend_from_slice(&handle.encode());
+	}
+	Ok(())
+}
+
+pub fn decode_pipenet_reconcile_request(
+	input: &[u8],
+	maximum: u32,
+) -> Result<Vec<WireHandle>, ProtocolError> {
+	let count = validate_counted_payload(input, 8, maximum)?;
+	let mut handles = Vec::with_capacity(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * 8;
+		handles.push(WireHandle::decode(&input[offset..offset + 8])?);
+	}
+	Ok(handles)
+}
+
+pub fn encode_pipenet_reconcile_response(
+	entries: &[PipenetReconcileSnapshot],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	let count = checked_encode_count(entries.len())?;
+	output.clear();
+	output.reserve(4 + entries.len() * PIPENET_RECONCILE_SNAPSHOT_LEN);
+	output.extend_from_slice(&count.to_le_bytes());
+	for entry in entries {
+		output.extend_from_slice(&entry.handle.encode());
+		output.extend_from_slice(&entry.snapshot.encode()?);
+	}
+	Ok(())
+}
+
+pub fn decode_pipenet_reconcile_response(
+	input: &[u8],
+	maximum: u32,
+) -> Result<Vec<PipenetReconcileSnapshot>, ProtocolError> {
+	let count = validate_counted_payload(input, PIPENET_RECONCILE_SNAPSHOT_LEN, maximum)?;
+	let mut entries = Vec::with_capacity(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * PIPENET_RECONCILE_SNAPSHOT_LEN;
+		entries.push(PipenetReconcileSnapshot {
+			handle: WireHandle::decode(&input[offset..offset + 8])?,
+			snapshot: MixtureSnapshot::decode(
+				&input[offset + 8..offset + PIPENET_RECONCILE_SNAPSHOT_LEN],
+			)?,
+		});
+	}
+	Ok(entries)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
