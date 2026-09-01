@@ -274,11 +274,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let diffusion_stage_response = SimulationStageResponse::decode(&stage_response)?;
 	if decode_production_simulation_stage(&stage_response)?
 		!= [
-			2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+			4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 		] {
 		return Err("cross-bitness production stage response ABI changed".into());
 	}
-	if diffusion_stage_response.work_items != 2 || diffusion_stage_response.callback_events != 0 {
+	if diffusion_stage_response.work_items != 4 || diffusion_stage_response.callback_events != 0 {
 		return Err("cross-bitness turf stage result changed".into());
 	}
 	client.round_trip_into(
