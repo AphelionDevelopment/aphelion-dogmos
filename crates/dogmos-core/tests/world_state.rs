@@ -42,6 +42,22 @@ fn oxygen() -> GasMetadata {
 	}
 }
 
+fn nitrogen() -> GasMetadata {
+	GasMetadata {
+		id: GasId(1),
+		key: "n2".into(),
+		name: "Nitrogen".into(),
+		flags: 0,
+		specific_heat: 20.0,
+		fusion_power: 0.0,
+		moles_visible: None,
+		enthalpy: 0.0,
+		fire_radiation_released: 0.0,
+		fire_role: GasFireRole::None,
+		fire_products: None,
+	}
+}
+
 #[test]
 fn turf_heat_snapshot_is_generation_checked_and_reports_absence() {
 	let mut world = DogmosWorld::new(1024 * 1024);
@@ -121,6 +137,218 @@ fn mixture_state_batches_reject_invalid_physical_values() {
 		Err(WorldError::InvalidMixtureState)
 	);
 	assert_eq!(world.snapshot(handle(0, 1)).unwrap().revision, 0);
+}
+
+#[test]
+fn mixture_state_canonicalizes_sub_centimole_traces() {
+	let trace = handle(0, 1);
+	let minimum = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: trace,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: minimum,
+			},
+		])
+		.unwrap();
+
+	world
+		.apply_mixture_state(&[state(trace, 0, 0.0099), state(minimum, 0, 0.01)])
+		.unwrap();
+
+	assert_eq!(world.snapshot(trace).unwrap().gases[0], 0.0);
+	assert_eq!(world.snapshot(minimum).unwrap().gases[0], 0.01);
+	world
+		.apply_command(Command::AdjustMoles {
+			handle: minimum,
+			gas: GasId(0),
+			delta: -0.0001,
+		})
+		.unwrap();
+	assert_eq!(world.snapshot(minimum).unwrap().gases[0], 0.0);
+}
+
+#[test]
+fn pipenet_reconcile_sinks_sub_centimole_components() {
+	let first = handle(0, 1);
+	let second = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: first,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: second,
+			},
+		])
+		.unwrap();
+	world
+		.apply_mixture_state(&[state(first, 0, 0.01), state(second, 0, 0.0)])
+		.unwrap();
+
+	world.reconcile_pipenet(&[first, second]).unwrap();
+
+	assert_eq!(world.snapshot(first).unwrap().gases[0], 0.0);
+	assert_eq!(world.snapshot(second).unwrap().gases[0], 0.0);
+}
+
+#[test]
+fn sub_centimole_delta_accumulates_into_a_calculated_component() {
+	let mixture = handle(0, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle: mixture,
+		}])
+		.unwrap();
+	world
+		.apply_mixture_state(&[state(mixture, 0, 0.01)])
+		.unwrap();
+
+	world
+		.apply_command(Command::AdjustMolesTemperature {
+			handle: mixture,
+			gas: GasId(0),
+			amount: 0.005,
+			temperature: 293.15,
+		})
+		.unwrap();
+
+	assert_eq!(world.snapshot(mixture).unwrap().gases[0], 0.015);
+}
+
+#[test]
+fn sunk_transfer_trace_does_not_heat_unrelated_destination_gas() {
+	let source = handle(0, 1);
+	let destination = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen(), nitrogen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: source,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: destination,
+			},
+		])
+		.unwrap();
+	let mut source_state = state(source, 0, 0.015);
+	source_state.temperature = 600.0;
+	let mut destination_state = state(destination, 0, 0.0);
+	destination_state.gases[1] = 1.0;
+	destination_state.temperature = 300.0;
+	world
+		.apply_mixture_state(&[source_state, destination_state])
+		.unwrap();
+
+	world
+		.apply_command(Command::TransferRatio {
+			source,
+			destination,
+			ratio: 0.5,
+		})
+		.unwrap();
+
+	let destination_after = world.snapshot(destination).unwrap();
+	assert_eq!(destination_after.gases[0], 0.0);
+	assert_eq!(destination_after.temperature, 300.0);
+}
+
+#[test]
+fn sunk_selected_gas_trace_does_not_heat_unrelated_destination_gas() {
+	let source = handle(0, 1);
+	let destination = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen(), nitrogen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: source,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: destination,
+			},
+		])
+		.unwrap();
+	let mut source_state = state(source, 0, 0.015);
+	source_state.temperature = 600.0;
+	let mut destination_state = state(destination, 0, 0.0);
+	destination_state.gases[1] = 1.0;
+	destination_state.temperature = 300.0;
+	world
+		.apply_mixture_state(&[source_state, destination_state])
+		.unwrap();
+
+	world
+		.apply_command(Command::TransferGases {
+			source,
+			destination,
+			ratio: 0.5,
+			gases: vec![GasId(0)].into_boxed_slice(),
+		})
+		.unwrap();
+
+	let destination_after = world.snapshot(destination).unwrap();
+	assert_eq!(destination_after.gases[0], 0.0);
+	assert_eq!(destination_after.temperature, 300.0);
+}
+
+#[test]
+fn sub_centimole_hot_trace_does_not_activate_turf_heat() {
+	let mixture = handle(0, 1);
+	let turf = turf_handle(0, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[LifecycleMutation {
+			action: LifecycleAction::Register,
+			handle: mixture,
+		}])
+		.unwrap();
+	let mut trace = state(mixture, 0, 0.0099);
+	trace.temperature = 733.0;
+	world.apply_mixture_state(&[trace]).unwrap();
+	world
+		.apply_turf_lifecycle(&[TurfLifecycleMutation::Register {
+			handle: turf,
+			mixture: Some(mixture),
+		}])
+		.unwrap();
+	world
+		.apply_turf_heat(&[TurfHeatMutation {
+			handle: turf,
+			state: Some(TurfHeatState {
+				temperature: 293.15,
+				thermal_conductivity: 0.4,
+				heat_capacity: 20_000.0,
+				adjacent_to_space: false,
+			}),
+		}])
+		.unwrap();
+
+	assert_eq!(
+		world
+			.process_stage_cancellable(WorldStage::TurfHeat, 0.5, || false)
+			.unwrap(),
+		dogmos_core::world::StageResult { work_items: 0 }
+	);
 }
 
 #[test]
@@ -655,7 +883,7 @@ fn remove_ratio_does_not_quantize_past_the_source_amount() {
 		])
 		.unwrap();
 	world
-		.apply_mixture_state(&[state(source, 0, 0.00006), state(destination, 0, 0.0)])
+		.apply_mixture_state(&[state(source, 0, 0.01006), state(destination, 0, 0.0)])
 		.unwrap();
 
 	world
@@ -669,8 +897,8 @@ fn remove_ratio_does_not_quantize_past_the_source_amount() {
 	let source_after = world.snapshot(source).unwrap();
 	let destination_after = world.snapshot(destination).unwrap();
 	assert_eq!(source_after.gases[0], 0.0);
-	assert_eq!(destination_after.gases[0], 0.00006);
-	assert_eq!(source_after.gases[0] + destination_after.gases[0], 0.00006);
+	assert_eq!(destination_after.gases[0], 0.01006);
+	assert_eq!(source_after.gases[0] + destination_after.gases[0], 0.01006);
 }
 
 #[test]
@@ -692,7 +920,7 @@ fn transfer_ratio_does_not_quantize_past_the_source_amount() {
 		])
 		.unwrap();
 	world
-		.apply_mixture_state(&[state(source, 0, 0.00006), state(destination, 0, 0.0)])
+		.apply_mixture_state(&[state(source, 0, 0.01006), state(destination, 0, 0.0)])
 		.unwrap();
 
 	world
@@ -706,8 +934,8 @@ fn transfer_ratio_does_not_quantize_past_the_source_amount() {
 	let source_after = world.snapshot(source).unwrap();
 	let destination_after = world.snapshot(destination).unwrap();
 	assert_eq!(source_after.gases[0], 0.0);
-	assert_eq!(destination_after.gases[0], 0.00006);
-	assert_eq!(source_after.gases[0] + destination_after.gases[0], 0.00006);
+	assert_eq!(destination_after.gases[0], 0.01006);
+	assert_eq!(source_after.gases[0] + destination_after.gases[0], 0.01006);
 }
 
 #[test]

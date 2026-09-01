@@ -402,7 +402,7 @@ fn fire_requirements_preserve_strict_ignition_and_minimum_mole_boundaries() {
 		.unwrap();
 	assert_eq!(world.reactable_reactions_into(handle, &mut output), Ok(1));
 
-	mixture_gases[0] = 0.0001;
+	mixture_gases[0] = 0.0099;
 	world
 		.apply_mixture_state(&[MixtureStateMutation {
 			handle,
@@ -414,7 +414,7 @@ fn fire_requirements_preserve_strict_ignition_and_minimum_mole_boundaries() {
 		.unwrap();
 	assert_eq!(world.reactable_reactions_into(handle, &mut output), Ok(0));
 
-	mixture_gases[0] = f32::from_bits(0.0001_f32.to_bits() + 1);
+	mixture_gases[0] = 0.01;
 	world
 		.apply_mixture_state(&[MixtureStateMutation {
 			handle,

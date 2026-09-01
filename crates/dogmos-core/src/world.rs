@@ -75,7 +75,7 @@ struct ProjectedSlot {
 
 const MINIMUM_TEMPERATURE_K: f32 = 2.7;
 const DEFAULT_MIXTURE_VOLUME_LITERS: f32 = 2500.0;
-const GAS_MIN_MOLES: f32 = 0.0001;
+const MINIMUM_CALCULATED_MOLES: f32 = 0.01;
 const MOLAR_ACCURACY: f32 = 0.0001;
 const MINIMUM_HEAT_CAPACITY: f32 = 0.0003;
 const DEFAULT_EVENT_CAPACITY: u32 = 4096;
@@ -1705,6 +1705,7 @@ impl DogmosWorld {
 			mixture.temperature = mutation.temperature;
 			mixture.volume = mutation.volume;
 			mixture.gases = mutation.gases;
+			canonicalize_gases(&mut mixture.gases);
 			mixture.revision += 1;
 		}
 		Ok(mutations.len() as u32)
@@ -1784,7 +1785,11 @@ impl DogmosWorld {
 				if !amount.is_finite() || amount < 0.0 {
 					return Err(WorldError::InvalidMoleAmount);
 				}
-				let amount = if amount <= GAS_MIN_MOLES { 0.0 } else { amount };
+				let amount = if amount < MINIMUM_CALCULATED_MOLES {
+					0.0
+				} else {
+					amount
+				};
 				let updated = self.mutate_mixture(handle, |mixture| {
 					if mixture.immutable || mixture.gases[gas_index] == amount {
 						return false;
@@ -1842,7 +1847,7 @@ impl DogmosWorld {
 				if !temperature.is_finite() {
 					return Err(WorldError::InvalidTemperature);
 				}
-				if amount <= GAS_MIN_MOLES {
+				if amount <= MOLAR_ACCURACY {
 					return Ok(CommandResult::Applied { updated: 0 });
 				}
 				let gas_index = self.gas_index(gas)?;
@@ -1904,7 +1909,11 @@ impl DogmosWorld {
 					let mut changed = false;
 					for (gas_index, amount) in adjusted {
 						let amount = amount as f32;
-						let amount = if amount <= GAS_MIN_MOLES { 0.0 } else { amount };
+						let amount = if amount < MINIMUM_CALCULATED_MOLES {
+							0.0
+						} else {
+							amount
+						};
 						changed |= mixture.gases[gas_index] != amount;
 						mixture.gases[gas_index] = amount;
 					}
@@ -1987,7 +1996,7 @@ impl DogmosWorld {
 				let mut fuel_amount = 0.0;
 				for gas in gases.iter() {
 					let amount = mixture.gases[usize::from(gas.id.0)];
-					if amount <= GAS_MIN_MOLES {
+					if amount < MINIMUM_CALCULATED_MOLES {
 						continue;
 					}
 					match gas.fire_role {
@@ -2091,7 +2100,7 @@ impl DogmosWorld {
 						let adjusted = (f64::from(*moles) + f64::from(amount))
 							.clamp(0.0, f64::from(f32::MAX)) as f32;
 						changed |= *moles != adjusted;
-						*moles = if adjusted <= GAS_MIN_MOLES {
+						*moles = if adjusted < MINIMUM_CALCULATED_MOLES {
 							0.0
 						} else {
 							adjusted
@@ -2115,7 +2124,7 @@ impl DogmosWorld {
 					for moles in &mut mixture.gases {
 						let adjusted =
 							(f64::from(*moles) * f64::from(factor)).min(f64::from(f32::MAX)) as f32;
-						let adjusted = if adjusted <= GAS_MIN_MOLES {
+						let adjusted = if adjusted < MINIMUM_CALCULATED_MOLES {
 							0.0
 						} else {
 							adjusted
@@ -2199,7 +2208,7 @@ impl DogmosWorld {
 					let gases = total.gases.map(|amount| {
 						let scaled =
 							(f64::from(amount) * f64::from(ratio)).min(f64::from(f32::MAX)) as f32;
-						if scaled <= GAS_MIN_MOLES {
+						if scaled < MINIMUM_CALCULATED_MOLES {
 							0.0
 						} else {
 							scaled
@@ -3092,7 +3101,8 @@ impl DogmosWorld {
 			if mixture.immutable {
 				continue;
 			}
-			let gases = state.output[index];
+			let mut gases = state.output[index];
+			canonicalize_gases(&mut gases);
 			let heat_capacity = gases
 				.iter()
 				.zip(state.specific_heats)
@@ -3418,6 +3428,7 @@ impl DogmosWorld {
 		let callback_events = u32::try_from(state.staged_events.len()).unwrap_or(u32::MAX);
 		for (handle, mut mixture) in state.staged_mixtures {
 			let current = self.require_handle_mut(handle)?;
+			canonicalize_gases(&mut mixture.gases);
 			mixture.revision = current.revision + 1;
 			*current = mixture;
 		}
@@ -3529,6 +3540,7 @@ impl DogmosWorld {
 		};
 		for (handle, mut record) in state.staged {
 			let current = self.require_handle_mut(handle)?;
+			canonicalize_gases(&mut record.gases);
 			record.revision = current.revision + 1;
 			*current = record;
 		}
@@ -3751,12 +3763,11 @@ impl DogmosWorld {
 			let current = self
 				.require_handle_mut(entry.handle)
 				.expect("transaction handles were validated before commit");
-			if current.gases == entry.candidate.gases
-				&& current.temperature == entry.candidate.temperature
-			{
+			let mut candidate = entry.candidate;
+			canonicalize_gases(&mut candidate.gases);
+			if current.gases == candidate.gases && current.temperature == candidate.temperature {
 				continue;
 			}
-			let mut candidate = entry.candidate;
 			candidate.revision = current.revision + 1;
 			*current = candidate;
 		}
@@ -3988,6 +3999,7 @@ impl DogmosWorld {
 		};
 		for (handle, mut record) in staged {
 			let current = self.require_handle_mut(handle)?;
+			canonicalize_gases(&mut record.gases);
 			record.revision = current.revision + 1;
 			*current = record;
 		}
@@ -4163,6 +4175,7 @@ impl DogmosWorld {
 		if sequence.native_updates > 0 {
 			let current = self.require_handle_mut(mixture)?;
 			let mut updated = sequence.mixture;
+			canonicalize_gases(&mut updated.gases);
 			updated.revision = current.revision + 1;
 			*current = updated;
 		}
@@ -4269,6 +4282,7 @@ impl DogmosWorld {
 		if sequence.native_updates > 0 {
 			let current = self.require_handle_mut(continuation.mixture)?;
 			let mut mixture = sequence.mixture;
+			canonicalize_gases(&mut mixture.gases);
 			mixture.revision = current.revision + 1;
 			*current = mixture;
 		}
@@ -5050,6 +5064,7 @@ impl DogmosWorld {
 			.map_err(|_| WorldError::AllocationFailed)?;
 		for (handle, mut mixture) in staged_mixtures {
 			let current = self.require_handle_mut(handle)?;
+			canonicalize_gases(&mut mixture.gases);
 			mixture.revision = current.revision + 1;
 			*current = mixture;
 		}
@@ -5131,9 +5146,10 @@ impl DogmosWorld {
 		}
 		for (index, handle) in handles.into_iter().enumerate() {
 			let offset = index * MAX_GAS_SLOTS;
-			let gases: [f32; MAX_GAS_SLOTS] = self.output[offset..offset + MAX_GAS_SLOTS]
+			let mut gases: [f32; MAX_GAS_SLOTS] = self.output[offset..offset + MAX_GAS_SLOTS]
 				.try_into()
 				.expect("diffusion output uses the fixed gas layout");
+			canonicalize_gases(&mut gases);
 			let mixture = self.require_handle_mut(handle)?;
 			if mixture.immutable {
 				continue;
@@ -5280,6 +5296,7 @@ impl DogmosWorld {
 		}
 		let changed = mutation(mixture);
 		if changed {
+			canonicalize_gases(&mut mixture.gases);
 			mixture.revision += 1;
 		}
 		Ok(changed)
@@ -5371,12 +5388,14 @@ impl DogmosWorld {
 		let (source_record, destination_record) =
 			self.require_two_handles_mut(source, destination)?;
 		destination_record.gases = removed;
+		canonicalize_gases(&mut destination_record.gases);
 		destination_record.temperature = source_before.temperature;
 		destination_record.revision += 1;
 		if !source_before.immutable {
 			for (amount, removed) in source_record.gases.iter_mut().zip(removed) {
 				*amount -= removed;
 			}
+			canonicalize_gases(&mut source_record.gases);
 			source_record.revision += 1;
 			Ok(2)
 		} else {
@@ -5424,7 +5443,6 @@ impl DogmosWorld {
 		let initial_energy =
 			self.heat_capacity(&destination_before)? * destination_before.temperature;
 		let mut transfers = Vec::with_capacity(gas_indices.len());
-		let mut heat_transfer = 0.0;
 		for gas_index in gas_indices {
 			let amount = source_before.gases[gas_index] * ratio;
 			let adjusted = f64::from(destination_before.gases[gas_index]) + f64::from(amount);
@@ -5433,15 +5451,22 @@ impl DogmosWorld {
 					gas_index as u16,
 				)));
 			}
-			heat_transfer += amount * source_before.temperature * specific_heats[gas_index];
 			transfers.push((gas_index, amount));
 		}
 		let (source_record, destination_record) =
 			self.require_two_handles_mut(source, destination)?;
-		for (gas_index, amount) in transfers {
-			source_record.gases[gas_index] -= amount;
-			destination_record.gases[gas_index] += amount;
+		for (gas_index, amount) in &transfers {
+			source_record.gases[*gas_index] -= amount;
+			destination_record.gases[*gas_index] += amount;
 		}
+		canonicalize_gases(&mut source_record.gases);
+		canonicalize_gases(&mut destination_record.gases);
+		let heat_transfer = transfers.iter().fold(0.0, |energy, (gas_index, _)| {
+			let retained_amount = (destination_record.gases[*gas_index]
+				- destination_before.gases[*gas_index])
+				.max(0.0);
+			energy + retained_amount * source_before.temperature * specific_heats[*gas_index]
+		});
 		let destination_capacity = destination_record
 			.gases
 			.iter()
@@ -5492,22 +5517,31 @@ impl DogmosWorld {
 				.as_ref()
 				.ok_or(WorldError::GasRegistryMissing)?;
 			let destination_capacity = self.heat_capacity(&destination_before)?;
-			let removed_capacity = removed
-				.iter()
-				.zip(registry.specific_heats())
-				.fold(0.0, |capacity, (amount, specific_heat)| {
-					specific_heat.mul_add(*amount, capacity)
-				});
 			for (amount, added) in destination_after.gases.iter_mut().zip(removed) {
 				*amount = (f64::from(*amount) + f64::from(added)).min(f64::from(f32::MAX)) as f32;
 			}
-			let combined_capacity = destination_capacity + removed_capacity;
+			canonicalize_gases(&mut destination_after.gases);
+			let retained_capacity = destination_after
+				.gases
+				.iter()
+				.zip(destination_before.gases)
+				.zip(registry.specific_heats())
+				.fold(0.0, |capacity, ((amount, before), specific_heat)| {
+					specific_heat.mul_add((*amount - before).max(0.0), capacity)
+				});
+			let combined_capacity = destination_capacity + retained_capacity;
 			if combined_capacity > MINIMUM_HEAT_CAPACITY {
 				destination_after.temperature = (destination_capacity
 					* destination_before.temperature
-					+ removed_capacity * source_before.temperature)
+					+ retained_capacity * source_before.temperature)
 					/ combined_capacity;
 			}
+		}
+		if !source_after.immutable {
+			canonicalize_gases(&mut source_after.gases);
+		}
+		if !destination_after.immutable {
+			canonicalize_gases(&mut destination_after.gases);
 		}
 		let source_changed = source_after.gases != source_before.gases;
 		let destination_changed = destination_after.gases != destination_before.gases
@@ -5572,6 +5606,12 @@ impl DogmosWorld {
 			scale_record(&mut inbetween, 0.5);
 			merge_record(&mut first_after, &inbetween, specific_heats);
 			merge_record(&mut second_after, &inbetween, specific_heats);
+		}
+		if !first_after.immutable {
+			canonicalize_gases(&mut first_after.gases);
+		}
+		if !second_after.immutable {
+			canonicalize_gases(&mut second_after.gases);
 		}
 		let first_changed = mixture_thermodynamics_differ(&first_before, &first_after);
 		let second_changed = mixture_thermodynamics_differ(&second_before, &second_after);
@@ -5727,7 +5767,15 @@ impl DogmosWorld {
 		let Some(mixture) = turf.mixture else {
 			return Ok(closed_turf_temperature);
 		};
-		Ok(closed_turf_temperature.max(self.require_handle(mixture)?.temperature))
+		let mixture = self.require_handle(mixture)?;
+		if !mixture
+			.gases
+			.iter()
+			.any(|amount| *amount >= MINIMUM_CALCULATED_MOLES)
+		{
+			return Ok(closed_turf_temperature);
+		}
+		Ok(closed_turf_temperature.max(mixture.temperature))
 	}
 
 	fn activate_turf_heat(&mut self, handle: TurfHandle) -> Result<(), WorldError> {
@@ -5974,6 +6022,14 @@ fn quantize(amount: f32) -> f32 {
 	(amount / MOLAR_ACCURACY).round() * MOLAR_ACCURACY
 }
 
+fn canonicalize_gases(gases: &mut [f32; MAX_GAS_SLOTS]) {
+	for amount in gases {
+		if *amount < MINIMUM_CALCULATED_MOLES {
+			*amount = 0.0;
+		}
+	}
+}
+
 fn quantized_removal(amount: f32, ratio: f32) -> f32 {
 	quantize(amount * ratio).min(amount)
 }
@@ -5992,7 +6048,7 @@ fn scale_record(mixture: &mut MixtureRecord, factor: f32) {
 	}
 	for amount in &mut mixture.gases {
 		*amount = (f64::from(*amount) * f64::from(factor)).min(f64::from(f32::MAX)) as f32;
-		if *amount <= GAS_MIN_MOLES {
+		if *amount <= MOLAR_ACCURACY {
 			*amount = 0.0;
 		}
 	}
