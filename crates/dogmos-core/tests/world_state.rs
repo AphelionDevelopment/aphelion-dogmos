@@ -230,6 +230,40 @@ fn sub_centimole_delta_accumulates_into_a_calculated_component() {
 }
 
 #[test]
+fn explicit_sub_centimole_amount_removal_preserves_the_breath() {
+	let source = handle(0, 1);
+	let destination = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: source,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: destination,
+			},
+		])
+		.unwrap();
+	world
+		.apply_mixture_state(&[state(source, 0, 1.0), state(destination, 0, 0.0)])
+		.unwrap();
+
+	world
+		.apply_command(Command::RemoveAmountInto {
+			source,
+			destination,
+			amount: 0.005,
+		})
+		.unwrap();
+
+	assert_eq!(world.snapshot(source).unwrap().gases[0], 0.995);
+	assert_eq!(world.snapshot(destination).unwrap().gases[0], 0.005);
+}
+
+#[test]
 fn sunk_transfer_trace_does_not_heat_unrelated_destination_gas() {
 	let source = handle(0, 1);
 	let destination = handle(1, 1);

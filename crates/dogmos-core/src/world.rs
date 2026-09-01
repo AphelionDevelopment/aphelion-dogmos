@@ -2357,7 +2357,7 @@ impl DogmosWorld {
 				destination,
 				ratio,
 			} => {
-				let updated = self.remove_ratio_into(source, destination, ratio)?;
+				let updated = self.remove_ratio_into(source, destination, ratio, true)?;
 				Ok(CommandResult::Applied { updated })
 			}
 			Command::RemoveAmountInto {
@@ -2370,7 +2370,7 @@ impl DogmosWorld {
 				}
 				let total = total_moles(self.require_handle(source)?);
 				let ratio = if total > 0.0 { amount / total } else { 0.0 };
-				let updated = self.remove_ratio_into(source, destination, ratio)?;
+				let updated = self.remove_ratio_into(source, destination, ratio, false)?;
 				Ok(CommandResult::Applied { updated })
 			}
 			Command::TransferGases {
@@ -5376,6 +5376,7 @@ impl DogmosWorld {
 		source: MixtureHandle,
 		destination: MixtureHandle,
 		ratio: f32,
+		canonicalize_traces: bool,
 	) -> Result<u32, WorldError> {
 		if source == destination {
 			return Err(WorldError::SameMixtureHandles(source));
@@ -5401,14 +5402,18 @@ impl DogmosWorld {
 		let (source_record, destination_record) =
 			self.require_two_handles_mut(source, destination)?;
 		destination_record.gases = removed;
-		canonicalize_gases(&mut destination_record.gases);
+		if canonicalize_traces {
+			canonicalize_gases(&mut destination_record.gases);
+		}
 		destination_record.temperature = source_before.temperature;
 		destination_record.revision += 1;
 		if !source_before.immutable {
 			for (amount, removed) in source_record.gases.iter_mut().zip(removed) {
 				*amount -= removed;
 			}
-			canonicalize_gases(&mut source_record.gases);
+			if canonicalize_traces {
+				canonicalize_gases(&mut source_record.gases);
+			}
 			source_record.revision += 1;
 			Ok(2)
 		} else {
