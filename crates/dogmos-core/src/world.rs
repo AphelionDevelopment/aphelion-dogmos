@@ -4424,7 +4424,7 @@ impl DogmosWorld {
 				0.0
 			};
 			for amount in &mut mixture.gases {
-				*amount -= quantize(*amount * ratio);
+				*amount -= quantized_removal(*amount, ratio);
 			}
 			let lost = before - total_moles(mixture);
 			local_losses.insert(turf_slot, lost);
@@ -4956,7 +4956,9 @@ impl DogmosWorld {
 		if destination_before.revision == u32::MAX {
 			return Err(WorldError::RevisionExhausted(destination));
 		}
-		let removed = source_before.gases.map(|amount| quantize(amount * ratio));
+		let removed = source_before
+			.gases
+			.map(|amount| quantized_removal(amount, ratio));
 		let (source_record, destination_record) =
 			self.require_two_handles_mut(source, destination)?;
 		destination_record.gases = removed;
@@ -5065,7 +5067,9 @@ impl DogmosWorld {
 		if ratio == 0.0 {
 			return Ok(0);
 		}
-		let removed = source_before.gases.map(|amount| quantize(amount * ratio));
+		let removed = source_before
+			.gases
+			.map(|amount| quantized_removal(amount, ratio));
 		let mut source_after = source_before.clone();
 		if !source_after.immutable {
 			for (amount, removed) in source_after.gases.iter_mut().zip(removed) {
@@ -5508,6 +5512,10 @@ fn quantize(amount: f32) -> f32 {
 	(amount / MOLAR_ACCURACY).round() * MOLAR_ACCURACY
 }
 
+fn quantized_removal(amount: f32, ratio: f32) -> f32 {
+	quantize(amount * ratio).min(amount)
+}
+
 fn copy_record(receiver: &mut MixtureRecord, giver: &MixtureRecord) {
 	if receiver.immutable {
 		return;
@@ -5569,7 +5577,7 @@ fn remove_ratio_into_record(
 	}
 	for (source_amount, removed_amount) in source.gases.iter_mut().zip(destination.gases.iter_mut())
 	{
-		*removed_amount = quantize(*source_amount * ratio);
+		*removed_amount = quantized_removal(*source_amount, ratio);
 		*source_amount -= *removed_amount;
 	}
 }
@@ -5645,7 +5653,7 @@ fn transfer_moles(
 		return Ok(0.0);
 	}
 	let ratio = (amount / source_total).min(1.0);
-	let removed = source.gases.map(|moles| quantize(moles * ratio));
+	let removed = source.gases.map(|moles| quantized_removal(moles, ratio));
 	for (gas_index, (target_amount, added)) in target.gases.iter().zip(removed).enumerate() {
 		if f64::from(*target_amount) + f64::from(added) > f64::from(f32::MAX) {
 			return Err(WorldError::MoleOverflow(crate::metadata::GasId(
@@ -5690,6 +5698,32 @@ mod tests {
 			slot,
 			generation: 1,
 		}
+	}
+
+	#[test]
+	fn record_ratio_removal_does_not_quantize_past_the_source_amount() {
+		let mut source = MixtureRecord::new();
+		source.gases[0] = 0.00006;
+
+		let removed = remove_ratio_record(&mut source, 1.0);
+
+		assert_eq!(source.gases[0], 0.0);
+		assert_eq!(removed.gases[0], 0.00006);
+		assert_eq!(source.gases[0] + removed.gases[0], 0.00006);
+	}
+
+	#[test]
+	fn mole_transfer_does_not_quantize_past_the_source_amount() {
+		let mut source = MixtureRecord::new();
+		source.gases[0] = 0.00006;
+		let mut target = MixtureRecord::new();
+		let specific_heats = [20.0; MAX_GAS_SLOTS];
+
+		let moved = transfer_moles(&mut source, &mut target, 0.00006, &specific_heats).unwrap();
+
+		assert_eq!(source.gases[0], 0.0);
+		assert_eq!(target.gases[0], 0.00006);
+		assert_eq!(moved, 0.00006);
 	}
 
 	#[test]

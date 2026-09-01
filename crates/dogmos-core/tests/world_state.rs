@@ -566,6 +566,80 @@ fn merge_remove_and_transfer_conserve_moles_and_thermal_energy() {
 }
 
 #[test]
+fn remove_ratio_does_not_quantize_past_the_source_amount() {
+	let source = handle(0, 1);
+	let destination = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: source,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: destination,
+			},
+		])
+		.unwrap();
+	world
+		.apply_mixture_state(&[state(source, 0, 0.00006), state(destination, 0, 0.0)])
+		.unwrap();
+
+	world
+		.apply_command(Command::RemoveRatioInto {
+			source,
+			destination,
+			ratio: 1.0,
+		})
+		.unwrap();
+
+	let source_after = world.snapshot(source).unwrap();
+	let destination_after = world.snapshot(destination).unwrap();
+	assert_eq!(source_after.gases[0], 0.0);
+	assert_eq!(destination_after.gases[0], 0.00006);
+	assert_eq!(source_after.gases[0] + destination_after.gases[0], 0.00006);
+}
+
+#[test]
+fn transfer_ratio_does_not_quantize_past_the_source_amount() {
+	let source = handle(0, 1);
+	let destination = handle(1, 1);
+	let mut world = DogmosWorld::new(1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(&[
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: source,
+			},
+			LifecycleMutation {
+				action: LifecycleAction::Register,
+				handle: destination,
+			},
+		])
+		.unwrap();
+	world
+		.apply_mixture_state(&[state(source, 0, 0.00006), state(destination, 0, 0.0)])
+		.unwrap();
+
+	world
+		.apply_command(Command::TransferRatio {
+			source,
+			destination,
+			ratio: 1.0,
+		})
+		.unwrap();
+
+	let source_after = world.snapshot(source).unwrap();
+	let destination_after = world.snapshot(destination).unwrap();
+	assert_eq!(source_after.gases[0], 0.0);
+	assert_eq!(destination_after.gases[0], 0.00006);
+	assert_eq!(source_after.gases[0] + destination_after.gases[0], 0.00006);
+}
+
+#[test]
 fn turf_topology_is_generation_checked_reciprocal_bounded_and_atomic() {
 	let mut world = DogmosWorld::new(1024 * 1024);
 	for slot in 0..8 {
