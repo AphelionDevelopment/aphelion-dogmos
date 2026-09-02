@@ -606,7 +606,7 @@ pub enum WorldError {
 	StateCapacityExceeded,
 	/// Carries the source location of the reservation that failed.
 	///
-	/// Roughly forty distinct 	ry_reserve sites produce this, and a service log that only says
+	/// Roughly forty distinct reservation sites produce this, and a service log that only says
 	/// `AllocationFailed` cannot tell an operator which one, so the location travels with it.
 	AllocationFailed(&'static std::panic::Location<'static>),
 	Cancelled,
