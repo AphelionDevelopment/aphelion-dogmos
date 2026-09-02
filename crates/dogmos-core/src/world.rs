@@ -5272,6 +5272,10 @@ impl DogmosWorld {
 	/// Never narrower than the registered gas count, and widened to cover any occupied slot above
 	/// it. Returns `MAX_GAS_SLOTS` when no gas registry is installed, preserving the full-width
 	/// behavior for a world that has not registered gases yet.
+	///
+	/// Gated to match its only caller, `process_turf_diffusion`. The chunked stage path that ships
+	/// in release keeps the equivalent stride on `StageDiffusionState` instead.
+	#[cfg(debug_assertions)]
 	fn diffusion_gas_stride(&self, handles: &[MixtureHandle]) -> Result<usize, WorldError> {
 		let mut stride = self
 			.gas_registry
