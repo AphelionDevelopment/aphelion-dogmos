@@ -4,18 +4,21 @@ use dogmos_protocol::{
 	decode_adjacency_batch, decode_adjust_multiple_request,
 	decode_continuation_adjust_multiple_request, decode_frontier_append_into,
 	decode_frontier_mutate_into, decode_gas_metadata_batch, decode_lifecycle_batch,
-	decode_mixture_state_batch, decode_pipenet_reconcile_request, decode_reaction_metadata_batch,
-	decode_turf_adjacency_batch, decode_turf_heat_adjacency_batch, decode_turf_heat_batch,
-	decode_turf_lifecycle_batch, encode_pipenet_reconcile_response, read_frame_into, write_frame,
-	CallbackBatchRequest, ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
-	FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse, FrontierCommitRequest,
-	FrontierCommitResponse, FrontierMutateResponse, HandshakePayload, MixtureCommandRequest,
-	MixtureSnapshotRequest, MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
+	decode_mixture_snapshot_batch_request_into, decode_mixture_state_batch,
+	decode_pipenet_reconcile_request, decode_reaction_metadata_batch, decode_turf_adjacency_batch,
+	decode_turf_heat_adjacency_batch, decode_turf_heat_batch, decode_turf_lifecycle_batch,
+	encode_mixture_snapshot_batch_response, encode_pipenet_reconcile_response, read_frame_into,
+	write_frame, CallbackBatchRequest, ContinuationCommandRequest, ContinuationResumeRequest,
+	ContinuationToken, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
+	FrontierCommitRequest, FrontierCommitResponse, FrontierMutateResponse, HandshakePayload,
+	MixtureCommandRequest, MixtureSnapshotRecord, MixtureSnapshotRequest,
+	MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
 	MixtureStateUploadAppendResponse, MixtureStateUploadBeginRequest,
 	MixtureStateUploadBeginResponse, MixtureStateUploadCommitRequest,
 	MixtureStateUploadCommitResponse, OperationKind, ProtocolHeader, ServiceErrorCode,
 	SimulationStageRequest, SimulationStageResponse, TurfHeatSnapshotRequest, FLAG_ERROR,
-	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_PIPENET_RECONCILE_MIXTURES,
+	HANDSHAKE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD, MAX_MIXTURE_SNAPSHOT_BATCH,
+	MAX_PIPENET_RECONCILE_MIXTURES,
 };
 use interprocess::local_socket::{
 	prelude::*, GenericNamespaced, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
@@ -159,6 +162,10 @@ fn secure_listener_options(
 	Ok(options.mode(0o600))
 }
 
+/// Read buffer for the request side of the connection. Mirrors the client's response buffer:
+/// `write_frame` sends a small frame in one write, so one read usually returns the whole frame.
+const REQUEST_BUFFER_BYTES: usize = 16 * 1024;
+
 fn reject_busy(
 	mut stream: Stream,
 	expected: &HandshakePayload,
@@ -179,10 +186,12 @@ fn reject_busy(
 }
 
 fn handle_primary(
-	mut stream: Stream,
+	stream: Stream,
 	expected: HandshakePayload,
 	shutdown: &AtomicBool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+	// Buffer the request side so a coalesced frame costs one read syscall instead of two.
+	let mut stream = std::io::BufReader::with_capacity(REQUEST_BUFFER_BYTES, stream);
 	let mut payload = vec![0_u8; MAX_CONTROL_PAYLOAD as usize];
 	let (request, payload_len) = read_frame_into(&mut stream, &mut payload)?;
 	if request.operation_kind()? != OperationKind::Handshake {
@@ -190,7 +199,11 @@ fn handle_primary(
 	}
 	let handshake = HandshakePayload::decode(&payload[..payload_len])?;
 	if handshake.validate_peer(&expected).is_err() {
-		write_error_response(&mut stream, request, ServiceErrorCode::AuthenticationFailed)?;
+		write_error_response(
+			stream.get_mut(),
+			request,
+			ServiceErrorCode::AuthenticationFailed,
+		)?;
 		return Ok(());
 	}
 	let response_payload = HandshakePayload {
@@ -200,11 +213,15 @@ fn handle_primary(
 	.encode();
 	let mut response = request.response();
 	response.payload_len = HANDSHAKE_PAYLOAD_LEN as u32;
-	write_frame(&mut stream, response, &response_payload)?;
+	write_frame(stream.get_mut(), response, &response_payload)?;
 	let _authenticated_session = AuthenticatedSessionGuard(shutdown);
 	let mut request_sequence = RequestSequence::after_handshake(request.request_id);
 	let mut diagnostic_arena: Vec<u8> = Vec::new();
 	let mut frontier_handles = Vec::new();
+	// Reused across batched snapshot prefetches so a per-tick prefetch does not allocate.
+	let mut snapshot_batch_handles = Vec::new();
+	let mut snapshot_batch_records = Vec::new();
+	let mut snapshot_batch_response = Vec::new();
 	let mut service_state = ServiceState::new_for_world(
 		expected.capacities.max_world_bytes,
 		expected.capacities.max_callback_events,
@@ -223,50 +240,64 @@ fn handle_primary(
 		}
 		if !request_sequence.accept(request.request_id) {
 			service_state.record_protocol_error();
-			write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+			write_error_response(stream.get_mut(), request, ServiceErrorCode::InvalidRequest)?;
 			continue;
 		}
 		if deadline.is_expired() {
 			service_state.record_request_timeout();
-			write_error_response(&mut stream, request, ServiceErrorCode::DeadlineExceeded)?;
+			write_error_response(
+				stream.get_mut(),
+				request,
+				ServiceErrorCode::DeadlineExceeded,
+			)?;
 			continue;
 		}
 		let operation = match request.operation_kind() {
 			Ok(operation) => operation,
 			Err(_) => {
 				service_state.record_protocol_error();
-				write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+				write_error_response(stream.get_mut(), request, ServiceErrorCode::InvalidRequest)?;
 				continue;
 			}
 		};
 		match operation {
-			OperationKind::Echo => write_response(&mut stream, request, &payload[..payload_len])?,
+			OperationKind::Echo => {
+				write_response(stream.get_mut(), request, &payload[..payload_len])?
+			}
 			OperationKind::ScalarGet | OperationKind::Transfer => {
 				payload[..8].fill(0);
-				write_response(&mut stream, request, &payload[..8])?;
+				write_response(stream.get_mut(), request, &payload[..8])?;
 			}
 			OperationKind::ScalarSet | OperationKind::AdjacencyUpdate => {
-				write_response(&mut stream, request, &[])?;
+				write_response(stream.get_mut(), request, &[])?;
 			}
 			OperationKind::GasVector => {
 				payload[..260].fill(0);
-				write_response(&mut stream, request, &payload[..260])?;
+				write_response(stream.get_mut(), request, &payload[..260])?;
 			}
 			OperationKind::Batch => {
 				let operation_count = read_count(&payload[..payload_len])?;
 				let response = operation_count.to_le_bytes();
-				write_response(&mut stream, request, &response)?;
+				write_response(stream.get_mut(), request, &response)?;
 			}
 			OperationKind::CallbackBatch => {
 				let Ok(callback_request) = CallbackBatchRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				if callback_request.max_events > expected.capacities.max_callback_events {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				}
 				let response_len = service_state.drain_scoped_callbacks(
@@ -275,19 +306,25 @@ fn handle_primary(
 					callback_request.max_events,
 					&mut payload[..expected.capacities.max_control_payload as usize],
 				)?;
-				write_response(&mut stream, request, &payload[..response_len])?;
+				write_response(stream.get_mut(), request, &payload[..response_len])?;
 			}
 			OperationKind::DiagnosticCallbackEnqueue => {
 				let Ok(callback_request) = CallbackBatchRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				match service_state.enqueue_diagnostic_callbacks(callback_request.max_events) {
-					Ok(accepted) => write_response(&mut stream, request, &accepted.to_le_bytes())?,
+					Ok(accepted) => {
+						write_response(stream.get_mut(), request, &accepted.to_le_bytes())?
+					}
 					Err(state::StateError::CallbackBackpressure) => write_error_response(
-						&mut stream,
+						stream.get_mut(),
 						request,
 						ServiceErrorCode::CallbackBackpressure,
 					)?,
@@ -300,7 +337,11 @@ fn handle_primary(
 					|| requested_bytes > usize::MAX as u64
 				{
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				}
 				if requested_bytes == 0 {
@@ -317,24 +358,68 @@ fn handle_primary(
 					}
 				}
 				let response = (diagnostic_arena.len() as u64).to_le_bytes();
-				write_response(&mut stream, request, &response)?;
+				write_response(stream.get_mut(), request, &response)?;
 			}
 			OperationKind::MixtureSnapshot => {
 				let Ok(snapshot_request) = MixtureSnapshotRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let snapshot = match service_state.snapshot(snapshot_request.handle) {
 					Ok(snapshot) => snapshot,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				let response = snapshot.encode()?;
-				write_response(&mut stream, request, &response)?;
+				write_response(stream.get_mut(), request, &response)?;
+			}
+			OperationKind::MixtureSnapshotBatch => {
+				/*
+					A prefetch: the caller names the mixtures it is about to read and gets them
+					all back in one round trip, rather than paying a round trip per mixture.
+
+					A handle that no longer resolves is skipped rather than failing the batch -
+					the caller is naming a speculative working set, and one stale turf must not
+					cost it every other snapshot in the request.
+				*/
+				let limit = expected
+					.capacities
+					.max_batch_operations
+					.min(MAX_MIXTURE_SNAPSHOT_BATCH as u32);
+				if decode_mixture_snapshot_batch_request_into(
+					&payload[..payload_len],
+					limit,
+					&mut snapshot_batch_handles,
+				)
+				.is_err()
+				{
+					service_state.record_protocol_error();
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
+					continue;
+				}
+				snapshot_batch_records.clear();
+				for handle in snapshot_batch_handles.iter().copied() {
+					if let Ok(snapshot) = service_state.snapshot(handle) {
+						snapshot_batch_records.push(MixtureSnapshotRecord { handle, snapshot });
+					}
+				}
+				encode_mixture_snapshot_batch_response(
+					&snapshot_batch_records,
+					&mut snapshot_batch_response,
+				)?;
+				write_response(stream.get_mut(), request, &snapshot_batch_response)?;
 			}
 			OperationKind::PipenetReconcile => {
 				let Ok(handles) = decode_pipenet_reconcile_request(
@@ -345,73 +430,93 @@ fn handle_primary(
 						.min(MAX_PIPENET_RECONCILE_MIXTURES as u32),
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let snapshots = match service_state.reconcile_pipenet(&handles) {
 					Ok(snapshots) => snapshots,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				let mut response = Vec::new();
 				encode_pipenet_reconcile_response(&snapshots, &mut response)?;
-				write_response(&mut stream, request, &response)?;
+				write_response(stream.get_mut(), request, &response)?;
 			}
 			OperationKind::TurfHeatSnapshot => {
 				let Ok(snapshot_request) = TurfHeatSnapshotRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let snapshot = match service_state.turf_heat_snapshot(snapshot_request.turf) {
 					Ok(snapshot) => snapshot,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &snapshot.encode()?)?;
+				write_response(stream.get_mut(), request, &snapshot.encode()?)?;
 			}
 			OperationKind::MixtureCommand => {
 				let Ok(command) = MixtureCommandRequest::decode(&payload[..payload_len]) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let response = match service_state.apply_mixture_command(command) {
 					Ok(response) => response,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &response.encode()?)?;
+				write_response(stream.get_mut(), request, &response.encode()?)?;
 			}
 			OperationKind::MixtureAdjustMultiple => {
 				let Ok((handle, adjustments)) =
 					decode_adjust_multiple_request(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let response = match service_state.apply_adjust_multiple(handle, &adjustments) {
 					Ok(response) => response,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &response.encode()?)?;
+				write_response(stream.get_mut(), request, &response.encode()?)?;
 			}
 			OperationKind::ContinuationCommand => {
 				let Ok(command) = ContinuationCommandRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let response = match service_state
@@ -419,18 +524,22 @@ fn handle_primary(
 				{
 					Ok(response) => response,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &response.encode()?)?;
+				write_response(stream.get_mut(), request, &response.encode()?)?;
 			}
 			OperationKind::ContinuationAdjustMultiple => {
 				let Ok((token, handle, adjustments)) =
 					decode_continuation_adjust_multiple_request(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let response = match service_state.apply_continuation_adjust_multiple(
@@ -440,16 +549,20 @@ fn handle_primary(
 				) {
 					Ok(response) => response,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &response.encode()?)?;
+				write_response(stream.get_mut(), request, &response.encode()?)?;
 			}
 			OperationKind::ContinuationResume => {
 				let Ok(resume) = ContinuationResumeRequest::decode(&payload[..payload_len]) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let response = match service_state
@@ -457,53 +570,65 @@ fn handle_primary(
 				{
 					Ok(response) => response,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &response.encode()?)?;
+				write_response(stream.get_mut(), request, &response.encode()?)?;
 			}
 			OperationKind::ContinuationCancel => {
 				let Ok(token) = ContinuationToken::decode(&payload[..payload_len]) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				if let Err(error) = service_state.cancel_continuation(token) {
-					write_state_error_response(&mut stream, request, &error)?;
+					write_state_error_response(stream.get_mut(), request, &error)?;
 					continue;
 				}
-				write_response(&mut stream, request, &[])?;
+				write_response(stream.get_mut(), request, &[])?;
 			}
 			OperationKind::GasMetadataInstall => {
 				let Ok(entries) = decode_gas_metadata_batch(&payload[..payload_len]) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let count = match service_state.install_gases(entries) {
 					Ok(count) => count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &count.to_le_bytes())?;
 			}
 			OperationKind::ReactionMetadataInstall => {
 				let Ok(entries) = decode_reaction_metadata_batch(&payload[..payload_len]) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let count = match service_state.install_reactions(entries) {
 					Ok(count) => count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &count.to_le_bytes())?;
 			}
 			OperationKind::MixtureLifecycleBatch => {
 				let Ok(mutations) = decode_lifecycle_batch(
@@ -511,17 +636,21 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let operation_count = match service_state.apply_lifecycle(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &operation_count.to_le_bytes())?;
 			}
 			OperationKind::MixtureStateBatch => {
 				let Ok(mutations) = decode_mixture_state_batch(
@@ -529,23 +658,31 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let operation_count = match service_state.apply_mixture_state(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &operation_count.to_le_bytes())?;
 			}
 			OperationKind::MixtureStateUploadBegin => {
 				let Ok(upload) = MixtureStateUploadBeginRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let upload_id = match service_state.begin_mixture_state_upload(
@@ -554,12 +691,12 @@ fn handle_primary(
 				) {
 					Ok(upload_id) => upload_id,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&MixtureStateUploadBeginResponse { upload_id }.encode()?,
 				)?;
@@ -570,7 +707,11 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let accepted_count = match service_state.append_mixture_state_upload(
@@ -580,12 +721,12 @@ fn handle_primary(
 				) {
 					Ok(count) => count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&MixtureStateUploadAppendResponse { accepted_count }.encode(),
 				)?;
@@ -594,19 +735,23 @@ fn handle_primary(
 				let Ok(upload) = MixtureStateUploadCommitRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let committed_count =
 					match service_state.commit_mixture_state_upload(upload.upload_id) {
 						Ok(count) => count,
 						Err(error) => {
-							write_state_error_response(&mut stream, request, &error)?;
+							write_state_error_response(stream.get_mut(), request, &error)?;
 							continue;
 						}
 					};
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&MixtureStateUploadCommitResponse { committed_count }.encode(),
 				)?;
@@ -615,14 +760,18 @@ fn handle_primary(
 				let Ok(upload) = MixtureStateUploadAbortRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				if let Err(error) = service_state.abort_mixture_state_upload(upload.upload_id) {
-					write_state_error_response(&mut stream, request, &error)?;
+					write_state_error_response(stream.get_mut(), request, &error)?;
 					continue;
 				}
-				write_response(&mut stream, request, &[])?;
+				write_response(stream.get_mut(), request, &[])?;
 			}
 			OperationKind::AdjacencyBatch => {
 				let Ok(mutations) = decode_adjacency_batch(
@@ -630,17 +779,21 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let operation_count = match service_state.apply_adjacency(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &operation_count.to_le_bytes())?;
 			}
 			OperationKind::TurfLifecycleBatch => {
 				let Ok(mutations) = decode_turf_lifecycle_batch(
@@ -648,17 +801,21 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let operation_count = match service_state.apply_turf_lifecycle(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &operation_count.to_le_bytes())?;
 			}
 			OperationKind::TurfAdjacencyBatch => {
 				let Ok(mutations) = decode_turf_adjacency_batch(
@@ -666,17 +823,21 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let operation_count = match service_state.apply_turf_adjacency(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &operation_count.to_le_bytes())?;
 			}
 			OperationKind::TurfHeatBatch => {
 				let Ok(mutations) = decode_turf_heat_batch(
@@ -684,17 +845,21 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let operation_count = match service_state.apply_turf_heat(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &operation_count.to_le_bytes())?;
 			}
 			OperationKind::TurfHeatAdjacencyBatch => {
 				let Ok(mutations) = decode_turf_heat_adjacency_batch(
@@ -702,28 +867,40 @@ fn handle_primary(
 					expected.capacities.max_batch_operations,
 				) else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let operation_count = match service_state.apply_turf_heat_adjacency(&mutations) {
 					Ok(operation_count) => operation_count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
-				write_response(&mut stream, request, &operation_count.to_le_bytes())?;
+				write_response(stream.get_mut(), request, &operation_count.to_le_bytes())?;
 			}
 			OperationKind::SimulationStage => {
 				let Ok(stage_request) = SimulationStageRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				if stage_request.work_limit > expected.capacities.max_stage_work_items {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				}
 				let result = match service_state.process_stage_chunk_cancellable(
@@ -736,7 +913,7 @@ fn handle_primary(
 				) {
 					Ok(result) => result,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
@@ -750,28 +927,36 @@ fn handle_primary(
 					produced_heat_seeds: result.produced_heat_seeds,
 				}
 				.encode();
-				write_response(&mut stream, request, &response)?;
+				write_response(stream.get_mut(), request, &response)?;
 			}
 			OperationKind::FrontierBegin => {
 				let Ok(frontier_request) = FrontierBeginRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				if frontier_request.expected_count > expected.capacities.max_frontier_handles {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				}
 				if let Err(error) = service_state
 					.begin_frontier(frontier_request.epoch, frontier_request.expected_count)
 				{
-					write_state_error_response(&mut stream, request, &error)?;
+					write_state_error_response(stream.get_mut(), request, &error)?;
 					continue;
 				}
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&FrontierBeginResponse {
 						epoch: frontier_request.epoch,
@@ -784,7 +969,11 @@ fn handle_primary(
 					decode_frontier_append_into(&payload[..payload_len], &mut frontier_handles)
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let accepted_count = match service_state.append_frontier(
@@ -794,12 +983,12 @@ fn handle_primary(
 				) {
 					Ok(count) => count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&FrontierAppendResponse { accepted_count }.encode(),
 				)?;
@@ -808,18 +997,22 @@ fn handle_primary(
 				let Ok(frontier_request) = FrontierCommitRequest::decode(&payload[..payload_len])
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let count = match service_state.commit_frontier(frontier_request.epoch) {
 					Ok(count) => count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&FrontierCommitResponse {
 						epoch: frontier_request.epoch,
@@ -833,18 +1026,22 @@ fn handle_primary(
 					decode_frontier_mutate_into(&payload[..payload_len], &mut frontier_handles)
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let count = match service_state.add_frontier(header.epoch, &frontier_handles) {
 					Ok(count) => count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&FrontierMutateResponse { count }.encode(),
 				)?;
@@ -854,18 +1051,22 @@ fn handle_primary(
 					decode_frontier_mutate_into(&payload[..payload_len], &mut frontier_handles)
 				else {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				};
 				let count = match service_state.remove_frontier(header.epoch, &frontier_handles) {
 					Ok(count) => count,
 					Err(error) => {
-						write_state_error_response(&mut stream, request, &error)?;
+						write_state_error_response(stream.get_mut(), request, &error)?;
 						continue;
 					}
 				};
 				write_response(
-					&mut stream,
+					stream.get_mut(),
 					request,
 					&FrontierMutateResponse { count }.encode(),
 				)?;
@@ -873,13 +1074,21 @@ fn handle_primary(
 			OperationKind::ServiceTelemetry => {
 				if payload_len != 0 {
 					service_state.record_protocol_error();
-					write_error_response(&mut stream, request, ServiceErrorCode::InvalidRequest)?;
+					write_error_response(
+						stream.get_mut(),
+						request,
+						ServiceErrorCode::InvalidRequest,
+					)?;
 					continue;
 				}
-				write_response(&mut stream, request, &service_state.telemetry().encode())?;
+				write_response(
+					stream.get_mut(),
+					request,
+					&service_state.telemetry().encode(),
+				)?;
 			}
 			OperationKind::Shutdown => {
-				write_frame(&mut stream, request.response(), &[])?;
+				write_frame(stream.get_mut(), request.response(), &[])?;
 				shutdown.store(true, Ordering::Release);
 				return Ok(());
 			}

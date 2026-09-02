@@ -1,11 +1,14 @@
 use dogmos_protocol::{
 	decode_adjacency_batch, decode_frontier_append_into, decode_frontier_mutate_into,
-	decode_lifecycle_batch, decode_mixture_state_batch, decode_pipenet_reconcile_request,
-	decode_pipenet_reconcile_response, encode_mixture_state_batch,
-	encode_pipenet_reconcile_request, encode_pipenet_reconcile_response, AdjacencyMutation,
-	FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
-	FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest, FrontierMutateResponse,
-	LifecycleAction, LifecycleMutation, MixtureCommandResponse, MixtureSnapshot,
+	decode_lifecycle_batch, decode_mixture_snapshot_batch_request_into,
+	decode_mixture_snapshot_batch_response_into, decode_mixture_state_batch,
+	decode_pipenet_reconcile_request, decode_pipenet_reconcile_response,
+	encode_mixture_snapshot_batch_request, encode_mixture_snapshot_batch_response,
+	encode_mixture_state_batch, encode_pipenet_reconcile_request,
+	encode_pipenet_reconcile_response, AdjacencyMutation, FrontierAppendRequest,
+	FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse, FrontierCommitRequest,
+	FrontierCommitResponse, FrontierMutateRequest, FrontierMutateResponse, LifecycleAction,
+	LifecycleMutation, MixtureCommandResponse, MixtureSnapshot, MixtureSnapshotRecord,
 	MixtureSnapshotRequest, MixtureStateMutation, MixtureStateUploadAbortRequest,
 	MixtureStateUploadAppendRequest, MixtureStateUploadBeginRequest,
 	MixtureStateUploadCommitRequest, OperationKind, PipenetReconcileSnapshot, ProtocolError,
@@ -14,7 +17,7 @@ use dogmos_protocol::{
 	FRONTIER_APPEND_RESPONSE_LEN, FRONTIER_BEGIN_REQUEST_LEN, FRONTIER_BEGIN_RESPONSE_LEN,
 	FRONTIER_COMMIT_REQUEST_LEN, FRONTIER_COMMIT_RESPONSE_LEN, FRONTIER_MUTATE_HEADER_LEN,
 	FRONTIER_MUTATE_RESPONSE_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES,
-	MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN, MIXTURE_STATE_MUTATION_LEN,
+	MAX_GAS_SLOTS, MIXTURE_SNAPSHOT_LEN, MIXTURE_SNAPSHOT_RECORD_LEN, MIXTURE_STATE_MUTATION_LEN,
 	PIPENET_RECONCILE_SNAPSHOT_LEN, SIMULATION_STAGE_REQUEST_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 
@@ -44,7 +47,7 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 #[test]
 fn compound_operation_ids_are_stable() {
-	assert_eq!(DOGMOS_PROTOCOL_VERSION, 12);
+	assert_eq!(DOGMOS_PROTOCOL_VERSION, 13);
 	assert_eq!(OperationKind::MixtureSnapshot as u16, 18);
 	assert_eq!(OperationKind::MixtureLifecycleBatch as u16, 19);
 	assert_eq!(OperationKind::AdjacencyBatch as u16, 20);
@@ -77,6 +80,109 @@ fn compound_operation_ids_are_stable() {
 		OperationKind::try_from(21),
 		Ok(OperationKind::SimulationStage)
 	);
+}
+
+#[test]
+fn mixture_snapshot_batch_shares_the_compact_record_layout() {
+	// The batch deliberately reuses the pipenet record so there is only one compact mixture
+	// layout on the wire. Pin that, so a change to one cannot silently desync the other.
+	assert_eq!(MIXTURE_SNAPSHOT_RECORD_LEN, PIPENET_RECONCILE_SNAPSHOT_LEN);
+	assert_eq!(
+		OperationKind::try_from(48).unwrap(),
+		OperationKind::MixtureSnapshotBatch
+	);
+
+	let handles = [handle(7, 11), handle(13, 17)];
+	let mut request = Vec::new();
+	encode_mixture_snapshot_batch_request(&handles, &mut request).unwrap();
+	let mut decoded_handles = vec![handle(99, 99)];
+	decode_mixture_snapshot_batch_request_into(&request, 2, &mut decoded_handles).unwrap();
+	assert_eq!(decoded_handles, handles);
+	assert_eq!(
+		decode_mixture_snapshot_batch_request_into(&request, 1, &mut decoded_handles),
+		Err(ProtocolError::OperationCountExceeded {
+			actual: 2,
+			maximum: 1,
+		})
+	);
+}
+
+#[test]
+fn mixture_snapshot_batch_response_round_trips_every_record() {
+	let mut gases = [ScalarValue(0.0); MAX_GAS_SLOTS];
+	gases[0] = ScalarValue(12.5);
+	gases[MAX_GAS_SLOTS - 1] = ScalarValue(0.25);
+	let records = [
+		MixtureSnapshotRecord {
+			handle: handle(7, 11),
+			snapshot: MixtureSnapshot {
+				revision: 3,
+				gas_count: MAX_GAS_SLOTS as u32,
+				temperature: ScalarValue(293.15),
+				volume: ScalarValue(2500.0),
+				minimum_heat_capacity: ScalarValue(0.0),
+				total_moles: ScalarValue(12.75),
+				pressure: ScalarValue(101.325),
+				heat_capacity: ScalarValue(255.0),
+				immutable: false,
+				gases,
+			},
+		},
+		MixtureSnapshotRecord {
+			handle: handle(13, 17),
+			snapshot: MixtureSnapshot {
+				revision: 9,
+				gas_count: 1,
+				temperature: ScalarValue(2.7),
+				volume: ScalarValue(2500.0),
+				minimum_heat_capacity: ScalarValue(0.0),
+				total_moles: ScalarValue(0.0),
+				pressure: ScalarValue(0.0),
+				heat_capacity: ScalarValue(0.0),
+				immutable: true,
+				gases: [ScalarValue(0.0); MAX_GAS_SLOTS],
+			},
+		},
+	];
+
+	let mut encoded = Vec::new();
+	encode_mixture_snapshot_batch_response(&records, &mut encoded).unwrap();
+	assert_eq!(
+		encoded.len(),
+		4 + records.len() * MIXTURE_SNAPSHOT_RECORD_LEN
+	);
+
+	let mut decoded = Vec::new();
+	decode_mixture_snapshot_batch_response_into(&encoded, 2, &mut decoded).unwrap();
+	assert_eq!(decoded.len(), records.len());
+	for (decoded, expected) in decoded.iter().zip(records.iter()) {
+		assert_eq!(decoded.handle, expected.handle);
+		assert_eq!(decoded.snapshot.revision, expected.snapshot.revision);
+		assert_eq!(decoded.snapshot.immutable, expected.snapshot.immutable);
+		assert_eq!(decoded.snapshot.gas_count, expected.snapshot.gas_count);
+		assert_eq!(decoded.snapshot.gases, expected.snapshot.gases);
+		/*
+			The compact record carries scalars at single precision, so a value like 293.15 does
+			not survive as an exact f64 - it survives exactly as an f32. That is the right
+			trade for this operation: BYOND numbers are f32, so the shim narrows every one of
+			these to f32 before handing it to DM anyway, and halving the scalar width is most of
+			what makes the batch worth sending.
+		*/
+		assert_eq!(
+			decoded.snapshot.temperature.0 as f32,
+			expected.snapshot.temperature.0 as f32
+		);
+		assert_eq!(
+			decoded.snapshot.pressure.0 as f32,
+			expected.snapshot.pressure.0 as f32
+		);
+	}
+
+	// An empty batch is legal - a prefetch may find nothing still resolvable.
+	let mut empty = Vec::new();
+	encode_mixture_snapshot_batch_response(&[], &mut empty).unwrap();
+	decode_mixture_snapshot_batch_response_into(&empty, 2, &mut decoded).unwrap();
+	assert!(decoded.is_empty());
 }
 
 #[test]

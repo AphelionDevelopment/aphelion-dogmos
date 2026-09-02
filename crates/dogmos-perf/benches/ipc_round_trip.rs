@@ -1,14 +1,14 @@
-use dogmos_byond::DogmosClient;
+use dogmos_byond::{BoundedDogmosClient, DogmosClient};
 use dogmos_protocol::{
-	encode_gas_metadata_batch, encode_lifecycle_batch, encode_mixture_state_batch,
-	encode_turf_adjacency_batch, encode_turf_lifecycle_batch, BuildIdentity, CallbackBatchRequest,
-	CallbackScope, CapacityLimits, FrontierAppendRequest, FrontierBeginRequest,
-	FrontierCommitRequest, GasMetadataRegistration, HandshakePayload, LifecycleAction,
-	LifecycleMutation, MixtureSnapshotRequest, MixtureStateMutation, OperationKind, ScalarValue,
-	SimulationStage, SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
-	TurfLifecycleMutation, WireGasFireRole, WireHandle, DOGMOS_ABI_VERSION,
+	encode_gas_metadata_batch, encode_lifecycle_batch, encode_mixture_snapshot_batch_request,
+	encode_mixture_state_batch, encode_turf_adjacency_batch, encode_turf_lifecycle_batch,
+	BuildIdentity, CallbackBatchRequest, CallbackScope, CapacityLimits, FrontierAppendRequest,
+	FrontierBeginRequest, FrontierCommitRequest, GasMetadataRegistration, HandshakePayload,
+	LifecycleAction, LifecycleMutation, MixtureSnapshotRequest, MixtureStateMutation,
+	OperationKind, ScalarValue, SimulationStage, SimulationStageRequest, SimulationStageResponse,
+	TurfAdjacencyMutation, TurfLifecycleMutation, WireGasFireRole, WireHandle, DOGMOS_ABI_VERSION,
 	DOGMOS_PROTOCOL_VERSION, MAX_CONTROL_PAYLOAD, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS,
-	MIXTURE_SNAPSHOT_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	MIXTURE_SNAPSHOT_LEN, MIXTURE_SNAPSHOT_RECORD_LEN, SIMULATION_STAGE_RESPONSE_LEN,
 };
 use std::{
 	error::Error,
@@ -24,6 +24,8 @@ const SERVICE_MIXTURE_COUNT: usize = 1024;
 const SERVICE_GAS_COUNT: usize = 32;
 const SERVICE_STAGE_ITERATION_LIMIT: usize = 500;
 const SERVICE_STAGE_WORK_LIMIT: u32 = 1024;
+const SNAPSHOT_BATCH_HANDLES: usize = 256;
+const SNAPSHOT_BATCH_ITERATIONS: usize = 2_000;
 
 struct ChildGuard(Child);
 
@@ -103,10 +105,87 @@ fn main() -> Result<(), Box<dyn Error>> {
 		&mut service_state,
 		iterations.min(SERVICE_STAGE_ITERATION_LIMIT),
 	)?;
-	client.shutdown()?;
+
+	// Re-run the same cases through the bounded wrapper, on the same connection and the same
+	// service process, so the two sets of rows are directly comparable.
+	let mut bounded = BoundedDogmosClient::new(client)?;
+	for case in cases() {
+		run_bounded_case(&mut bounded, &case, iterations)?;
+	}
+	run_bounded_case(
+		&mut bounded,
+		&Case {
+			name: "service_mixture_snapshot_32_gases".into(),
+			operation: OperationKind::MixtureSnapshot,
+			request: MixtureSnapshotRequest { handle: handle(1) }
+				.encode()
+				.to_vec(),
+			response_len: MIXTURE_SNAPSHOT_LEN,
+		},
+		iterations,
+	)?;
+	// The point of the batch: one round trip against SNAPSHOT_BATCH_HANDLES singular ones. Divide
+	// this row's p50 by the handle count to compare it against the singular row above.
+	{
+		let handles = (1..=SNAPSHOT_BATCH_HANDLES).map(handle).collect::<Vec<_>>();
+		let mut request = Vec::new();
+		encode_mixture_snapshot_batch_request(&handles, &mut request)?;
+		run_bounded_case(
+			&mut bounded,
+			&Case {
+				name: format!("service_mixture_snapshot_batch_{SNAPSHOT_BATCH_HANDLES}"),
+				operation: OperationKind::MixtureSnapshotBatch,
+				request,
+				response_len: 4 + SNAPSHOT_BATCH_HANDLES * MIXTURE_SNAPSHOT_RECORD_LEN,
+			},
+			iterations.min(SNAPSHOT_BATCH_ITERATIONS),
+		)?;
+	}
+	bounded.round_trip(OperationKind::Shutdown, &[], 0, Duration::from_secs(5))?;
+	bounded.close(Duration::from_secs(5))?;
 	if !service.0.wait()?.success() {
 		return Err("dogmosd did not shut down cleanly".into());
 	}
+	Ok(())
+}
+
+/// As `run_case`, but through `BoundedDogmosClient` - the wrapper the shim actually calls.
+///
+/// The cases above measure the bare pipe round trip, which is not what a DM proc pays: every
+/// bound call goes through the bounded client's cancellation path. Measuring both makes the cost
+/// of that wrapper visible instead of leaving it attributed to "FFI overhead".
+fn run_bounded_case(
+	client: &mut BoundedDogmosClient,
+	case: &Case,
+	iterations: usize,
+) -> Result<(), Box<dyn Error>> {
+	let timeout = Duration::from_secs(5);
+	for _ in 0..WARMUP_ITERATIONS {
+		let received =
+			client.round_trip(case.operation, &case.request, case.response_len, timeout)?;
+		black_box(received);
+	}
+	let mut samples = Vec::with_capacity(iterations);
+	for _ in 0..iterations {
+		let started = Instant::now();
+		let received =
+			client.round_trip(case.operation, &case.request, case.response_len, timeout)?;
+		let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+		black_box(received);
+		samples.push(elapsed);
+	}
+	samples.sort_unstable();
+	println!(
+		"bounded_{},{},{},{},{},{},{},{},0",
+		case.name,
+		case.request.len(),
+		case.response_len,
+		iterations,
+		percentile(&samples, 50),
+		percentile(&samples, 95),
+		percentile(&samples, 99),
+		samples.last().copied().unwrap_or(0),
+	);
 	Ok(())
 }
 

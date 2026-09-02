@@ -14,9 +14,10 @@ use dogmos_process_metrics::{
 	PROCESS_WORKING_SET_AVAILABLE,
 };
 use dogmos_protocol::{
-	decode_adjust_multiple_request, decode_pipenet_reconcile_response,
-	encode_adjust_multiple_request, encode_continuation_adjust_multiple_request,
-	encode_gas_metadata_batch, encode_lifecycle_batch, encode_mixture_state_batch,
+	decode_adjust_multiple_request, decode_mixture_snapshot_batch_response_into,
+	decode_pipenet_reconcile_response, encode_adjust_multiple_request,
+	encode_continuation_adjust_multiple_request, encode_gas_metadata_batch, encode_lifecycle_batch,
+	encode_mixture_snapshot_batch_request, encode_mixture_state_batch,
 	encode_pipenet_reconcile_request, encode_reaction_metadata_batch, encode_turf_adjacency_batch,
 	encode_turf_heat_adjacency_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
 	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CallbackScope,
@@ -35,12 +36,12 @@ use dogmos_protocol::{
 	WireGasFireRole, WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution,
 	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
 	GAS_METADATA_RECORD_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS,
-	MAX_PIPENET_RECONCILE_MIXTURES, MIXTURE_ADJUSTMENT_LEN, MIXTURE_ADJUST_MULTIPLE_HEADER_LEN,
-	MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN,
-	MIXTURE_STATE_MUTATION_LEN, PIPENET_RECONCILE_SNAPSHOT_LEN, REACTION_METADATA_RECORD_LEN,
-	SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN,
-	TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN,
-	TURF_LIFECYCLE_MUTATION_LEN,
+	MAX_MIXTURE_SNAPSHOT_BATCH, MAX_PIPENET_RECONCILE_MIXTURES, MIXTURE_ADJUSTMENT_LEN,
+	MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN,
+	MIXTURE_SNAPSHOT_LEN, MIXTURE_SNAPSHOT_RECORD_LEN, MIXTURE_STATE_MUTATION_LEN,
+	PIPENET_RECONCILE_SNAPSHOT_LEN, REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN,
+	SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN,
+	TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
 };
 use std::{
 	fs,
@@ -956,31 +957,101 @@ pub fn encode_production_pipenet_reconcile(values: &[f32]) -> eyre::Result<Vec<u
 			"pipenet reconcile contains {operation_count} mixtures, maximum {MAX_PIPENET_RECONCILE_MIXTURES}"
 		));
 	}
-	let handles = values
+	let handles = handles_from_slot_generation_pairs(values, "pipenet reconcile")?;
+	let mut output = Vec::with_capacity(4 + handles.len() * 8);
+	encode_pipenet_reconcile_request(&handles, &mut output)?;
+	Ok(output)
+}
+
+/// Reads a flat DM list of `slot, generation` pairs into wire handles.
+fn handles_from_slot_generation_pairs(
+	values: &[f32],
+	context: &'static str,
+) -> eyre::Result<Vec<WireHandle>> {
+	values
 		.as_chunks::<2>()
 		.0
 		.iter()
 		.enumerate()
 		.map(|(index, entry)| {
 			Ok(WireHandle {
-				slot: indexed(exact_u32(entry[0], "slot"), "pipenet reconcile", index)?,
-				generation: indexed(
-					exact_u32(entry[1], "generation"),
-					"pipenet reconcile",
-					index,
-				)?,
+				slot: indexed(exact_u32(entry[0], "slot"), context, index)?,
+				generation: indexed(exact_u32(entry[1], "generation"), context, index)?,
 			})
 		})
-		.collect::<eyre::Result<Vec<_>>>()?;
-	let mut output = Vec::with_capacity(4 + handles.len() * 8);
-	encode_pipenet_reconcile_request(&handles, &mut output)?;
-	Ok(output)
+		.collect()
 }
 
 #[doc(hidden)]
 pub fn decode_production_pipenet_reconcile(response: &[u8]) -> eyre::Result<Vec<f32>> {
 	let entries =
 		decode_pipenet_reconcile_response(response, MAX_PIPENET_RECONCILE_MIXTURES as u32)?;
+	let mut fields = Vec::with_capacity(entries.len() * PRODUCTION_PIPENET_RESPONSE_FIELDS);
+	for entry in entries {
+		fields.push(entry.handle.slot as f32);
+		fields.push(entry.handle.generation as f32);
+		append_production_mixture_snapshot(&mut fields, entry.snapshot)?;
+	}
+	Ok(fields)
+}
+
+// Prefetches many mixture snapshots in one round trip. Takes a flat list of slot, generation
+// pairs and returns the flat field layout dogmos_pipenet_reconcile returns. Handles that no
+// longer resolve are omitted, so callers match returned records by handle, not by request order.
+//
+// Deliberately a plain comment: the generator emits `///` into bindings.dm, where it would sort
+// ahead of every proc and break that file's canonical ordering. The DM-facing contract is
+// documented on the SSdogmos consumer instead.
+#[auxmacros::bind("/proc/dogmos_mixture_snapshot_batch")]
+fn dogmos_mixture_snapshot_batch(entries: ByondValue) -> eyre::Result<ByondValue> {
+	let values = bounded_number_list(
+		entries,
+		"mixture snapshot batch",
+		MAX_MIXTURE_SNAPSHOT_BATCH * 2,
+	)?;
+	let operation_count = values.len() / 2;
+	let request = encode_production_mixture_snapshot_batch(&values)?;
+	let response_capacity = 4 + operation_count * MIXTURE_SNAPSHOT_RECORD_LEN;
+	let fields = production_request_with_response(
+		OperationKind::MixtureSnapshotBatch,
+		&request,
+		response_capacity,
+		decode_production_mixture_snapshot_batch,
+	)?;
+	let mut output = ByondValue::new_list()?;
+	for field in fields {
+		output.push_list(field.into())?;
+	}
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn encode_production_mixture_snapshot_batch(values: &[f32]) -> eyre::Result<Vec<u8>> {
+	if !values.len().is_multiple_of(2) {
+		return Err(eyre::eyre!(
+			"mixture snapshot batch requires slot and generation pairs"
+		));
+	}
+	let operation_count = values.len() / 2;
+	if operation_count > MAX_MIXTURE_SNAPSHOT_BATCH {
+		return Err(eyre::eyre!(
+			"mixture snapshot batch contains {operation_count} mixtures, maximum {MAX_MIXTURE_SNAPSHOT_BATCH}"
+		));
+	}
+	let handles = handles_from_slot_generation_pairs(values, "mixture snapshot batch")?;
+	let mut output = Vec::with_capacity(4 + handles.len() * 8);
+	encode_mixture_snapshot_batch_request(&handles, &mut output)?;
+	Ok(output)
+}
+
+#[doc(hidden)]
+pub fn decode_production_mixture_snapshot_batch(response: &[u8]) -> eyre::Result<Vec<f32>> {
+	let mut entries = Vec::new();
+	decode_mixture_snapshot_batch_response_into(
+		response,
+		MAX_MIXTURE_SNAPSHOT_BATCH as u32,
+		&mut entries,
+	)?;
 	let mut fields = Vec::with_capacity(entries.len() * PRODUCTION_PIPENET_RESPONSE_FIELDS);
 	for entry in entries {
 		fields.push(entry.handle.slot as f32);

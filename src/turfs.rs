@@ -321,14 +321,13 @@ impl TurfGases {
 	}
 
 	pub fn remove_adjacencies(&mut self, index: NodeIndex) {
-		let edges = self
-			.graph
-			.edges(index)
-			.map(|edgeref| edgeref.id())
-			.collect::<Vec<_>>();
-		edges.into_iter().for_each(|edgeindex| {
-			self.graph.remove_edge(edgeindex);
-		});
+		// Drain one edge at a time instead of collecting them into a fresh `Vec` first. This runs
+		// on every `__update_auxtools_turf_adjacency_info`, which the profiler shows firing
+		// hundreds of thousands of times a round, and a turf's degree is capped at six - so the
+		// allocation cost dominated the work it was buffering.
+		while let Some(edge) = self.graph.edges(index).next().map(|edge| edge.id()) {
+			self.graph.remove_edge(edge);
+		}
 	}
 
 	pub fn get(&self, idx: NodeIndex) -> Option<&TurfMixture> {

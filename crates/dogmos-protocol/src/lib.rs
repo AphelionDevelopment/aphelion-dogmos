@@ -14,7 +14,7 @@ pub use transport::{read_frame_into, write_frame, TransportError};
 
 pub const DOGMOS_FRAME_MAGIC: u32 = 0x534d_4744;
 pub const DOGMOS_ABI_VERSION: u16 = 2;
-pub const DOGMOS_PROTOCOL_VERSION: u16 = 12;
+pub const DOGMOS_PROTOCOL_VERSION: u16 = 13;
 pub const PROTOCOL_HEADER_LEN: u16 = 48;
 pub const HANDSHAKE_PAYLOAD_LEN: usize = 176;
 pub const MAX_CONTROL_PAYLOAD: u32 = 1024 * 1024;
@@ -24,6 +24,15 @@ pub const MIXTURE_SNAPSHOT_LEN: usize = 64 + MAX_GAS_SLOTS * 8;
 pub const PIPENET_RECONCILE_SNAPSHOT_LEN: usize = 8 + 36 + MAX_GAS_SLOTS * 4;
 pub const MAX_PIPENET_RECONCILE_MIXTURES: usize =
 	(MAX_CONTROL_PAYLOAD as usize - 4) / PIPENET_RECONCILE_SNAPSHOT_LEN;
+/// Length of one `(handle, compact snapshot)` record.
+///
+/// Batched snapshot reads reuse the compact record pipenet reconciliation already defines rather
+/// than introducing a third mixture layout: it is 172 bytes against the 320 of the singular
+/// `MixtureSnapshot`, which is what makes a batch worth sending.
+pub const MIXTURE_SNAPSHOT_RECORD_LEN: usize = PIPENET_RECONCILE_SNAPSHOT_LEN;
+/// Most records one batched snapshot request or response can carry.
+pub const MAX_MIXTURE_SNAPSHOT_BATCH: usize =
+	(MAX_CONTROL_PAYLOAD as usize - 4) / MIXTURE_SNAPSHOT_RECORD_LEN;
 pub const MIXTURE_STATE_MUTATION_LEN: usize = 32 + MAX_GAS_SLOTS * 8;
 pub const MIXTURE_STATE_UPLOAD_BEGIN_REQUEST_LEN: usize = 8;
 pub const MIXTURE_STATE_UPLOAD_BEGIN_RESPONSE_LEN: usize = 8;
@@ -110,6 +119,7 @@ pub enum OperationKind {
 	MixtureStateUploadCommit = 45,
 	MixtureStateUploadAbort = 46,
 	PipenetReconcile = 47,
+	MixtureSnapshotBatch = 48,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +240,7 @@ impl TryFrom<u16> for OperationKind {
 			45 => Ok(Self::MixtureStateUploadCommit),
 			46 => Ok(Self::MixtureStateUploadAbort),
 			47 => Ok(Self::PipenetReconcile),
+			48 => Ok(Self::MixtureSnapshotBatch),
 			actual => Err(ProtocolError::UnknownOperationKind(actual)),
 		}
 	}
@@ -1391,6 +1402,78 @@ pub fn decode_pipenet_reconcile_response(
 		});
 	}
 	Ok(entries)
+}
+
+/// A handle paired with its snapshot, as carried by a batched snapshot response.
+///
+/// Byte-identical to a pipenet reconciliation record; the two operations differ in meaning, not
+/// in layout - reconciliation mutates and returns, a batched read only reads.
+pub type MixtureSnapshotRecord = PipenetReconcileSnapshot;
+
+/// Encodes the handles a batched snapshot read is asking for.
+///
+/// # Errors
+/// If the handle count does not fit the wire count field.
+pub fn encode_mixture_snapshot_batch_request(
+	handles: &[WireHandle],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	encode_pipenet_reconcile_request(handles, output)
+}
+
+/// Decodes a batched snapshot request into a caller-owned buffer.
+///
+/// Reuses the caller's allocation because the service decodes one of these per prefetch.
+/// # Errors
+/// If the payload is malformed or asks for more handles than `maximum`.
+pub fn decode_mixture_snapshot_batch_request_into(
+	input: &[u8],
+	maximum: u32,
+	output: &mut Vec<WireHandle>,
+) -> Result<(), ProtocolError> {
+	let count = validate_counted_payload(input, 8, maximum)?;
+	output.clear();
+	output.reserve(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * 8;
+		output.push(WireHandle::decode(&input[offset..offset + 8])?);
+	}
+	Ok(())
+}
+
+/// Encodes the snapshots answering a batched read.
+///
+/// # Errors
+/// If the record count does not fit the wire count field or a scalar is not finite.
+pub fn encode_mixture_snapshot_batch_response(
+	entries: &[MixtureSnapshotRecord],
+	output: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+	encode_pipenet_reconcile_response(entries, output)
+}
+
+/// Decodes a batched snapshot response into a caller-owned buffer.
+///
+/// # Errors
+/// If the payload is malformed or carries more records than `maximum`.
+pub fn decode_mixture_snapshot_batch_response_into(
+	input: &[u8],
+	maximum: u32,
+	output: &mut Vec<MixtureSnapshotRecord>,
+) -> Result<(), ProtocolError> {
+	let count = validate_counted_payload(input, MIXTURE_SNAPSHOT_RECORD_LEN, maximum)?;
+	output.clear();
+	output.reserve(count as usize);
+	for index in 0..count as usize {
+		let offset = 4 + index * MIXTURE_SNAPSHOT_RECORD_LEN;
+		output.push(MixtureSnapshotRecord {
+			handle: WireHandle::decode(&input[offset..offset + 8])?,
+			snapshot: decode_pipenet_reconcile_snapshot(
+				&input[offset + 8..offset + MIXTURE_SNAPSHOT_RECORD_LEN],
+			)?,
+		});
+	}
+	Ok(())
 }
 
 fn encode_pipenet_reconcile_snapshot(

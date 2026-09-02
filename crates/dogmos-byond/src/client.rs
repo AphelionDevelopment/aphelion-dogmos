@@ -85,8 +85,16 @@ impl From<TransportError> for ClientError {
 	}
 }
 
+/// Read buffer for the response side of the connection.
+///
+/// `write_frame` emits a small frame as a single write, so the matching response almost always
+/// arrives as one readable chunk. Reading it through a buffer turns the header read and the
+/// payload read into one syscall instead of two, and - unlike a speculative oversized read -
+/// any bytes that arrive early are retained rather than lost.
+const RESPONSE_BUFFER_BYTES: usize = 16 * 1024;
+
 pub struct DogmosClient {
-	stream: Stream,
+	stream: io::BufReader<Stream>,
 	local: HandshakePayload,
 	peer: HandshakePayload,
 	next_request_id: u64,
@@ -126,6 +134,7 @@ impl DogmosClient {
 			0,
 		);
 		write_frame(&mut stream, request, &local.encode())?;
+		let mut stream = io::BufReader::with_capacity(RESPONSE_BUFFER_BYTES, stream);
 		let mut handshake_buffer = [0_u8; HANDSHAKE_PAYLOAD_LEN];
 		let (response, response_len) = read_frame_into(&mut stream, &mut handshake_buffer)?;
 		if response.flags & FLAG_ERROR != 0 {
@@ -188,7 +197,7 @@ impl DogmosClient {
 			payload_len,
 			deadline_ns,
 		);
-		write_frame(&mut self.stream, request, payload)?;
+		write_frame(self.stream.get_mut(), request, payload)?;
 		let (response, response_len) = read_frame_into(&mut self.stream, response_buffer)?;
 		if response.flags & FLAG_ERROR != 0 {
 			let code = ServiceErrorCode::decode(&response_buffer[..response_len])?;
@@ -207,7 +216,7 @@ impl DogmosClient {
 			0,
 			0,
 		);
-		write_frame(&mut self.stream, request, &[])?;
+		write_frame(self.stream.get_mut(), request, &[])?;
 		let mut response_buffer = [];
 		let (response, response_len) = read_frame_into(&mut self.stream, &mut response_buffer)?;
 		response.validate_response_to(&request)?;
@@ -483,7 +492,7 @@ fn current_io_handle_token(
 ) -> Result<std::os::windows::io::OwnedHandle, ClientError> {
 	use interprocess::TryClone;
 
-	match client.stream.try_clone()? {
+	match client.stream.get_ref().try_clone()? {
 		Stream::NamedPipe(stream) => Ok(stream.into()),
 	}
 }

@@ -252,14 +252,11 @@ impl TurfHeat {
 	}
 
 	pub fn remove_adjacencies(&mut self, index: NodeIndex<usize>) {
-		let edges = self
-			.graph
-			.edges(index)
-			.map(|edgeref| edgeref.id())
-			.collect::<Vec<_>>();
-		edges.into_iter().for_each(|edgeindex| {
-			self.graph.remove_edge(edgeindex);
-		});
+		// Same as the gas graph: the heat adjacency update runs on the same hot registration path,
+		// and bounded degree makes the buffering `Vec` pure overhead.
+		while let Some(edge) = self.graph.edges(index).next().map(|edge| edge.id()) {
+			self.graph.remove_edge(edge);
+		}
 	}
 }
 

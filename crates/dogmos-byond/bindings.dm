@@ -54,6 +54,9 @@
 /proc/dogmos_mixture_snapshot(fields)
 	return call_ext(DOGMOS, "byond:dogmos_mixture_snapshot_ffi")(fields)
 
+/proc/dogmos_mixture_snapshot_batch(entries)
+	return call_ext(DOGMOS, "byond:dogmos_mixture_snapshot_batch_ffi")(entries)
+
 /proc/dogmos_mixture_state_batch(entries)
 	return call_ext(DOGMOS, "byond:dogmos_mixture_state_batch_ffi")(entries)
 

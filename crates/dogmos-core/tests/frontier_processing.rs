@@ -126,6 +126,87 @@ fn run_diffusion_stage(world: &mut DogmosWorld, frontier: &[TurfHandle]) {
 	panic!("diffusion stage did not complete within four chunks");
 }
 
+/// Diffusion runs over a narrowed gas stride. A mixture may still legally carry moles in a slot
+/// above the registered gas count, because `apply_mixture_state` copies the wire array through
+/// without clamping it to the registry, so the stride has to widen to cover them.
+#[test]
+fn diffusion_moves_gas_in_slots_above_the_registered_gas_count() {
+	let high_slot = MAX_GAS_SLOTS - 1;
+	// Only oxygen (slot 0) is registered, so the stride would otherwise be 1.
+	let (mut world, turfs, mixtures) = diffusion_pair(0.0, 293.15, 0.0, 293.15);
+	let mut gases = [0.0; MAX_GAS_SLOTS];
+	gases[high_slot] = 100.0;
+	world
+		.apply_mixture_state(&[MixtureStateMutation {
+			handle: mixtures[0],
+			expected_revision: 1,
+			temperature: 293.15,
+			volume: 2500.0,
+			gases,
+		}])
+		.unwrap();
+
+	let before = world.snapshot(mixtures[0]).unwrap().gases[high_slot]
+		+ world.snapshot(mixtures[1]).unwrap().gases[high_slot];
+	run_diffusion_stage(&mut world, &turfs);
+
+	let left = world.snapshot(mixtures[0]).unwrap().gases[high_slot];
+	let right = world.snapshot(mixtures[1]).unwrap().gases[high_slot];
+	assert!(
+		right > 0.0,
+		"gas in an unregistered slot never diffused; the stride dropped it"
+	);
+	assert!(left < 100.0, "source slot did not give up any gas");
+	assert!(
+		(before - (left + right)).abs() <= 1e-3,
+		"narrowed stride lost moles: {before} before, {} after",
+		left + right
+	);
+}
+
+/// Narrowing the stride must not perturb the gases below it.
+#[test]
+fn narrowed_diffusion_matches_the_full_width_result_bit_for_bit() {
+	let narrow = {
+		let (mut world, turfs, mixtures) = diffusion_pair(100.0, 400.0, 7.5, 250.0);
+		run_diffusion_stage(&mut world, &turfs);
+		[
+			world.snapshot(mixtures[0]).unwrap().gases[0],
+			world.snapshot(mixtures[1]).unwrap().gases[0],
+		]
+	};
+	// Occupying the top slot forces the stride back out to the full fixed width.
+	let full_width = {
+		let (mut world, turfs, mixtures) = diffusion_pair(100.0, 400.0, 7.5, 250.0);
+		for (index, handle) in mixtures.iter().copied().enumerate() {
+			let mut gases = world.snapshot(handle).unwrap().gases;
+			gases[MAX_GAS_SLOTS - 1] = 1.0;
+			world
+				.apply_mixture_state(&[MixtureStateMutation {
+					handle,
+					expected_revision: 1,
+					temperature: if index == 0 { 400.0 } else { 250.0 },
+					volume: 2500.0,
+					gases,
+				}])
+				.unwrap();
+		}
+		run_diffusion_stage(&mut world, &turfs);
+		[
+			world.snapshot(mixtures[0]).unwrap().gases[0],
+			world.snapshot(mixtures[1]).unwrap().gases[0],
+		]
+	};
+
+	for (index, (narrow, full)) in narrow.iter().zip(full_width.iter()).enumerate() {
+		assert_eq!(
+			narrow.to_bits(),
+			full.to_bits(),
+			"mixture {index} diverged between narrowed and full-width diffusion: {narrow} vs {full}"
+		);
+	}
+}
+
 #[test]
 fn frontier_commit_atomically_replaces_the_previous_snapshot() {
 	let handles = [turf(0, 1), turf(1, 1), turf(2, 1)];

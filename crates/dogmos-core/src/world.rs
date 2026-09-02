@@ -692,6 +692,13 @@ struct StageDiffusionState {
 	input_energy: Vec<f32>,
 	output_energy: Vec<f32>,
 	specific_heats: [f32; MAX_GAS_SLOTS],
+	/// Gas slots the stencil actually has to visit.
+	///
+	/// Starts at the registered gas count and widens as rows carrying moles in higher slots are
+	/// appended, so an unregistered slot is never dropped. Discovery appends a turf together with
+	/// all of its neighbors, so by the time a node is computed the stride already covers every row
+	/// that contributes to it.
+	gas_stride: usize,
 	next_node: usize,
 }
 
@@ -817,7 +824,7 @@ impl StageHeatState {
 }
 
 impl StageDiffusionState {
-	fn new(specific_heats: [f32; MAX_GAS_SLOTS]) -> Self {
+	fn new(specific_heats: [f32; MAX_GAS_SLOTS], registered_gases: usize) -> Self {
 		Self {
 			turfs: Vec::new(),
 			mixtures: Vec::new(),
@@ -830,7 +837,21 @@ impl StageDiffusionState {
 			input_energy: Vec::new(),
 			output_energy: Vec::new(),
 			specific_heats,
+			gas_stride: registered_gases.clamp(1, MAX_GAS_SLOTS),
 			next_node: 0,
+		}
+	}
+
+	/// Widens the stride to cover any moles this row carries above it.
+	fn widen_gas_stride(&mut self, gases: &[f32; MAX_GAS_SLOTS]) {
+		if self.gas_stride == MAX_GAS_SLOTS {
+			return;
+		}
+		if let Some(highest) = (self.gas_stride..MAX_GAS_SLOTS)
+			.rev()
+			.find(|&index| gases[index] != 0.0)
+		{
+			self.gas_stride = highest + 1;
 		}
 	}
 }
@@ -1268,7 +1289,7 @@ impl DogmosWorld {
 		}
 
 		// Unregistering N mixtures used to scan the entire turf slot table N times (once per
-		// mutation) to find turfs pointing at each departing mixture - O(unregisters × total
+		// mutation) to find turfs pointing at each departing mixture - O(unregisters Ã— total
 		// turfs), worst case exactly when mass mixture teardown makes the batch large. Collect
 		// every handle being unregistered in this batch first, then do one pass over self.turfs
 		// for the whole batch below instead.
@@ -2638,9 +2659,15 @@ impl DogmosWorld {
 						values
 					})
 					.unwrap_or([0.0; MAX_GAS_SLOTS]);
+				// Without a registry the stride starts at the full width, which is what the
+				// stencil did unconditionally before.
+				let registered_gases = self
+					.gas_registry
+					.as_ref()
+					.map_or(MAX_GAS_SLOTS, |registry| registry.specific_heats().len());
 				self.stage_cursor = Some(StageCursor::new(request, self.topology.revision()));
 				self.stage_diffusion = (request.stage == WorldStage::ProcessTurfs)
-					.then(|| StageDiffusionState::new(diffusion_specific_heats));
+					.then(|| StageDiffusionState::new(diffusion_specific_heats, registered_gases));
 				self.stage_heat = (request.stage == WorldStage::TurfHeat).then(StageHeatState::new);
 				self.stage_reactions = (request.stage == WorldStage::React).then(|| {
 					let active_continuations = self
@@ -3048,6 +3075,7 @@ impl DogmosWorld {
 		state.turfs.push(turf_handle);
 		state.mixtures.push(mixture_handle);
 		state.index_by_turf.insert(turf_handle, index);
+		state.widen_gas_stride(&gases);
 		state.input.push(gases);
 		state.output.push([0.0; MAX_GAS_SLOTS]);
 		state.input_temperatures.push(temperature);
@@ -3080,13 +3108,36 @@ impl DogmosWorld {
 		}
 		let self_weight = diffusion_self_weight(neighbor_count as u32)
 			.map_err(|error| WorldError::State(error.to_string()))?;
+		/*
+			Node-major: seed the output row from this node, then fold each neighbor's row into it.
+			The previous nest ran gas-major and re-indexed every neighbor's row once per gas slot,
+			which walks `MAX_GAS_SLOTS` separate strides through the input instead of one
+			contiguous pass per neighbor.
+
+			The arithmetic sequence per gas is unchanged - self term first, then neighbors in the
+			same order - so the results are bit-identical.
+		*/
+		let stride = state.gas_stride;
+		debug_assert!(
+			std::iter::once(index)
+				.chain(neighbors[..neighbor_count].iter().copied())
+				.all(|row| state.input[row][stride..].iter().all(|&value| value == 0.0)),
+			"a row contributing to this node carries moles above the diffusion stride",
+		);
 		let mut output = [0.0; MAX_GAS_SLOTS];
-		for (gas_index, output_value) in output.iter_mut().enumerate() {
-			let mut next_value = state.input[index][gas_index] * self_weight;
-			for neighbor in &neighbors[..neighbor_count] {
-				next_value += state.input[*neighbor][gas_index] * GAS_DIFFUSION_CONSTANT;
+		for (output_value, &value) in output[..stride]
+			.iter_mut()
+			.zip(state.input[index][..stride].iter())
+		{
+			*output_value = value * self_weight;
+		}
+		for neighbor in &neighbors[..neighbor_count] {
+			for (output_value, &value) in output[..stride]
+				.iter_mut()
+				.zip(state.input[*neighbor][..stride].iter())
+			{
+				*output_value += value * GAS_DIFFUSION_CONSTANT;
 			}
-			*output_value = next_value;
 		}
 		let mut output_energy = state.input_energy[index] * self_weight;
 		for neighbor in &neighbors[..neighbor_count] {
@@ -3299,7 +3350,7 @@ impl DogmosWorld {
 			}) else {
 				return Ok(false);
 			};
-			// nth() walks the same fixed-size (≤6-entry) neighbor iterator .collect() would have,
+			// nth() walks the same fixed-size (â‰¤6-entry) neighbor iterator .collect() would have,
 			// but without allocating a Vec every single call - this runs once per neighbor step,
 			// so a degree-4 turf was allocating and filling the same 4-element vector 5 times.
 			let Some(neighbor) = self.topology.heat_neighbors(turf).nth(neighbor_index) else {
@@ -3595,7 +3646,7 @@ impl DogmosWorld {
 				.expect("component stage owns traversal state");
 			if let Some(current) = state.queue.get(state.queue_index).copied() {
 				// See advance_stage_heat_topology()'s identical fix: nth() walks the same fixed
-				// (≤6-entry) neighbor iterator .collect() would have, without allocating a Vec
+				// (â‰¤6-entry) neighbor iterator .collect() would have, without allocating a Vec
 				// every single call.
 				let Some(neighbor) = self
 					.topology
@@ -5164,10 +5215,23 @@ impl DogmosWorld {
 		if frontier_graph.is_none() && self.turf_graph.is_none() {
 			self.turf_graph = Some(self.build_turf_graph(&self.topology)?);
 		}
+		/*
+			The mixture record is a fixed 32-slot array because that is the wire layout, but a
+			codebase typically registers far fewer gases, and the stencil costs one pass per slot
+			per neighbor. Run it over the narrowest stride that still covers every occupied slot
+			instead of the full 32.
+
+			The stride starts at the registered gas count and widens for any mixture that carries
+			moles above it, so nothing is dropped even if a caller wrote into an unregistered slot
+			- `apply_mixture_state` copies the wire array through without clamping to the registry.
+			Slots above the stride are zero by construction and the stencil is linear, so their
+			results are zero and the surviving slots are bit-identical to the full-width pass.
+		*/
+		let stride = self.diffusion_gas_stride(&handles)?;
 		self.input.clear();
 		for handle in handles.iter().copied() {
 			let gases = self.require_handle(handle)?.gases;
-			self.input.extend_from_slice(&gases);
+			self.input.extend_from_slice(&gases[..stride]);
 		}
 		self.output.resize(self.input.len(), 0.0);
 		let graph = frontier_graph
@@ -5176,7 +5240,7 @@ impl DogmosWorld {
 			.expect("turf graph was built above");
 		diffusion_step_into_cancellable(
 			graph,
-			MAX_GAS_SLOTS as u32,
+			stride as u32,
 			&self.input,
 			&mut self.output,
 			&mut *should_cancel,
@@ -5189,10 +5253,9 @@ impl DogmosWorld {
 			return Err(WorldError::Cancelled);
 		}
 		for (index, handle) in handles.into_iter().enumerate() {
-			let offset = index * MAX_GAS_SLOTS;
-			let mut gases: [f32; MAX_GAS_SLOTS] = self.output[offset..offset + MAX_GAS_SLOTS]
-				.try_into()
-				.expect("diffusion output uses the fixed gas layout");
+			let offset = index * stride;
+			let mut gases = [0.0_f32; MAX_GAS_SLOTS];
+			gases[..stride].copy_from_slice(&self.output[offset..offset + stride]);
 			canonicalize_gases(&mut gases);
 			let mixture = self.require_handle_mut(handle)?;
 			if mixture.immutable {
@@ -5202,6 +5265,33 @@ impl DogmosWorld {
 			mixture.revision += 1;
 		}
 		Ok(StageResult { work_items })
+	}
+
+	/// The narrowest gas stride the diffusion stencil can run over without losing moles.
+	///
+	/// Never narrower than the registered gas count, and widened to cover any occupied slot above
+	/// it. Returns `MAX_GAS_SLOTS` when no gas registry is installed, preserving the full-width
+	/// behavior for a world that has not registered gases yet.
+	fn diffusion_gas_stride(&self, handles: &[MixtureHandle]) -> Result<usize, WorldError> {
+		let mut stride = self
+			.gas_registry
+			.as_ref()
+			.map_or(MAX_GAS_SLOTS, |registry| registry.specific_heats().len())
+			.min(MAX_GAS_SLOTS);
+		for handle in handles.iter().copied() {
+			if stride == MAX_GAS_SLOTS {
+				break;
+			}
+			let gases = &self.require_handle(handle)?.gases;
+			// Highest occupied slot at or above the current stride, if any.
+			if let Some(highest) = (stride..MAX_GAS_SLOTS)
+				.rev()
+				.find(|&index| gases[index] != 0.0)
+			{
+				stride = highest + 1;
+			}
+		}
+		Ok(stride.max(1))
 	}
 
 	pub fn edge_count(&self) -> usize {
@@ -6429,7 +6519,10 @@ mod tests {
 			seconds_per_tick: 0.5,
 		};
 		world.stage_cursor = Some(StageCursor::new(request, 0));
-		world.stage_diffusion = Some(StageDiffusionState::new([0.0; MAX_GAS_SLOTS]));
+		world.stage_diffusion = Some(StageDiffusionState::new(
+			[0.0; MAX_GAS_SLOTS],
+			MAX_GAS_SLOTS,
+		));
 		world.stage_heat = Some(StageHeatState::new());
 		world.stage_components = Some(StageComponentState::try_new(1, 1).unwrap());
 		world.stage_component_turfs = Some(Vec::new());
