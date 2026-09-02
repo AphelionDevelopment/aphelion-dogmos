@@ -1106,7 +1106,7 @@ fn service_error_code(error: &state::StateError) -> ServiceErrorCode {
 		state::StateError::DuplicateMixtureState(_) => ServiceErrorCode::DuplicateMixtureState,
 		state::StateError::InvalidMixtureState => ServiceErrorCode::InvalidMixtureState,
 		state::StateError::StateCapacityExceeded => ServiceErrorCode::StateCapacityExceeded,
-		state::StateError::AllocationFailed => ServiceErrorCode::AllocationFailed,
+		state::StateError::AllocationFailed(_) => ServiceErrorCode::AllocationFailed,
 		state::StateError::Graph(_) => ServiceErrorCode::InvalidGraph,
 		state::StateError::CallbackBackpressure => ServiceErrorCode::CallbackBackpressure,
 		state::StateError::ReactionTransactionCapacityExceeded => {

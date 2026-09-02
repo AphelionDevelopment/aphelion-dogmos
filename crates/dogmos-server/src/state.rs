@@ -72,7 +72,8 @@ pub enum StateError {
 	Graph(String),
 	State(String),
 	StateCapacityExceeded,
-	AllocationFailed,
+	/// Carries the source location of the reservation that failed. See `WorldError`.
+	AllocationFailed(&'static std::panic::Location<'static>),
 	CallbackBackpressure,
 	CallbackOutputTooSmall,
 	CallbackSequenceExhausted,
@@ -96,6 +97,12 @@ pub enum StateError {
 	ContinuationTokenMismatch(ContinuationToken),
 	ContinuationExpired(ContinuationToken),
 	Cancelled,
+}
+
+/// Builds an `AllocationFailed` tagged with its caller's location. See `world_allocation_failed`.
+#[track_caller]
+fn state_allocation_failed() -> StateError {
+	StateError::AllocationFailed(std::panic::Location::caller())
 }
 
 impl fmt::Display for StateError {
@@ -485,7 +492,7 @@ impl ServiceState {
 			.ok_or(StateError::CallbackSequenceExhausted)?;
 		self.general_callbacks
 			.try_reserve_exact(count as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		for index in 0..count {
 			self.general_callbacks.push_back(QueuedCallback {
 				event: callback.scoped(
@@ -538,7 +545,7 @@ impl ServiceState {
 			.ok_or(StateError::CallbackSequenceExhausted)?;
 		self.general_callbacks
 			.try_reserve_exact(count as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		for (index, callback) in callbacks.iter().copied().enumerate() {
 			self.general_callbacks.push_back(QueuedCallback {
 				event: callback.scoped(
@@ -680,7 +687,7 @@ impl ServiceState {
 		self.expired_continuation_scratch.clear();
 		self.expired_continuation_scratch
 			.try_reserve(self.pending_continuations.len())
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		for (id, continuation) in &self.pending_continuations {
 			if now_ticks >= continuation.deadline_ticks {
 				self.expired_continuation_scratch
@@ -1022,7 +1029,7 @@ impl ServiceState {
 		let mut mutations = Vec::new();
 		mutations
 			.try_reserve_exact(expected_count)
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		self.pending_mixture_state_upload = Some(PendingMixtureStateUpload {
 			id: upload_id,
 			expected_count,
@@ -1118,7 +1125,7 @@ impl ServiceState {
 		let mut core_handles = Vec::new();
 		core_handles
 			.try_reserve_exact(handles.len())
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		core_handles.extend(handles.iter().copied().map(core_handle));
 		let reconciled = self
 			.world
@@ -1127,7 +1134,7 @@ impl ServiceState {
 		let mut snapshots = Vec::new();
 		snapshots
 			.try_reserve_exact(reconciled.len())
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		for handle in reconciled {
 			let handle = wire_handle(handle);
 			snapshots.push(PipenetReconcileSnapshot {
@@ -1791,7 +1798,7 @@ impl ServiceState {
 	) -> Result<(), StateError> {
 		if self.callback_enqueue_failure == Some(checkpoint) {
 			self.callback_enqueue_failure = None;
-			return Err(StateError::AllocationFailed);
+			return Err(state_allocation_failed());
 		}
 		Ok(())
 	}
@@ -1834,23 +1841,23 @@ impl ServiceState {
 		self.callback_enqueue_checkpoint(CallbackEnqueueCheckpoint::ContinuationReserve)?;
 		self.pending_callback_scratch
 			.try_reserve_exact(maximum as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		self.pending_continuation_scratch
 			.try_reserve_exact(continuation_capacity as usize)
-			.map_err(|_| StateError::AllocationFailed)?;
+			.map_err(|_| state_allocation_failed())?;
 		self.callback_enqueue_checkpoint(CallbackEnqueueCheckpoint::CallbackReserve)?;
 		match scope {
 			CallbackScope::General => self
 				.general_callbacks
 				.try_reserve_exact(maximum as usize)
-				.map_err(|_| StateError::AllocationFailed)?,
+				.map_err(|_| state_allocation_failed())?,
 			CallbackScope::Reaction => self
 				.reaction_callbacks
 				.get_mut(&transaction_id)
 				.expect("reaction callback queue was validated before reservation")
 				.callbacks
 				.try_reserve_exact(maximum as usize)
-				.map_err(|_| StateError::AllocationFailed)?,
+				.map_err(|_| state_allocation_failed())?,
 		}
 		Ok(())
 	}
@@ -2294,7 +2301,7 @@ fn pending_callback_from_world_event(
 fn map_world_error(error: WorldError) -> StateError {
 	match error {
 		WorldError::Frontier(FrontierError::Incomplete { .. }) => StateError::FrontierIncomplete,
-		WorldError::Frontier(FrontierError::AllocationFailed) => StateError::AllocationFailed,
+		WorldError::Frontier(FrontierError::AllocationFailed) => state_allocation_failed(),
 		WorldError::Frontier(_) => StateError::FrontierConflict,
 		WorldError::GasMetadata(_)
 		| WorldError::GasRegistryAlreadyInstalled
@@ -2378,7 +2385,7 @@ fn map_world_error(error: WorldError) -> StateError {
 		WorldError::Graph(message) => StateError::Graph(message),
 		WorldError::State(message) => StateError::State(message),
 		WorldError::StateCapacityExceeded => StateError::StateCapacityExceeded,
-		WorldError::AllocationFailed => StateError::AllocationFailed,
+		WorldError::AllocationFailed(location) => StateError::AllocationFailed(location),
 		WorldError::InvalidReactionResult(result) => {
 			StateError::State(format!("invalid reaction result flags: {result}"))
 		}
@@ -3329,10 +3336,10 @@ mod tests {
 			.unwrap();
 		state.fail_next_callback_enqueue_at(CallbackEnqueueCheckpoint::Commit);
 
-		assert_eq!(
+		assert!(matches!(
 			state.enqueue_world_events_at(2, 10, CallbackScope::General, 0),
-			Err(StateError::AllocationFailed)
-		);
+			Err(StateError::AllocationFailed(_))
+		));
 		assert!(state.general_callbacks.is_empty());
 		assert!(state.pending_continuations.is_empty());
 		assert_eq!(state.pending_callback_count, 0);
@@ -3356,15 +3363,15 @@ mod tests {
 			let snapshot_before = state.world.snapshot(room_mixture).unwrap();
 			state.fail_next_callback_enqueue_at(checkpoint);
 
-			assert_eq!(
+			assert!(matches!(
 				state.process_stage_cancellable_at(
 					SimulationStage::ProcessTurfEqualize,
 					0.5,
 					10,
 					|| false,
 				),
-				Err(StateError::AllocationFailed)
-			);
+				Err(StateError::AllocationFailed(_))
+			));
 			assert_eq!(state.world.snapshot(room_mixture).unwrap(), snapshot_before);
 			assert!(state.world.pending_events(2).is_empty());
 			assert!(state.general_callbacks.is_empty());
@@ -3575,14 +3582,14 @@ mod tests {
 			let snapshot_before = state.snapshot(mixture).unwrap();
 			state.fail_next_callback_enqueue_at(checkpoint);
 
-			assert_eq!(
+			assert!(matches!(
 				state.apply_mixture_command(MixtureCommandRequest::React {
 					handle: mixture,
 					target: holder,
 					reaction_profile_threshold_ms: None,
 				}),
-				Err(StateError::AllocationFailed)
-			);
+				Err(StateError::AllocationFailed(_))
+			));
 			assert_eq!(state.snapshot(mixture).unwrap(), snapshot_before);
 			assert!(state.reaction_callbacks.is_empty());
 			assert!(state.pending_continuations.is_empty());
@@ -3626,10 +3633,10 @@ mod tests {
 		assert!(progress.pending);
 		state.fail_next_callback_enqueue_at(CallbackEnqueueCheckpoint::Commit);
 
-		assert_eq!(
+		assert!(matches!(
 			state.enqueue_world_events_at(8, 10, CallbackScope::Reaction, transaction_id),
-			Err(StateError::AllocationFailed)
-		);
+			Err(StateError::AllocationFailed(_))
+		));
 		let queue = state.reaction_callbacks.get(&transaction_id).unwrap();
 		assert!(queue.callbacks.is_empty());
 		assert_eq!(queue.next_sequence, 1);

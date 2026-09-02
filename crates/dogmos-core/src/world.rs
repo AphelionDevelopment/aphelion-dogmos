@@ -604,7 +604,11 @@ pub enum WorldError {
 	Graph(String),
 	State(String),
 	StateCapacityExceeded,
-	AllocationFailed,
+	/// Carries the source location of the reservation that failed.
+	///
+	/// Roughly forty distinct 	ry_reserve sites produce this, and a service log that only says
+	/// `AllocationFailed` cannot tell an operator which one, so the location travels with it.
+	AllocationFailed(&'static std::panic::Location<'static>),
 	Cancelled,
 }
 
@@ -767,7 +771,7 @@ impl StageComponentState {
 		let mut published_generation_by_slot = Vec::new();
 		published_generation_by_slot
 			.try_reserve_exact(slot_count)
-			.map_err(|_| WorldError::AllocationFailed)?;
+			.map_err(|_| world_allocation_failed())?;
 		published_generation_by_slot.resize(slot_count, None);
 		Ok(Self {
 			targets: Vec::new(),
@@ -863,16 +867,25 @@ fn validate_reaction_profile_threshold(threshold_ms: Option<f32>) -> Result<(), 
 	Ok(())
 }
 
+/// Builds an `AllocationFailed` tagged with its caller's location.
+///
+/// `#[track_caller]` makes `Location::caller()` resolve to the reservation that failed rather
+/// than to this helper, so each site is identified without hand-written labels.
+#[track_caller]
+fn world_allocation_failed() -> WorldError {
+	WorldError::AllocationFailed(std::panic::Location::caller())
+}
+
 fn map_topology_error(error: TopologyError) -> WorldError {
 	match error {
-		TopologyError::AllocationFailed => WorldError::AllocationFailed,
+		TopologyError::AllocationFailed => world_allocation_failed(),
 		other => WorldError::Graph(format!("{other:?}")),
 	}
 }
 
 fn transaction_world_error(error: TransactionError) -> WorldError {
 	match error {
-		TransactionError::AllocationFailed => WorldError::AllocationFailed,
+		TransactionError::AllocationFailed => world_allocation_failed(),
 		TransactionError::CapacityExceeded => WorldError::StateCapacityExceeded,
 		TransactionError::HandleConflict { requested, current } => {
 			WorldError::StageConflict(StageConflictReason::TransactionGeneration {
@@ -1278,14 +1291,14 @@ impl DogmosWorld {
 		if required_slots > self.mixtures.len() {
 			self.mixtures
 				.try_reserve_exact(required_slots - self.mixtures.len())
-				.map_err(|_| WorldError::AllocationFailed)?;
+				.map_err(|_| world_allocation_failed())?;
 			self.mixtures
 				.resize_with(required_slots, MixtureSlot::default);
 		}
 		if !mutations.is_empty() {
 			self.free_continuations
 				.try_reserve(self.continuations.len())
-				.map_err(|_| WorldError::AllocationFailed)?;
+				.map_err(|_| world_allocation_failed())?;
 		}
 
 		// Unregistering N mixtures used to scan the entire turf slot table N times (once per
@@ -1437,13 +1450,13 @@ impl DogmosWorld {
 		if required_slots > self.turfs.len() {
 			self.turfs
 				.try_reserve_exact(required_slots - self.turfs.len())
-				.map_err(|_| WorldError::AllocationFailed)?;
+				.map_err(|_| world_allocation_failed())?;
 			self.turfs.resize_with(required_slots, TurfSlot::default);
 		}
 		if !mutations.is_empty() {
 			self.free_continuations
 				.try_reserve(self.continuations.len())
-				.map_err(|_| WorldError::AllocationFailed)?;
+				.map_err(|_| world_allocation_failed())?;
 		}
 
 		for mutation in mutations {
@@ -1517,7 +1530,7 @@ impl DogmosWorld {
 		}
 		self.heat_active
 			.try_reserve(mutations.len())
-			.map_err(|_| WorldError::AllocationFailed)?;
+			.map_err(|_| world_allocation_failed())?;
 		for mutation in mutations {
 			let was_active = self.turfs[mutation.handle.slot as usize]
 				.turf
@@ -1701,7 +1714,7 @@ impl DogmosWorld {
 		let mut slots = Vec::new();
 		slots
 			.try_reserve_exact(mutations.len())
-			.map_err(|_| WorldError::AllocationFailed)?;
+			.map_err(|_| world_allocation_failed())?;
 		for mutation in mutations {
 			let mixture = self.require_handle(mutation.handle)?;
 			if mixture.revision != mutation.expected_revision {
@@ -1752,7 +1765,7 @@ impl DogmosWorld {
 		let mut unique_handles = Vec::new();
 		unique_handles
 			.try_reserve_exact(handles.len())
-			.map_err(|_| WorldError::AllocationFailed)?;
+			.map_err(|_| world_allocation_failed())?;
 		let mut seen = BTreeSet::new();
 		for handle in handles {
 			if !seen.insert(*handle) {
@@ -1791,7 +1804,7 @@ impl DogmosWorld {
 		let mut mutations = Vec::new();
 		mutations
 			.try_reserve_exact(unique_handles.len())
-			.map_err(|_| WorldError::AllocationFailed)?;
+			.map_err(|_| world_allocation_failed())?;
 		for handle in &unique_handles {
 			let mixture = self.require_handle(*handle)?;
 			let volume_ratio = mixture.volume / volume_sum;
@@ -3485,7 +3498,7 @@ impl DogmosWorld {
 		}
 		if self.heat_active.try_reserve(state.nodes.len()).is_err() {
 			self.stage_heat = Some(state);
-			return Err(WorldError::AllocationFailed);
+			return Err(world_allocation_failed());
 		}
 		let completed = u32::try_from(state.nodes.len())
 			.map_err(|_| WorldError::State("turf heat count exceeds u32".into()))?;
@@ -5156,7 +5169,7 @@ impl DogmosWorld {
 		}
 		self.heat_active
 			.try_reserve(nodes.len())
-			.map_err(|_| WorldError::AllocationFailed)?;
+			.map_err(|_| world_allocation_failed())?;
 		for (handle, mut mixture) in staged_mixtures {
 			let current = self.require_handle_mut(handle)?;
 			canonicalize_gases(&mut mixture.gases);
@@ -5931,7 +5944,7 @@ impl DogmosWorld {
 		}
 		self.heat_active
 			.try_reserve(1)
-			.map_err(|_| WorldError::AllocationFailed)?;
+			.map_err(|_| world_allocation_failed())?;
 		let index = u32::try_from(self.heat_active.len())
 			.map_err(|_| WorldError::State("active turf heat count exceeds u32".into()))?;
 		self.heat_active.push(handle);
