@@ -82,6 +82,56 @@ fn compound_operation_ids_are_stable() {
 	);
 }
 
+/// Frames are coalesced into a single write below a size threshold and split above it, and both
+/// peers now read through a `BufReader`. A desync across that boundary would surface as garbage
+/// decodes - absurd counts, bogus handles - far from the transport itself, so pin it here: a long
+/// run of back-to-back frames spanning the threshold must round-trip byte for byte and leave the
+/// stream positioned exactly at the next frame.
+#[test]
+fn framing_round_trips_across_the_coalescing_threshold() {
+	use dogmos_protocol::{read_frame_into, write_frame, ProtocolHeader};
+	use std::io::BufReader;
+
+	// Sizes straddling the 512-byte coalescing limit, plus the empty and header-sized cases.
+	let sizes = [
+		0_usize, 1, 8, 47, 48, 49, 255, 511, 512, 513, 1024, 4096, 16384, 65536,
+	];
+	let mut wire = Vec::new();
+	let mut expected = Vec::new();
+	for (index, &size) in sizes.iter().enumerate() {
+		let payload = (0..size)
+			.map(|byte| (byte.wrapping_mul(31).wrapping_add(index)) as u8)
+			.collect::<Vec<u8>>();
+		let header = ProtocolHeader::request(
+			OperationKind::Echo,
+			index as u64 + 1,
+			7,
+			0x1234_5678_90ab_cdef,
+			size as u32,
+			0,
+		);
+		write_frame(&mut wire, header, &payload).unwrap();
+		expected.push((header, payload));
+	}
+
+	// Read every frame back through a buffer smaller than the largest payload, so the reader has
+	// to both drain buffered bytes and bypass the buffer for bulk frames.
+	let mut reader = BufReader::with_capacity(1024, wire.as_slice());
+	let mut buffer = vec![0_u8; 128 * 1024];
+	for (header, payload) in &expected {
+		let (decoded, len) = read_frame_into(&mut reader, &mut buffer).unwrap();
+		assert_eq!(decoded.request_id, header.request_id);
+		assert_eq!(decoded.payload_len, header.payload_len);
+		assert_eq!(len, payload.len());
+		assert_eq!(
+			&buffer[..len],
+			payload.as_slice(),
+			"payload of frame {} came back corrupted",
+			header.request_id
+		);
+	}
+}
+
 #[test]
 fn mixture_snapshot_batch_shares_the_compact_record_layout() {
 	// The batch deliberately reuses the pipenet record so there is only one compact mixture

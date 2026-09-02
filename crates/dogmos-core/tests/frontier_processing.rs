@@ -126,6 +126,223 @@ fn run_diffusion_stage(world: &mut DogmosWorld, frontier: &[TurfHandle]) {
 	panic!("diffusion stage did not complete within four chunks");
 }
 
+/// Builds a `size` x `size` grid of turfs with 4-connectivity, one gas registered, and the given
+/// moles placed in each cell. Returns the world plus the turf and mixture handles in row order.
+fn diffusion_grid(
+	size: usize,
+	moles_at: impl Fn(usize, usize) -> f32,
+) -> (DogmosWorld, Vec<TurfHandle>, Vec<MixtureHandle>) {
+	let count = size * size;
+	let turfs = (0..count).map(|i| turf(i as u32, 1)).collect::<Vec<_>>();
+	let mixtures = (0..count).map(|i| mixture(i as u32)).collect::<Vec<_>>();
+	let mut world = DogmosWorld::new(16 * 1024 * 1024);
+	world.install_gases(vec![oxygen()]).unwrap();
+	world
+		.apply_lifecycle(
+			&mixtures
+				.iter()
+				.map(|handle| LifecycleMutation {
+					action: LifecycleAction::Register,
+					handle: *handle,
+				})
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+	for y in 0..size {
+		for x in 0..size {
+			let mut gases = [0.0; MAX_GAS_SLOTS];
+			gases[0] = moles_at(x, y);
+			world
+				.apply_mixture_state(&[MixtureStateMutation {
+					handle: mixtures[y * size + x],
+					expected_revision: 0,
+					temperature: 293.15,
+					volume: 2500.0,
+					gases,
+				}])
+				.unwrap();
+		}
+	}
+	world
+		.apply_turf_lifecycle(
+			&turfs
+				.iter()
+				.zip(mixtures.iter())
+				.map(|(handle, mixture)| TurfLifecycleMutation::Register {
+					handle: *handle,
+					mixture: Some(*mixture),
+				})
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+	let mut adjacency = Vec::new();
+	for y in 0..size {
+		for x in 0..size {
+			if x + 1 < size {
+				adjacency.push(TurfAdjacencyMutation {
+					left: turfs[y * size + x],
+					right: turfs[y * size + x + 1],
+					connected: true,
+				});
+			}
+			if y + 1 < size {
+				adjacency.push(TurfAdjacencyMutation {
+					left: turfs[y * size + x],
+					right: turfs[(y + 1) * size + x],
+					connected: true,
+				});
+			}
+		}
+	}
+	world.apply_turf_adjacency(&adjacency).unwrap();
+	(world, turfs, mixtures)
+}
+
+fn run_diffusion_stage_to_completion(world: &mut DogmosWorld, frontier: &[TurfHandle], epoch: u64) {
+	world.begin_frontier(epoch, frontier.len() as u32).unwrap();
+	world.append_frontier(epoch, 0, frontier).unwrap();
+	world.commit_frontier(epoch).unwrap();
+	let request = StageChunkRequest {
+		stage: WorldStage::ProcessTurfs,
+		frontier_epoch: epoch,
+		stage_epoch: epoch,
+		work_limit: 8,
+		seconds_per_tick: 0.5,
+	};
+	for _ in 0..512 {
+		if !world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap()
+			.pending
+		{
+			return;
+		}
+	}
+	panic!("diffusion stage did not complete");
+}
+
+fn total_moles(world: &DogmosWorld, mixtures: &[MixtureHandle]) -> f64 {
+	mixtures
+		.iter()
+		.map(|handle| f64::from(world.snapshot(*handle).unwrap().gases[0]))
+		.sum()
+}
+
+/// The production stencil must not create or destroy gas. A violation here is what a player sees
+/// as gas appearing on a turf that analyzed as empty, and as fires reigniting from nothing.
+#[test]
+fn staged_diffusion_conserves_moles_across_repeated_ticks() {
+	const SIZE: usize = 5;
+	// A single hot cell, so every interior/edge/corner degree is exercised as it spreads.
+	let (mut world, turfs, mixtures) =
+		diffusion_grid(SIZE, |x, y| if x == 2 && y == 2 { 1000.0 } else { 0.0 });
+	let before = total_moles(&world, &mixtures);
+	assert!(
+		(before - 1000.0).abs() < 1e-6,
+		"setup placed {before} moles"
+	);
+
+	for epoch in 1..=8_u64 {
+		run_diffusion_stage_to_completion(&mut world, &turfs, epoch);
+		let after = total_moles(&world, &mixtures);
+		assert!(
+			(before - after).abs() <= 1.0,
+			"tick {epoch} changed total moles from {before} to {after}"
+		);
+	}
+}
+
+/// A uniform field is a fixed point: with every cell equal, diffusion must not move anything.
+/// Any alternating over/under-shoot shows up here as the checkerboard seen in gas overlays.
+#[test]
+fn staged_diffusion_leaves_a_uniform_field_unchanged() {
+	const SIZE: usize = 5;
+	let (mut world, turfs, mixtures) = diffusion_grid(SIZE, |_, _| 100.0);
+	run_diffusion_stage_to_completion(&mut world, &turfs, 1);
+
+	for (index, handle) in mixtures.iter().enumerate() {
+		let moles = world.snapshot(*handle).unwrap().gases[0];
+		assert!(
+			(moles - 100.0).abs() <= 0.01,
+			"cell {index} drifted from a uniform field to {moles}; a uniform field must be a fixed point"
+		);
+	}
+}
+
+fn run_stage_to_completion(
+	world: &mut DogmosWorld,
+	stage: WorldStage,
+	frontier: &[TurfHandle],
+	epoch: u64,
+) {
+	world.begin_frontier(epoch, frontier.len() as u32).unwrap();
+	world.append_frontier(epoch, 0, frontier).unwrap();
+	world.commit_frontier(epoch).unwrap();
+	let request = StageChunkRequest {
+		stage,
+		frontier_epoch: epoch,
+		stage_epoch: epoch,
+		work_limit: 8,
+		seconds_per_tick: 0.5,
+	};
+	for _ in 0..512 {
+		if !world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap()
+			.pending
+		{
+			return;
+		}
+	}
+	panic!("{stage:?} stage did not complete");
+}
+
+/// Excited groups replace every mixture in a zone with the zone average. Getting zone membership
+/// or the divisor wrong creates or destroys gas outright, which is what shows up in game as gas
+/// on a turf that analyzed as empty and as fires reigniting from nothing.
+#[test]
+fn staged_excited_groups_conserve_moles() {
+	const SIZE: usize = 5;
+	// Pressures within the excited-group goal of each other so the whole grid forms one zone.
+	let (mut world, turfs, mixtures) =
+		diffusion_grid(SIZE, |x, y| 100.0 + (x as f32) * 0.001 + (y as f32) * 0.001);
+	let before = total_moles(&world, &mixtures);
+
+	for epoch in 1..=4_u64 {
+		run_stage_to_completion(&mut world, WorldStage::ExcitedGroups, &turfs, epoch);
+		let after = total_moles(&world, &mixtures);
+		assert!(
+			(before - after).abs() <= 0.5,
+			"tick {epoch} changed total moles from {before} to {after}"
+		);
+	}
+}
+
+/// Every turf in a settled zone must end up with the same mixture. A zone that keeps re-splitting
+/// on alternating ticks is what produces a visible checkerboard.
+#[test]
+fn staged_excited_groups_reach_a_stable_uniform_zone() {
+	const SIZE: usize = 4;
+	let (mut world, turfs, mixtures) =
+		diffusion_grid(SIZE, |x, y| 100.0 + (x as f32) * 0.002 + (y as f32) * 0.002);
+	run_stage_to_completion(&mut world, WorldStage::ExcitedGroups, &turfs, 1);
+	let settled = mixtures
+		.iter()
+		.map(|handle| world.snapshot(*handle).unwrap().gases[0])
+		.collect::<Vec<_>>();
+
+	// A second pass over an already-averaged zone must be a no-op.
+	run_stage_to_completion(&mut world, WorldStage::ExcitedGroups, &turfs, 2);
+	for (index, handle) in mixtures.iter().enumerate() {
+		let moles = world.snapshot(*handle).unwrap().gases[0];
+		assert!(
+			(moles - settled[index]).abs() <= 0.001,
+			"cell {index} oscillated between ticks: {} then {moles}",
+			settled[index]
+		);
+	}
+}
+
 /// Diffusion runs over a narrowed gas stride. A mixture may still legally carry moles in a slot
 /// above the registered gas count, because `apply_mixture_state` copies the wire array through
 /// without clamping it to the registry, so the stride has to widen to cover them.
