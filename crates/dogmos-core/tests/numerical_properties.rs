@@ -166,6 +166,58 @@ fn diffusion_can_reuse_a_caller_owned_output_buffer() {
 	assert_eq!(output.as_ptr(), allocation);
 }
 
+/// Straightforward gas-major transcription of the stencil, kept deliberately naive so it can act
+/// as the reference the optimized kernel must reproduce bit for bit.
+fn reference_diffusion_step(
+	neighbors_of: &[&[usize]],
+	gas_count: usize,
+	state: &[f32],
+) -> Vec<f32> {
+	let mut result = vec![0.0_f32; state.len()];
+	for (node_index, adjacent) in neighbors_of.iter().enumerate() {
+		let self_weight = diffusion_self_weight(adjacent.len() as u32).unwrap();
+		for gas_index in 0..gas_count {
+			let state_index = node_index * gas_count + gas_index;
+			let mut next_value = state[state_index] * self_weight;
+			for &neighbor_index in adjacent.iter() {
+				next_value +=
+					state[neighbor_index * gas_count + gas_index] * GAS_DIFFUSION_CONSTANT;
+			}
+			result[state_index] = next_value;
+		}
+	}
+	result
+}
+
+#[test]
+fn diffusion_matches_the_reference_stencil_bit_for_bit() {
+	// Mixed degrees (0 through 4) and gas values that do not sum exactly in binary floating point,
+	// so any change to the accumulation order would show up as a differing last bit.
+	let nodes = (0..6).map(node).collect::<Vec<_>>();
+	let graph = validate_graph(
+		&nodes,
+		&reciprocal_edges(&[(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (2, 3)]),
+	)
+	.unwrap();
+	let neighbors_of: &[&[usize]] = &[&[1, 2, 3, 4], &[0, 2], &[0, 1, 3], &[0, 2], &[0], &[]];
+	let gas_count = 5;
+	let state = (0..nodes.len() * gas_count)
+		.map(|index| (index as f32) * 0.1 + 1.0 / (index as f32 + 3.0))
+		.collect::<Vec<_>>();
+
+	let expected = reference_diffusion_step(neighbors_of, gas_count, &state);
+	let actual = diffusion_step(&graph, gas_count as u32, &state).unwrap();
+
+	assert_eq!(actual.len(), expected.len());
+	for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+		assert_eq!(
+			actual.to_bits(),
+			expected.to_bits(),
+			"value {index} diverged from the reference stencil: {actual} vs {expected}"
+		);
+	}
+}
+
 #[test]
 fn diffusion_cancellation_stops_before_committing_more_work() {
 	let graph = validate_graph(&[node(0), node(1)], &reciprocal_edges(&[(0, 1)])).unwrap();

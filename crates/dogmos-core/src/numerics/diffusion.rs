@@ -203,6 +203,17 @@ pub fn validate_graph(
 			});
 		}
 	}
+	/*
+		Build the CSR adjacency with a counting pass and a prefix sum rather than a
+		`Vec<Vec<u32>>`. The per-node vector cost one heap allocation (plus its growth reallocs)
+		for every node in the graph, which on a full station map is hundreds of thousands of
+		allocations every time the turf graph is rebuilt.
+
+		Resolving each edge's endpoints once here also keeps this to a single `handle_to_index`
+		lookup per edge, the same as the vector-of-vectors build did.
+	*/
+	let mut degrees = vec![0_u32; nodes.len()];
+	let mut resolved = Vec::with_capacity(edge_set.len());
 	for edge in edge_set.iter().copied() {
 		if !edge_set.contains(&DirectedEdge {
 			from: edge.to,
@@ -213,17 +224,12 @@ pub fn validate_graph(
 				to: edge.to,
 			});
 		}
+		let from = handle_to_index[&edge.from];
+		let to = handle_to_index[&edge.to];
+		degrees[from as usize] += 1;
+		resolved.push((from, to));
 	}
-
-	let mut adjacency = vec![Vec::<u32>::new(); nodes.len()];
-	for edge in edge_set {
-		let from = handle_to_index[&edge.from] as usize;
-		adjacency[from].push(handle_to_index[&edge.to]);
-	}
-	for (index, neighbors) in adjacency.iter_mut().enumerate() {
-		neighbors.sort_unstable();
-		let degree = u32::try_from(neighbors.len())
-			.map_err(|_| GraphValidationError::HandleSpaceExceeded)?;
+	for (index, &degree) in degrees.iter().enumerate() {
 		if degree > MAX_CARDINAL_NEIGHBORS {
 			return Err(GraphValidationError::DegreeExceeded {
 				handle: nodes[index].handle,
@@ -232,22 +238,32 @@ pub fn validate_graph(
 		}
 	}
 
-	let edge_count = adjacency.iter().try_fold(0_u32, |total, neighbors| {
-		total.checked_add(u32::try_from(neighbors.len()).ok()?)
-	});
-	let Some(edge_count) = edge_count else {
-		return Err(GraphValidationError::HandleSpaceExceeded);
-	};
 	let mut offsets = Vec::with_capacity(nodes.len() + 1);
-	let mut neighbors = Vec::with_capacity(edge_count as usize);
+	let mut edge_count = 0_u32;
 	offsets.push(0);
-	for adjacent in adjacency {
-		neighbors.extend(adjacent);
-		offsets.push(
-			u32::try_from(neighbors.len())
-				.map_err(|_| GraphValidationError::HandleSpaceExceeded)?,
-		);
+	for &degree in &degrees {
+		edge_count = edge_count
+			.checked_add(degree)
+			.ok_or(GraphValidationError::HandleSpaceExceeded)?;
+		offsets.push(edge_count);
 	}
+
+	let mut neighbors = vec![0_u32; edge_count as usize];
+	let mut cursors = degrees;
+	cursors.fill(0);
+	for (from, to) in resolved {
+		let slot = offsets[from as usize] + cursors[from as usize];
+		neighbors[slot as usize] = to;
+		cursors[from as usize] += 1;
+	}
+	// Each row holds at most `MAX_CARDINAL_NEIGHBORS` entries, so this keeps the ascending
+	// neighbor order the vector-of-vectors build produced without a meaningful sort cost.
+	for index in 0..nodes.len() {
+		let start = offsets[index] as usize;
+		let end = offsets[index + 1] as usize;
+		neighbors[start..end].sort_unstable();
+	}
+
 	Ok(DiffusionGraph {
 		nodes: nodes.to_vec(),
 		handle_to_index,
@@ -317,20 +333,33 @@ pub fn diffusion_step_into_cancellable(
 		return Err(DiffusionError::InvalidStateValue { index });
 	}
 
+	/*
+		Node-major with the gas loop innermost, rather than gas-major with the neighbor loop
+		innermost. Both visit the same values, but this order walks each neighbor's gas row
+		contiguously instead of re-striding the whole state vector once per gas, which keeps the
+		working set to one cache line per row and lets the inner loop vectorize.
+
+		The arithmetic sequence per (node, gas) is unchanged - the self term first, then each
+		neighbor in the same order - so results stay bit-for-bit identical. That equivalence is
+		pinned by `diffusion_matches_the_reference_stencil_bit_for_bit`.
+	*/
 	for node_index in 0..graph.node_count() {
 		if node_index % 64 == 0 && should_cancel() {
 			return Err(DiffusionError::Cancelled);
 		}
 		let adjacent = graph.neighbor_indices(node_index);
 		let self_weight = diffusion_self_weight(adjacent.len() as u32)?;
-		for gas_index in 0..gas_count {
-			let state_index = node_index * gas_count + gas_index;
-			let mut next_value = state[state_index] * self_weight;
-			for &neighbor_index in adjacent {
-				next_value +=
-					state[neighbor_index as usize * gas_count + gas_index] * GAS_DIFFUSION_CONSTANT;
+		let row = node_index * gas_count;
+		let output_row = &mut result[row..row + gas_count];
+		for (output, &value) in output_row.iter_mut().zip(&state[row..row + gas_count]) {
+			*output = value * self_weight;
+		}
+		for &neighbor_index in adjacent {
+			let neighbor_row = neighbor_index as usize * gas_count;
+			let neighbor_row = &state[neighbor_row..neighbor_row + gas_count];
+			for (output, &value) in output_row.iter_mut().zip(neighbor_row) {
+				*output += value * GAS_DIFFUSION_CONSTANT;
 			}
-			result[state_index] = next_value;
 		}
 	}
 	Ok(())

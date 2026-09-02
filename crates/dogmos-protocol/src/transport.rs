@@ -48,9 +48,29 @@ pub fn write_frame(
 			actual: payload.len(),
 		});
 	}
-	ProtocolHeader::decode(&header.encode())?;
-	writer.write_all(&header.encode())?;
-	writer.write_all(payload)?;
+	let header_bytes = header.encode();
+	// Self-check that the header we are about to put on the wire round-trips, then reuse those
+	// same bytes rather than encoding a second time for the write.
+	ProtocolHeader::decode(&header_bytes)?;
+	/*
+		Control frames are overwhelmingly small - an eight byte scalar, an empty acknowledgement,
+		a fixed-size snapshot - and the stream underneath is unbuffered, so splitting every frame
+		into a header write plus a payload write doubles the syscall count on exactly the frames
+		where the round trip is pure latency. Coalesce into one stack buffer when the payload is
+		small, and fall back to two writes for bulk frames, where the second write is amortized
+		over the payload anyway.
+	*/
+	const COALESCE_PAYLOAD_LIMIT: usize = 512;
+	if payload.len() <= COALESCE_PAYLOAD_LIMIT {
+		let mut frame = [0_u8; PROTOCOL_HEADER_LEN as usize + COALESCE_PAYLOAD_LIMIT];
+		let frame_len = header_bytes.len() + payload.len();
+		frame[..header_bytes.len()].copy_from_slice(&header_bytes);
+		frame[header_bytes.len()..frame_len].copy_from_slice(payload);
+		writer.write_all(&frame[..frame_len])?;
+	} else {
+		writer.write_all(&header_bytes)?;
+		writer.write_all(payload)?;
+	}
 	writer.flush()?;
 	Ok(())
 }

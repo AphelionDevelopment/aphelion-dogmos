@@ -61,65 +61,86 @@ fn excited_group_processing(
 ) -> (usize, bool) {
 	let mut found_turfs: HashSet<TurfID, FxBuildHasher> = Default::default();
 	let mut is_cancelled = false;
-	for initial_turf in low_pressure_turfs {
-		if found_turfs.contains(&initial_turf) {
-			continue;
-		}
+	/*
+		Both global locks are taken once for the whole pass rather than once per seed turf. The
+		body calls no DM procs and never needs the arena's write lock, so there is nothing to
+		re-enter, and the pass is bounded by the caller's time budget. `fdm` and `post_process`
+		already hoist the same pair of locks this way.
+	*/
+	with_turf_gases_read(|arena| {
+		GasArena::with_all_mixtures(|all_mixtures| {
+			for initial_turf in low_pressure_turfs {
+				if found_turfs.contains(&initial_turf) {
+					continue;
+				}
 
-		if start_time.elapsed() >= remaining_time {
-			is_cancelled = true;
-			break;
-		}
+				if start_time.elapsed() >= remaining_time {
+					is_cancelled = true;
+					break;
+				}
 
-		with_turf_gases_read(|arena| {
-			let Some(initial_mix_ref) = arena.get_from_id(initial_turf) else {
-				return;
-			};
-			if !initial_mix_ref.enabled() {
-				return;
-			}
+				let Some(initial_index) = arena.get_id(initial_turf) else {
+					continue;
+				};
+				let Some(initial_mix_ref) = arena.get(initial_index) else {
+					continue;
+				};
+				if !initial_mix_ref.enabled() {
+					continue;
+				}
+				let Some(initial_lock) = all_mixtures.get(initial_mix_ref.mix) else {
+					continue;
+				};
 
-			let mut border_turfs: VecDeque<TurfID> = VecDeque::with_capacity(40);
-			let mut turfs: Vec<&TurfMixture> = Vec::with_capacity(200);
-			let mut min_pressure = initial_mix_ref.return_pressure();
-			let mut max_pressure = min_pressure;
-			let mut fully_mixed = Mixture::new();
+				// Carry the node handle alongside the id so the walk below does not re-resolve
+				// each turf through the id map on every pop and on every neighbor.
+				let mut border_turfs: VecDeque<(TurfID, NodeIndex)> = VecDeque::with_capacity(40);
+				let mut turfs: Vec<&TurfMixture> = Vec::with_capacity(200);
+				let mut min_pressure = initial_lock.read().return_pressure();
+				let mut max_pressure = min_pressure;
+				let mut fully_mixed = Mixture::new();
 
-			border_turfs.push_back(initial_turf);
-			found_turfs.insert(initial_turf);
-			GasArena::with_all_mixtures(|all_mixtures| {
-				loop {
+				border_turfs.push_back((initial_turf, initial_index));
+				found_turfs.insert(initial_turf);
+
+				while let Some((_, index)) = border_turfs.pop_front() {
 					if turfs.len() >= 2500 {
 						break;
 					}
-					if let Some(idx) = border_turfs.pop_front() {
-						let Some(tmix) = arena.get_from_id(idx) else {
-							break;
-						};
-						if let Some(lock) = all_mixtures.get(tmix.mix) {
-							let mix = lock.read();
-							let pressure = mix.return_pressure();
-							let this_max = max_pressure.max(pressure);
-							let this_min = min_pressure.min(pressure);
-							if (this_max - this_min).abs() >= pressure_goal {
+					let Some(tmix) = arena.get(index) else {
+						break;
+					};
+					if let Some(lock) = all_mixtures.get(tmix.mix) {
+						let mix = lock.read();
+						let pressure = mix.return_pressure();
+						let this_max = max_pressure.max(pressure);
+						let this_min = min_pressure.min(pressure);
+						if (this_max - this_min).abs() >= pressure_goal {
+							continue;
+						}
+						min_pressure = this_min;
+						max_pressure = this_max;
+						turfs.push(tmix);
+						fully_mixed.merge(&mix);
+						fully_mixed.volume += mix.volume;
+						for adjacent_index in arena.adjacent_node_ids(index) {
+							let Some(adjacent) = arena.get(adjacent_index) else {
+								continue;
+							};
+							// Marked found before the enabled check, as before: a disabled
+							// neighbor still counts as visited and is simply not walked into.
+							if !found_turfs.insert(adjacent.id) {
 								continue;
 							}
-							min_pressure = this_min;
-							max_pressure = this_max;
-							turfs.push(tmix);
-							fully_mixed.merge(&mix);
-							fully_mixed.volume += mix.volume;
-							arena
-								.adjacent_turf_ids(arena.get_id(idx).unwrap())
-								.filter(|&loc| found_turfs.insert(loc))
-								.filter(|&loc| {
-									arena.get_from_id(loc).filter(|b| b.enabled()).is_some()
-								})
-								.for_each(|loc| border_turfs.push_back(loc));
+							if adjacent.enabled() {
+								border_turfs.push_back((adjacent.id, adjacent_index));
+							}
 						}
-					} else {
-						break;
 					}
+				}
+
+				if turfs.is_empty() {
+					continue;
 				}
 				fully_mixed.multiply(1.0 / turfs.len() as f32);
 				if !fully_mixed.is_corrupt() {
@@ -128,8 +149,8 @@ fn excited_group_processing(
 						.filter_map(|turf| all_mixtures.get(turf.mix))
 						.for_each(|mix_lock| mix_lock.write().copy_from_mutable(&fully_mixed));
 				}
-			});
+			}
 		});
-	}
+	});
 	(found_turfs.len(), is_cancelled)
 }

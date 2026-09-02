@@ -189,7 +189,11 @@ impl TurfHeat {
 	}
 
 	pub fn remove_turf(&mut self, id: TurfID) -> bool {
-		if let Some(index) = self.map.shift_remove(&id) {
+		// `swap_remove` rather than `shift_remove`, which memmoves every following entry. Nothing
+		// downstream depends on this map's order: the node set it yields is order-independent,
+		// the dense snapshot sorts `touched_nodes`, and `conduction_step` canonicalizes and sorts
+		// its edges before applying any substep, so the temperatures come out the same either way.
+		if let Some(index) = self.map.swap_remove(&id) {
 			self.graph.remove_node(index);
 			true
 		} else {

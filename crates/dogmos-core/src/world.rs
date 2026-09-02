@@ -4437,19 +4437,45 @@ impl DogmosWorld {
 		if should_cancel() {
 			return Err(WorldError::Cancelled);
 		}
-		let nodes = self
+		/*
+			The staged set is held as one slot-sorted array rather than a `BTreeMap`. The flood
+			fill below resolves a node on every pop and again on every neighbour, and tests
+			membership even more often than that, so the tree descents and their per-node heap
+			cells dominated this stage. A contiguous array answers the same lookups by binary
+			search, and membership becomes a direct index into `found` because positions in this
+			array are dense.
+
+			Iterating it in ascending slot order preserves the `BTreeMap::keys` order the seed
+			loop had, which fixes the order gases are summed in below.
+		*/
+		let mut staged = self
 			.stage_turf_handles()
 			.iter()
 			.copied()
 			.filter_map(|handle| {
 				let turf = self.require_turf_handle(handle).ok()?;
 				let mixture = turf.mixture?;
-				Some((handle.slot, (handle, mixture)))
+				Some((handle.slot, handle, mixture))
 			})
-			.collect::<BTreeMap<_, _>>();
+			.collect::<Vec<_>>();
+		// Stable sort, then keep the last entry of each equal-slot run, so a repeated slot
+		// resolves exactly the way inserting it twice into the `BTreeMap` used to.
+		staged.sort_by_key(|&(slot, _, _)| slot);
+		let mut nodes: Vec<(u32, TurfHandle, MixtureHandle)> = Vec::with_capacity(staged.len());
+		for entry in staged {
+			match nodes.last_mut() {
+				Some(last) if last.0 == entry.0 => *last = entry,
+				_ => nodes.push(entry),
+			}
+		}
 		if nodes.is_empty() {
 			return Ok(StageResult { work_items: 0 });
 		}
+		let position_of = |slot: u32| -> Option<usize> {
+			nodes
+				.binary_search_by_key(&slot, |&(candidate, _, _)| candidate)
+				.ok()
+		};
 		let specific_heats = self
 			.gas_registry
 			.as_ref()
@@ -4457,41 +4483,46 @@ impl DogmosWorld {
 			.specific_heats();
 		let mut heat_values = [0.0; MAX_GAS_SLOTS];
 		heat_values[..specific_heats.len()].copy_from_slice(specific_heats);
-		let mut found = BTreeSet::new();
+		// Positions in `nodes` are dense, so visited marking is a direct index rather than a
+		// tree insert. `queue` and `accepted` carry positions for the same reason.
+		let mut found = vec![false; nodes.len()];
+		let mut queue: Vec<usize> = Vec::new();
+		let mut accepted: Vec<usize> = Vec::new();
+		let mut mutable_mixtures: BTreeSet<MixtureHandle> = BTreeSet::new();
 		let mut work_items = 0_u32;
-		for initial_slot in nodes.keys().copied() {
-			if found.contains(&initial_slot)
+		for initial_position in 0..nodes.len() {
+			if found[initial_position]
 				|| !self
 					.topology
-					.gas_neighbors(nodes[&initial_slot].0)
+					.gas_neighbors(nodes[initial_position].1)
 					.any(|neighbor| {
-						nodes
-							.get(&neighbor.handle.slot)
-							.is_some_and(|(handle, _)| *handle == neighbor.handle)
+						position_of(neighbor.handle.slot)
+							.is_some_and(|position| nodes[position].1 == neighbor.handle)
 					}) {
 				continue;
 			}
 			if should_cancel() {
 				return Err(WorldError::Cancelled);
 			}
-			let initial_mixture = self.require_handle(nodes[&initial_slot].1)?;
+			let initial_mixture = self.require_handle(nodes[initial_position].2)?;
 			if initial_mixture.immutable {
 				continue;
 			}
 			let initial_pressure = mixture_pressure(initial_mixture);
 			let mut minimum_pressure = initial_pressure;
 			let mut maximum_pressure = initial_pressure;
-			let mut queue = vec![initial_slot];
+			queue.clear();
+			queue.push(initial_position);
 			let mut queue_index = 0;
-			let mut accepted = Vec::new();
-			found.insert(initial_slot);
+			accepted.clear();
+			found[initial_position] = true;
 			while queue_index < queue.len() && accepted.len() < 2500 {
 				if should_cancel() {
 					return Err(WorldError::Cancelled);
 				}
-				let slot = queue[queue_index];
+				let position = queue[queue_index];
 				queue_index += 1;
-				let mixture = self.require_handle(nodes[&slot].1)?;
+				let mixture = self.require_handle(nodes[position].2)?;
 				if mixture.immutable {
 					continue;
 				}
@@ -4503,14 +4534,14 @@ impl DogmosWorld {
 				}
 				minimum_pressure = next_minimum;
 				maximum_pressure = next_maximum;
-				accepted.push(slot);
-				for neighbor in self.topology.gas_neighbors(nodes[&slot].0) {
-					if nodes
-						.get(&neighbor.handle.slot)
-						.is_some_and(|(handle, _)| *handle == neighbor.handle)
-						&& found.insert(neighbor.handle.slot)
-					{
-						queue.push(neighbor.handle.slot);
+				accepted.push(position);
+				for neighbor in self.topology.gas_neighbors(nodes[position].1) {
+					let Some(neighbor_position) = position_of(neighbor.handle.slot) else {
+						continue;
+					};
+					if nodes[neighbor_position].1 == neighbor.handle && !found[neighbor_position] {
+						found[neighbor_position] = true;
+						queue.push(neighbor_position);
 					}
 				}
 			}
@@ -4520,9 +4551,9 @@ impl DogmosWorld {
 			let mut mixed_gases = [0.0; MAX_GAS_SLOTS];
 			let mut total_capacity = 0.0;
 			let mut total_energy = 0.0;
-			let mut mutable_mixtures = BTreeSet::new();
-			for slot in &accepted {
-				let handle = nodes[slot].1;
+			mutable_mixtures.clear();
+			for &position in &accepted {
+				let handle = nodes[position].2;
 				let mixture = self.require_handle(handle)?;
 				if transaction.contains(handle) || !mutable_mixtures.insert(handle) {
 					return Err(WorldError::DuplicateMutableTurfMixture(handle));
@@ -4546,8 +4577,8 @@ impl DogmosWorld {
 			} else {
 				MINIMUM_TEMPERATURE_K
 			};
-			for slot in accepted {
-				let handle = nodes[&slot].1;
+			for &position in &accepted {
+				let handle = nodes[position].2;
 				let mixture = self.require_handle(handle)?;
 				let candidate = transaction
 					.touch(handle, mixture.revision, mixture)

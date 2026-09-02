@@ -135,13 +135,27 @@ impl TurfMixture {
 	}
 	/// Returns the total moles of the turf's gas, see [`super::gas::Mixture`]
 	pub fn total_moles(&self) -> f32 {
-		GasArena::with_all_mixtures(|all_mixtures| {
-			all_mixtures
-				.get(self.mix)
-				.unwrap_or_else(|| panic!("Gas mixture not found for turf: {}", self.mix))
-				.read()
-				.total_moles()
-		})
+		GasArena::with_all_mixtures(|all_mixtures| self.total_moles_in(all_mixtures))
+	}
+	/// As `total_moles`, against an arena slice the caller already holds.
+	///
+	/// The convenience accessors above each take the global arena read lock. In a flood fill
+	/// that is one acquisition per visited turf, so the equalizer paths hoist the lock once and
+	/// call these instead - which also avoids re-entering a read lock the caller already owns.
+	pub fn total_moles_in(&self, all_mixtures: &[RwLock<Mixture>]) -> f32 {
+		all_mixtures
+			.get(self.mix)
+			.unwrap_or_else(|| panic!("Gas mixture not found for turf: {}", self.mix))
+			.read()
+			.total_moles()
+	}
+	/// As `is_immutable`, against an arena slice the caller already holds.
+	pub fn is_immutable_in(&self, all_mixtures: &[RwLock<Mixture>]) -> bool {
+		all_mixtures
+			.get(self.mix)
+			.unwrap_or_else(|| panic!("Gas mixture not found for turf: {}", self.mix))
+			.read()
+			.is_immutable()
 	}
 	/// Clears the turf's airs, see [`super::gas::Mixture`]
 	pub fn clear_air(&self) {
@@ -218,6 +232,14 @@ type TurfGraphMap = IndexMap<TurfID, NodeIndex, FxBuildHasher>;
 struct TurfGases {
 	graph: StableDiGraph<TurfMixture, AdjacentFlags>,
 	map: TurfGraphMap,
+	/// How many graph nodes currently name each gas-arena slot, indexed by slot.
+	///
+	/// `GasArena::register_mix` has to know whether a free-list slot is still owned by a turf
+	/// before it hands the slot to a new mixture. Answering that by scanning `graph.node_weights()`
+	/// is linear in the whole turf graph on every single mixture registration, so the count is
+	/// maintained here instead. Space turfs deliberately share one immutable mixture, so this has
+	/// to be a count rather than a flag.
+	mix_refcounts: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -231,17 +253,56 @@ pub(crate) struct TurfRuntimeMetrics {
 }
 
 impl TurfGases {
+	fn with_capacity(nodes: usize, edges: usize) -> Self {
+		Self {
+			graph: StableDiGraph::with_capacity(nodes, edges),
+			map: IndexMap::with_capacity_and_hasher(nodes, FxBuildHasher),
+			mix_refcounts: Vec::new(),
+		}
+	}
+
+	fn acquire_mix(&mut self, mix: usize) {
+		if self.mix_refcounts.len() <= mix {
+			self.mix_refcounts.resize(mix + 1, 0);
+		}
+		self.mix_refcounts[mix] = self.mix_refcounts[mix].saturating_add(1);
+	}
+
+	fn release_mix(&mut self, mix: usize) {
+		if let Some(count) = self.mix_refcounts.get_mut(mix) {
+			*count = count.saturating_sub(1);
+		}
+	}
+
+	/// Whether any graph node still names this gas-arena slot.
+	fn mix_is_referenced(&self, mix: usize) -> bool {
+		self.mix_refcounts.get(mix).is_some_and(|&count| count > 0)
+	}
+
 	pub fn insert_turf(&mut self, tmix: TurfMixture) {
+		let new_mix = tmix.mix;
 		if let Some(&node_id) = self.map.get(&tmix.id) {
 			let thin = self.graph.node_weight_mut(node_id).unwrap();
-			*thin = tmix
+			let previous_mix = thin.mix;
+			*thin = tmix;
+			if previous_mix != new_mix {
+				self.release_mix(previous_mix);
+				self.acquire_mix(new_mix);
+			}
 		} else {
 			self.map.insert(tmix.id, self.graph.add_node(tmix));
+			self.acquire_mix(new_mix);
 		}
 	}
 	pub fn remove_turf(&mut self, id: TurfID) {
-		if let Some(index) = self.map.shift_remove(&id) {
-			self.graph.remove_node(index);
+		// `swap_remove` rather than `shift_remove`: nothing reads this map in index order (every
+		// consumer goes through `get`/`par_values`, and no float accumulation is ordered by it),
+		// and `NodeIndex` handles stay valid across it because the graph is a `StableDiGraph`.
+		// `shift_remove` memmoves every following entry, which is up to the whole map per turf.
+		if let Some(index) = self.map.swap_remove(&id) {
+			if let Some(removed) = self.graph.remove_node(index) {
+				self.release_mix(removed.mix);
+			}
 		}
 	}
 	pub fn update_adjacencies(&mut self, idx: TurfID, adjacent_list: ByondValue) -> Result<()> {
@@ -381,10 +442,7 @@ pub fn wait_for_tasks() {
 pub fn initialize_turfs() {
 	// 10x 255x255 zlevels
 	// Reserve room for the graph's expected node and edge counts.
-	*TURF_GASES.write() = Some(TurfGases {
-		graph: StableDiGraph::with_capacity(650_250, 1_300_500),
-		map: IndexMap::with_capacity_and_hasher(650_250, FxBuildHasher),
-	});
+	*TURF_GASES.write() = Some(TurfGases::with_capacity(650_250, 1_300_500));
 	*PLANETARY_ATMOS.write() = Some(Default::default());
 }
 
@@ -446,7 +504,7 @@ pub(crate) fn gas_mix_is_referenced(mix: usize) -> bool {
 	TURF_GASES
 		.read()
 		.as_ref()
-		.is_some_and(|arena| arena.graph.node_weights().any(|turf| turf.mix == mix))
+		.is_some_and(|arena| arena.mix_is_referenced(mix))
 }
 
 /// Returns the number of on-demand space-boundary nodes in the gas graph.
@@ -774,9 +832,118 @@ fn adjacent_tile_ids(adj: Directions, i: TurfID, max_x: i32, max_y: i32) -> Adja
 mod tests {
 	use super::{
 		initialize_turfs, prepare_turfs_for_world, shutdown_turfs, turf_runtime_metrics,
-		PLANETARY_ATMOS, TURF_GASES,
+		SimulationFlags, TurfGases, TurfMixture, PLANETARY_ATMOS, TURF_GASES,
 	};
+	use std::sync::atomic::AtomicU64;
 	static TURF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+	fn turf(id: u32, mix: usize) -> TurfMixture {
+		TurfMixture {
+			mix,
+			id,
+			generation: 1,
+			flags: SimulationFlags::SIMULATION_ALL,
+			planetary_atmos: None,
+			vis_hash: AtomicU64::new(0),
+		}
+	}
+
+	/// The reference-count fast path must answer exactly what scanning every node would have.
+	/// `register_mix` hands a gas-arena slot to a new mixture based on this answer, so a false
+	/// negative would alias two live mixtures onto one slot.
+	fn scan_says_referenced(arena: &TurfGases, mix: usize) -> bool {
+		arena.graph.node_weights().any(|turf| turf.mix == mix)
+	}
+
+	fn assert_agrees_with_scan(arena: &TurfGases, slots: std::ops::Range<usize>) {
+		for mix in slots {
+			assert_eq!(
+				arena.mix_is_referenced(mix),
+				scan_says_referenced(arena, mix),
+				"refcount and node scan disagree about gas slot {mix}"
+			);
+		}
+	}
+
+	#[test]
+	fn mix_reference_counts_track_insertion_replacement_and_removal() {
+		let mut arena = TurfGases::with_capacity(0, 0);
+		assert_agrees_with_scan(&arena, 0..4);
+
+		arena.insert_turf(turf(10, 0));
+		arena.insert_turf(turf(11, 1));
+		assert_agrees_with_scan(&arena, 0..4);
+		assert!(arena.mix_is_referenced(0));
+		assert!(arena.mix_is_referenced(1));
+
+		// Re-registering a turf onto a different slot must release the slot it left behind.
+		arena.insert_turf(turf(11, 2));
+		assert_agrees_with_scan(&arena, 0..4);
+		assert!(!arena.mix_is_referenced(1));
+		assert!(arena.mix_is_referenced(2));
+
+		// Re-registering onto the same slot must not double-count it.
+		arena.insert_turf(turf(11, 2));
+		arena.remove_turf(11);
+		assert_agrees_with_scan(&arena, 0..4);
+		assert!(!arena.mix_is_referenced(2));
+
+		arena.remove_turf(10);
+		assert_agrees_with_scan(&arena, 0..4);
+
+		// Removing an id the arena never held must not disturb the counts.
+		arena.remove_turf(999);
+		assert_agrees_with_scan(&arena, 0..4);
+	}
+
+	#[test]
+	fn shared_mix_slots_stay_referenced_until_the_last_turf_leaves() {
+		// Space turfs deliberately share one immutable DM mixture, so the slot has to survive
+		// until every turf naming it is gone.
+		let mut arena = TurfGases::with_capacity(0, 0);
+		for id in 20..25 {
+			arena.insert_turf(turf(id, 7));
+		}
+		assert_agrees_with_scan(&arena, 0..8);
+
+		for id in 20..24 {
+			arena.remove_turf(id);
+			assert!(
+				arena.mix_is_referenced(7),
+				"slot 7 released while turfs still name it"
+			);
+			assert_agrees_with_scan(&arena, 0..8);
+		}
+
+		arena.remove_turf(24);
+		assert!(!arena.mix_is_referenced(7));
+		assert_agrees_with_scan(&arena, 0..8);
+	}
+
+	#[test]
+	fn removing_a_turf_keeps_other_node_handles_valid() {
+		// `swap_remove` reorders the id map; the `NodeIndex` handles it stores must still resolve.
+		let mut arena = TurfGases::with_capacity(0, 0);
+		for (offset, id) in (30..40).enumerate() {
+			arena.insert_turf(turf(id, offset));
+		}
+		arena.remove_turf(31);
+		arena.remove_turf(38);
+
+		for (offset, id) in (30..40).enumerate() {
+			if id == 31 || id == 38 {
+				assert!(arena.get_id(id).is_none());
+				continue;
+			}
+			let index = arena
+				.get_id(id)
+				.expect("surviving turf kept its node handle");
+			let mixture = arena.get(index).expect("node handle still resolves");
+			assert_eq!(mixture.id, id);
+			assert_eq!(mixture.mix, offset);
+		}
+		assert_agrees_with_scan(&arena, 0..12);
+	}
 
 	#[test]
 	fn turf_runtime_metrics_report_source_layout_and_reserved_capacity() {

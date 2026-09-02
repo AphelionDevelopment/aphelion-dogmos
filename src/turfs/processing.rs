@@ -13,6 +13,7 @@ use tinyvec::TinyVec;
 const EQUALIZE_PROFILE_FDM_ONLY: i32 = 0;
 const EQUALIZE_PROFILE_FAST_ZONE: i32 = 1;
 const PRESSURE_CALLBACK_BATCH_SIZE: usize = 256;
+const POST_PROCESS_CALLBACK_BATCH_SIZE: usize = 256;
 
 /// Returns: If a processing thread is running or not.
 #[auxmacros::bind("/datum/controller/subsystem/air/proc/thread_running")]
@@ -339,10 +340,7 @@ pub(crate) fn capture_two_turf_diffusion_trace() -> super::katmos::LegacyStageTr
 		RwLock::new(left_gas),
 		RwLock::new(Mixture::from_vol(crate::constants::CELL_VOLUME)),
 	];
-	let mut arena = TurfGases {
-		graph: StableDiGraph::with_capacity(0, 0),
-		map: IndexMap::with_hasher(FxBuildHasher),
-	};
+	let mut arena = TurfGases::with_capacity(0, 0);
 	for (mix, id) in [(0, 10), (1, 11)] {
 		arena.insert_turf(TurfMixture {
 			mix,
@@ -600,47 +598,80 @@ fn post_process() {
 					.collect::<Vec<_>>()
 			})
 		});
-		processables
-			.into_par_iter()
-			.for_each(|(tmix, should_update_vis, should_react)| {
-				let id = tmix.id;
-				let generation = tmix.generation;
+		/*
+			One boxed callback per turf meant two heap allocations per processable turf every
+			cycle, each reporting zero owned bytes so queue backpressure could not see them.
+			Batch them the way the pressure-difference path above already does, and report the
+			transferred capacity so the queue's accounting is honest.
 
-				if should_react {
-					let _ = auxcallback::queue_callback(
-						Box::new(move || {
-							if !crate::turfs::turf_callback_is_current(id, generation) {
-								return Ok(());
+			Reactions are queued ahead of visual updates so an overlay reflects the gas state the
+			reaction left behind; previously the two were interleaved in nondeterministic rayon
+			order.
+		*/
+		let mut reacting: Vec<(TurfID, u32)> = Vec::new();
+		let mut revisualizing: Vec<(TurfID, u32)> = Vec::new();
+		for (tmix, should_update_vis, should_react) in processables {
+			if should_react {
+				reacting.push((tmix.id, tmix.generation));
+			}
+			if should_update_vis {
+				revisualizing.push((tmix.id, tmix.generation));
+			}
+		}
+
+		queue_turf_callback_batches(reacting, |batch| {
+			Box::new(move || {
+				let mut first_error = None;
+				for (id, generation) in batch {
+					if !crate::turfs::turf_callback_is_current(id, generation) {
+						continue;
+					}
+					let turf = ByondValue::new_ref(ValueType::Turf, id);
+					match turf.read_var_id(byond_string!("air")) {
+						Ok(air) if !air.is_null() => {
+							if let Err(error) = react_hook(air, turf).wrap_err("Reacting") {
+								first_error.get_or_insert(error);
 							}
-							let turf = ByondValue::new_ref(ValueType::Turf, id);
-							match turf.read_var_id(byond_string!("air")) {
-								Ok(air) if !air.is_null() => {
-									react_hook(air, turf).wrap_err("Reacting")?;
-									Ok(())
-								}
-								//turf is no longer valid for reactions
-								_ => Ok(()),
-							}
-						}),
-						0,
-					);
+						}
+						//turf is no longer valid for reactions
+						_ => (),
+					}
 				}
+				first_error.map_or(Ok(()), Err)
+			})
+		});
 
-				if should_update_vis {
-					let _ = auxcallback::queue_callback(
-						Box::new(move || {
-							if !crate::turfs::turf_callback_is_current(id, generation) {
-								return Ok(());
-							}
-							let turf = ByondValue::new_ref(ValueType::Turf, id);
-
-							//turf is checked for validity in update_visuals
-							update_visuals(turf).wrap_err("Updating Visuals")?;
-							Ok(())
-						}),
-						0,
-					);
+		queue_turf_callback_batches(revisualizing, |batch| {
+			Box::new(move || {
+				let mut first_error = None;
+				for (id, generation) in batch {
+					if !crate::turfs::turf_callback_is_current(id, generation) {
+						continue;
+					}
+					let turf = ByondValue::new_ref(ValueType::Turf, id);
+					//turf is checked for validity in update_visuals
+					if let Err(error) = update_visuals(turf).wrap_err("Updating Visuals") {
+						first_error.get_or_insert(error);
+					}
 				}
-			});
+				first_error.map_or(Ok(()), Err)
+			})
+		});
 	});
+}
+
+/// Queues `turfs` as bounded batches so a busy cycle costs one boxed callback per batch instead
+/// of one per turf.
+fn queue_turf_callback_batches(
+	mut turfs: Vec<(TurfID, u32)>,
+	mut wrap: impl FnMut(Vec<(TurfID, u32)>) -> Box<dyn FnOnce() -> Result<()> + Send + Sync>,
+) {
+	while !turfs.is_empty() {
+		let batch_len = POST_PROCESS_CALLBACK_BATCH_SIZE.min(turfs.len());
+		let batch = turfs.drain(..batch_len).collect::<Vec<_>>();
+		let owned_bytes = batch
+			.capacity()
+			.saturating_mul(std::mem::size_of::<(TurfID, u32)>());
+		let _ = auxcallback::queue_callback(wrap(batch), owned_bytes);
+	}
 }

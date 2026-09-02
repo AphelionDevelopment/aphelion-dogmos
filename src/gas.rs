@@ -208,6 +208,39 @@ impl GasArena {
 			f(&mut src_mix, &mut arg_mix)
 		}
 	}
+	/// As `with_gas_mixtures_mut`, but against an arena slice the caller already holds.
+	///
+	/// Callers that have hoisted `with_all_mixtures` out of a loop must use this rather than
+	/// re-entering `GAS_MIXTURES.read()`: a second read acquisition while a writer is queued
+	/// would block behind that writer and deadlock. The per-mixture lock ordering is identical.
+	/// # Errors
+	/// If either slot is absent, the slots alias, or the closure itself errors.
+	pub fn with_gas_mixtures_mut_in<T, F>(
+		all_mixtures: &[RwLock<Mixture>],
+		src: usize,
+		arg: usize,
+		f: F,
+	) -> Result<T>
+	where
+		F: FnOnce(&mut Mixture, &mut Mixture) -> Result<T>,
+	{
+		let src_lock = all_mixtures
+			.get(src)
+			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {src} exists!"))?;
+		let arg_lock = all_mixtures
+			.get(arg)
+			.ok_or_else(|| eyre::eyre!("No gas mixture with ID {arg} exists!"))?;
+		ensure_distinct_mixture_slots(src, arg)?;
+		if src < arg {
+			let mut src_mix = src_lock.write();
+			let mut arg_mix = arg_lock.write();
+			f(&mut src_mix, &mut arg_mix)
+		} else {
+			let mut arg_mix = arg_lock.write();
+			let mut src_mix = src_lock.write();
+			f(&mut src_mix, &mut arg_mix)
+		}
+	}
 	/// Runs the given closure on the gas mixture *locks* rather than an already-locked version.
 	/// # Errors
 	/// If no such gas mixture exists or the closure itself errors.
