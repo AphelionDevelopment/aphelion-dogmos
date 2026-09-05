@@ -1,5 +1,8 @@
 use crate::metadata::TurfHandle;
-use std::collections::HashSet;
+use std::{
+	collections::{HashMap, HashSet},
+	sync::OnceLock,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrontierError {
@@ -38,7 +41,8 @@ pub(crate) struct FrontierState {
 	// Mirrors `committed`'s membership so add()'s duplicate check and remove()'s filter are O(1)
 	// per handle instead of rebuilding a HashSet from the whole committed vec on every call -
 	// the steady-state incremental path exists specifically to avoid full-frontier-sized work.
-	committed_set: HashSet<TurfHandle>,
+	committed_set: HashMap<TurfHandle, usize>,
+	committed_view: OnceLock<Vec<TurfHandle>>,
 	upload_epoch: Option<u64>,
 	upload_expected: u32,
 	upload_received: u32,
@@ -189,7 +193,14 @@ impl FrontierState {
 		self.upload_received = 0;
 		self.upload_seen.clear();
 		self.committed_set.clear();
-		self.committed_set.extend(self.committed.iter().copied());
+		self.committed_set.extend(
+			self.committed
+				.iter()
+				.copied()
+				.enumerate()
+				.map(|(index, handle)| (handle, index)),
+		);
+		self.committed_view.take();
 		Ok(self.committed.len() as u32)
 	}
 
@@ -214,7 +225,7 @@ impl FrontierState {
 				requested: epoch,
 			});
 		}
-		let projected = self.committed.len().saturating_add(handles.len());
+		let projected = self.committed_set.len().saturating_add(handles.len());
 		if projected > maximum as usize {
 			return Err(FrontierError::CountExceeded {
 				actual: u32::try_from(projected).unwrap_or(u32::MAX),
@@ -223,12 +234,21 @@ impl FrontierState {
 		}
 		let mut incoming = HashSet::with_capacity(handles.len());
 		for handle in handles {
-			if self.committed_set.contains(handle) || !incoming.insert(*handle) {
+			if self.committed_set.contains_key(handle) || !incoming.insert(*handle) {
 				return Err(FrontierError::DuplicateHandle(*handle));
 			}
 		}
+		self.compact();
+		let start = self.committed.len();
 		self.committed.extend_from_slice(handles);
-		self.committed_set.extend(handles.iter().copied());
+		self.committed_set.extend(
+			handles
+				.iter()
+				.copied()
+				.enumerate()
+				.map(|(index, handle)| (handle, start + index)),
+		);
+		self.committed_view.take();
 		self.committed_epoch = Some(epoch);
 		Ok(u32::try_from(handles.len()).unwrap_or(u32::MAX))
 	}
@@ -252,17 +272,29 @@ impl FrontierState {
 				requested: epoch,
 			});
 		}
-		let removing: HashSet<TurfHandle> = handles.iter().copied().collect();
-		let before = self.committed.len();
-		self.committed.retain(|handle| {
-			let remove = removing.contains(handle);
-			if remove {
-				self.committed_set.remove(handle);
-			}
-			!remove
-		});
+		let before = self.committed_set.len();
+		for handle in handles {
+			self.committed_set.remove(handle);
+		}
+		self.committed_view.take();
+		self.compact();
 		self.committed_epoch = Some(epoch);
-		Ok(u32::try_from(before - self.committed.len()).unwrap_or(u32::MAX))
+		Ok((before - self.committed_set.len()) as u32)
+	}
+
+	fn compact(&mut self) {
+		if self.committed.len() <= self.committed_set.len().saturating_mul(2) {
+			return;
+		}
+		let mut index = 0;
+		self.committed.retain(|handle| {
+			let keep = self.committed_set.get(handle) == Some(&index);
+			index += 1;
+			keep
+		});
+		for (index, handle) in self.committed.iter().enumerate() {
+			*self.committed_set.get_mut(handle).unwrap() = index;
+		}
 	}
 
 	pub(crate) fn committed_epoch(&self) -> Option<u64> {
@@ -270,7 +302,16 @@ impl FrontierState {
 	}
 
 	pub(crate) fn committed(&self) -> &[TurfHandle] {
-		&self.committed
+		self.committed_view.get_or_init(|| {
+			self.committed
+				.iter()
+				.copied()
+				.enumerate()
+				.filter_map(|(index, handle)| {
+					(self.committed_set.get(&handle) == Some(&index)).then_some(handle)
+				})
+				.collect()
+		})
 	}
 
 	pub(crate) fn upload_bytes(&self) -> u64 {
@@ -281,11 +322,17 @@ impl FrontierState {
 
 	pub(crate) fn committed_storage_bytes_lower_bound(&self) -> u64 {
 		(self.committed.capacity() * std::mem::size_of::<TurfHandle>()
-			+ self.committed_set.capacity() * std::mem::size_of::<TurfHandle>()) as u64
+			+ self.committed_set.capacity() * std::mem::size_of::<(TurfHandle, usize)>()
+			+ self.committed_view.get().map_or(0, |view| {
+				view.capacity() * std::mem::size_of::<TurfHandle>()
+			})) as u64
 	}
 
 	pub(crate) fn committed_capacities(&self) -> (usize, usize) {
-		(self.committed.capacity(), self.committed_set.capacity())
+		(
+			self.committed.capacity() + self.committed_view.get().map_or(0, Vec::capacity),
+			self.committed_set.capacity(),
+		)
 	}
 
 	fn is_received(&self, index: u32) -> bool {

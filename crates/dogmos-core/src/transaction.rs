@@ -31,6 +31,33 @@ pub(crate) struct IndexedTransaction<T> {
 }
 
 impl<T: Clone> IndexedTransaction<T> {
+	pub(crate) fn prepare(
+		&mut self,
+		slot_count: usize,
+		max_entries: usize,
+	) -> Result<(), TransactionError> {
+		self.clear();
+		if max_entries >= UNUSED_INDEX as usize {
+			return Err(TransactionError::CapacityExceeded);
+		}
+		let words = slot_count
+			.checked_add(BITS_PER_WORD - 1)
+			.ok_or(TransactionError::CapacityExceeded)?
+			/ BITS_PER_WORD;
+		self.slot_to_index
+			.try_reserve(slot_count.saturating_sub(self.slot_to_index.len()))
+			.map_err(|_| TransactionError::AllocationFailed)?;
+		self.slot_to_index.resize(slot_count, UNUSED_INDEX);
+		self.touched_bits
+			.try_reserve(words.saturating_sub(self.touched_bits.len()))
+			.map_err(|_| TransactionError::AllocationFailed)?;
+		self.touched_bits.resize(words, 0);
+		self.entries
+			.try_reserve(max_entries)
+			.map_err(|_| TransactionError::AllocationFailed)?;
+		self.max_entries = max_entries;
+		Ok(())
+	}
 	pub(crate) fn try_new(slot_count: usize, max_entries: usize) -> Result<Self, TransactionError> {
 		if max_entries >= UNUSED_INDEX as usize {
 			return Err(TransactionError::CapacityExceeded);
@@ -68,6 +95,7 @@ impl<T: Clone> IndexedTransaction<T> {
 		self.entries.len()
 	}
 
+	#[cfg(test)]
 	pub(crate) fn checkpoint(&self) -> usize {
 		self.entries.len()
 	}
@@ -145,6 +173,7 @@ impl<T: Clone> IndexedTransaction<T> {
 		}
 	}
 
+	#[cfg(test)]
 	pub(crate) fn rollback_to(&mut self, checkpoint: usize) {
 		for entry in self.entries.drain(checkpoint..) {
 			let slot = entry.handle.slot as usize;
@@ -153,10 +182,21 @@ impl<T: Clone> IndexedTransaction<T> {
 		}
 	}
 
+	pub(crate) fn retire(&mut self, index: usize) {
+		let slot = self.entries[index].handle.slot as usize;
+		self.slot_to_index[slot] = UNUSED_INDEX;
+		self.touched_bits[slot / BITS_PER_WORD] &= !(1 << (slot % BITS_PER_WORD));
+	}
+
+	pub(crate) fn clear_retired(&mut self) {
+		self.entries.clear();
+	}
+
 	pub(crate) fn clear(&mut self) {
 		drop(self.drain_entries());
 	}
 
+	#[cfg(debug_assertions)]
 	pub(crate) fn sort_by_handle(&mut self) {
 		self.entries.sort_unstable_by_key(|entry| entry.handle);
 		for (index, entry) in self.entries.iter().enumerate() {

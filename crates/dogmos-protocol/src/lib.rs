@@ -1461,19 +1461,36 @@ pub fn decode_mixture_snapshot_batch_response_into(
 	maximum: u32,
 	output: &mut Vec<MixtureSnapshotRecord>,
 ) -> Result<(), ProtocolError> {
-	let count = validate_counted_payload(input, MIXTURE_SNAPSHOT_RECORD_LEN, maximum)?;
+	let entries = mixture_snapshot_batch_records(input, maximum)?;
 	output.clear();
-	output.reserve(count as usize);
-	for index in 0..count as usize {
-		let offset = 4 + index * MIXTURE_SNAPSHOT_RECORD_LEN;
-		output.push(MixtureSnapshotRecord {
-			handle: WireHandle::decode(&input[offset..offset + 8])?,
-			snapshot: decode_pipenet_reconcile_snapshot(
-				&input[offset + 8..offset + MIXTURE_SNAPSHOT_RECORD_LEN],
-			)?,
-		});
+	output.reserve(entries.len());
+	for entry in entries {
+		output.push(entry?);
 	}
 	Ok(())
+}
+
+/// Iterates fixed-width snapshot records without an intermediate record allocation.
+///
+/// Each record must be decoded successfully before publishing a response to a caller.
+pub fn mixture_snapshot_batch_records(
+	input: &[u8],
+	maximum: u32,
+) -> Result<
+	impl ExactSizeIterator<Item = Result<MixtureSnapshotRecord, ProtocolError>> + '_,
+	ProtocolError,
+> {
+	validate_counted_payload(input, MIXTURE_SNAPSHOT_RECORD_LEN, maximum)?;
+	Ok(input[4..]
+		.as_chunks::<MIXTURE_SNAPSHOT_RECORD_LEN>()
+		.0
+		.iter()
+		.map(|record| {
+			Ok(MixtureSnapshotRecord {
+				handle: WireHandle::decode(&record[..8])?,
+				snapshot: decode_pipenet_reconcile_snapshot(&record[8..])?,
+			})
+		}))
 }
 
 fn encode_pipenet_reconcile_snapshot(

@@ -14,34 +14,34 @@ use dogmos_process_metrics::{
 	PROCESS_WORKING_SET_AVAILABLE,
 };
 use dogmos_protocol::{
-	decode_adjust_multiple_request, decode_mixture_snapshot_batch_response_into,
-	decode_pipenet_reconcile_response, encode_adjust_multiple_request,
-	encode_continuation_adjust_multiple_request, encode_gas_metadata_batch, encode_lifecycle_batch,
-	encode_mixture_snapshot_batch_request, encode_mixture_state_batch,
-	encode_pipenet_reconcile_request, encode_reaction_metadata_batch, encode_turf_adjacency_batch,
-	encode_turf_heat_adjacency_batch, encode_turf_heat_batch, encode_turf_lifecycle_batch,
-	CallbackBatchHeader, CallbackBatchRequest, CallbackEvent, CallbackScope,
-	ContinuationCommandRequest, ContinuationResumeRequest, ContinuationToken,
-	FrontierAppendRequest, FrontierAppendResponse, FrontierBeginRequest, FrontierBeginResponse,
-	FrontierCommitRequest, FrontierCommitResponse, FrontierMutateRequest, FrontierMutateResponse,
-	GasMetadataRegistration, LifecycleAction, LifecycleMutation, MixtureAdjustment,
-	MixtureCommandRequest, MixtureCommandResponse, MixtureSnapshot, MixtureSnapshotRequest,
-	MixtureStateMutation, MixtureStateUploadAbortRequest, MixtureStateUploadAppendRequest,
-	MixtureStateUploadAppendResponse, MixtureStateUploadBeginRequest,
-	MixtureStateUploadBeginResponse, MixtureStateUploadCommitRequest,
-	MixtureStateUploadCommitResponse, OperationKind, ReactionMetadataRegistration, ScalarValue,
-	ServiceTelemetry, SimulationStage, SimulationStageRequest, SimulationStageResponse,
-	TurfAdjacencyMutation, TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot,
-	TurfHeatSnapshotRequest, TurfHeatState, TurfLifecycleMutation, WireFireProducts,
-	WireGasFireRole, WireGasProduct, WireGasRequirement, WireHandle, WireReactionExecution,
-	CALLBACK_BATCH_HEADER_LEN, CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION,
-	GAS_METADATA_RECORD_LEN, LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS,
-	MAX_MIXTURE_SNAPSHOT_BATCH, MAX_PIPENET_RECONCILE_MIXTURES, MIXTURE_ADJUSTMENT_LEN,
-	MIXTURE_ADJUST_MULTIPLE_HEADER_LEN, MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN,
-	MIXTURE_SNAPSHOT_LEN, MIXTURE_SNAPSHOT_RECORD_LEN, MIXTURE_STATE_MUTATION_LEN,
-	PIPENET_RECONCILE_SNAPSHOT_LEN, REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN,
-	SIMULATION_STAGE_RESPONSE_LEN, TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN,
-	TURF_HEAT_MUTATION_LEN, TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
+	decode_adjust_multiple_request, decode_pipenet_reconcile_response,
+	encode_adjust_multiple_request, encode_continuation_adjust_multiple_request,
+	encode_gas_metadata_batch, encode_lifecycle_batch, encode_mixture_snapshot_batch_request,
+	encode_mixture_state_batch, encode_pipenet_reconcile_request, encode_reaction_metadata_batch,
+	encode_turf_adjacency_batch, encode_turf_heat_adjacency_batch, encode_turf_heat_batch,
+	encode_turf_lifecycle_batch, mixture_snapshot_batch_records, CallbackBatchHeader,
+	CallbackBatchRequest, CallbackEvent, CallbackScope, ContinuationCommandRequest,
+	ContinuationResumeRequest, ContinuationToken, FrontierAppendRequest, FrontierAppendResponse,
+	FrontierBeginRequest, FrontierBeginResponse, FrontierCommitRequest, FrontierCommitResponse,
+	FrontierMutateRequest, FrontierMutateResponse, GasMetadataRegistration, LifecycleAction,
+	LifecycleMutation, MixtureAdjustment, MixtureCommandRequest, MixtureCommandResponse,
+	MixtureSnapshot, MixtureSnapshotRequest, MixtureStateMutation, MixtureStateUploadAbortRequest,
+	MixtureStateUploadAppendRequest, MixtureStateUploadAppendResponse,
+	MixtureStateUploadBeginRequest, MixtureStateUploadBeginResponse,
+	MixtureStateUploadCommitRequest, MixtureStateUploadCommitResponse, OperationKind,
+	ReactionMetadataRegistration, ScalarValue, ServiceTelemetry, SimulationStage,
+	SimulationStageRequest, SimulationStageResponse, TurfAdjacencyMutation,
+	TurfHeatAdjacencyMutation, TurfHeatMutation, TurfHeatSnapshot, TurfHeatSnapshotRequest,
+	TurfHeatState, TurfLifecycleMutation, WireFireProducts, WireGasFireRole, WireGasProduct,
+	WireGasRequirement, WireHandle, WireReactionExecution, CALLBACK_BATCH_HEADER_LEN,
+	CALLBACK_EVENT_LEN, DOGMOS_ABI_VERSION, DOGMOS_PROTOCOL_VERSION, GAS_METADATA_RECORD_LEN,
+	LIFECYCLE_MUTATION_LEN, MAX_FRONTIER_APPEND_HANDLES, MAX_GAS_SLOTS, MAX_MIXTURE_SNAPSHOT_BATCH,
+	MAX_PIPENET_RECONCILE_MIXTURES, MIXTURE_ADJUSTMENT_LEN, MIXTURE_ADJUST_MULTIPLE_HEADER_LEN,
+	MIXTURE_COMMAND_REQUEST_LEN, MIXTURE_COMMAND_RESPONSE_LEN, MIXTURE_SNAPSHOT_LEN,
+	MIXTURE_SNAPSHOT_RECORD_LEN, MIXTURE_STATE_MUTATION_LEN, PIPENET_RECONCILE_SNAPSHOT_LEN,
+	REACTION_METADATA_RECORD_LEN, SERVICE_TELEMETRY_LEN, SIMULATION_STAGE_RESPONSE_LEN,
+	TURF_ADJACENCY_MUTATION_LEN, TURF_HEAT_ADJACENCY_MUTATION_LEN, TURF_HEAT_MUTATION_LEN,
+	TURF_HEAT_SNAPSHOT_LEN, TURF_LIFECYCLE_MUTATION_LEN,
 };
 use std::{
 	fs,
@@ -292,11 +292,7 @@ fn dogmos_service_telemetry() -> eyre::Result<ByondValue> {
 		SERVICE_TELEMETRY_LEN,
 		decode_production_service_telemetry,
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[auxmacros::bind("/proc/dogmos_process_metrics")]
@@ -308,11 +304,7 @@ fn dogmos_process_metrics() -> eyre::Result<ByondValue> {
 		SERVICE_TELEMETRY_LEN,
 		|response| encode_production_process_metrics(metrics, response),
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[doc(hidden)]
@@ -471,11 +463,7 @@ fn dogmos_callback_drain(fields: ByondValue) -> eyre::Result<ByondValue> {
 		response_capacity,
 		|response| decode_production_callback_batch(response, max_events, scope, transaction_id),
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[doc(hidden)]
@@ -876,11 +864,7 @@ fn dogmos_mixture_snapshot(fields: ByondValue) -> eyre::Result<ByondValue> {
 		MIXTURE_SNAPSHOT_LEN,
 		decode_production_mixture_snapshot,
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[doc(hidden)]
@@ -937,11 +921,7 @@ fn dogmos_pipenet_reconcile(entries: ByondValue) -> eyre::Result<ByondValue> {
 		response_capacity,
 		decode_production_pipenet_reconcile,
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[doc(hidden)]
@@ -1018,11 +998,7 @@ fn dogmos_mixture_snapshot_batch(entries: ByondValue) -> eyre::Result<ByondValue
 		response_capacity,
 		decode_production_mixture_snapshot_batch,
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[doc(hidden)]
@@ -1046,14 +1022,10 @@ pub fn encode_production_mixture_snapshot_batch(values: &[f32]) -> eyre::Result<
 
 #[doc(hidden)]
 pub fn decode_production_mixture_snapshot_batch(response: &[u8]) -> eyre::Result<Vec<f32>> {
-	let mut entries = Vec::new();
-	decode_mixture_snapshot_batch_response_into(
-		response,
-		MAX_MIXTURE_SNAPSHOT_BATCH as u32,
-		&mut entries,
-	)?;
+	let entries = mixture_snapshot_batch_records(response, MAX_MIXTURE_SNAPSHOT_BATCH as u32)?;
 	let mut fields = Vec::with_capacity(entries.len() * PRODUCTION_PIPENET_RESPONSE_FIELDS);
 	for entry in entries {
+		let entry = entry?;
 		fields.push(entry.handle.slot as f32);
 		fields.push(entry.handle.generation as f32);
 		append_production_mixture_snapshot(&mut fields, entry.snapshot)?;
@@ -1812,11 +1784,7 @@ fn dogmos_turf_heat_snapshot(fields: ByondValue) -> eyre::Result<ByondValue> {
 		TURF_HEAT_SNAPSHOT_LEN,
 		decode_production_turf_heat_snapshot,
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[doc(hidden)]
@@ -2125,11 +2093,7 @@ fn dogmos_simulation_stage(fields: ByondValue) -> eyre::Result<ByondValue> {
 		SIMULATION_STAGE_RESPONSE_LEN,
 		decode_production_simulation_stage,
 	)?;
-	let mut output = ByondValue::new_list()?;
-	for field in fields {
-		output.push_list(field.into())?;
-	}
-	Ok(output)
+	production_number_list(&fields)
 }
 
 #[doc(hidden)]
@@ -2777,6 +2741,23 @@ fn checked_declared_length(number: f32, field: &str) -> eyre::Result<usize> {
 		));
 	}
 	Ok(number as u32 as usize)
+}
+
+fn production_number_list(fields: &[f32]) -> eyre::Result<ByondValue> {
+	thread_local! { static VALUES: std::cell::RefCell<Vec<ByondValue>> = const { std::cell::RefCell::new(Vec::new()) }; }
+	VALUES.with(|storage| {
+		let mut values = storage
+			.try_borrow_mut()
+			.map_err(|_| eyre::eyre!("reentrant numeric list conversion"))?;
+		values.clear();
+		values.extend(fields.iter().copied().map(ByondValue::from));
+		let result = ByondValue::new_list().and_then(|output| {
+			output.write_list(&values)?;
+			Ok(output)
+		});
+		values.clear();
+		result.map_err(Into::into)
+	})
 }
 
 fn bounded_number_list(

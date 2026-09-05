@@ -49,7 +49,26 @@ pub(crate) fn guard_with_arity<T>(
 		std::mem::size_of::<ByondValue>() as u64,
 		dogmos_perf::classify_binding(binding),
 	);
-	match catch_unwind(AssertUnwindSafe(call)) {
+	let diagnostic_or_shutdown = matches!(
+		binding,
+		"/proc/dogmos_shutdown"
+			| "/proc/dogmos_perf_snapshot"
+			| "/proc/dogmos_perf_set_detailed"
+			| "/proc/dogmos_ffi_panic_count"
+			| "/proc/dogmos_callback_enqueue_failures"
+	);
+	match catch_unwind(AssertUnwindSafe(|| {
+		if !diagnostic_or_shutdown
+			&& !(binding == "/proc/auxtools_atmos_init" && auxcallback::callbacks_closed())
+		{
+			auxcallback::ensure_callbacks_healthy()?;
+		}
+		let value = call()?;
+		if !diagnostic_or_shutdown {
+			auxcallback::ensure_callbacks_healthy()?;
+		}
+		Ok(value)
+	})) {
 		Ok(Ok(value)) => {
 			telemetry.finish(1);
 			Ok(value)
@@ -80,21 +99,59 @@ pub(crate) fn ffi_panic_count() -> u64 {
 mod tests {
 	use super::{ffi_panic_count, guard_init, guard_with_arity, panic_payload_message};
 	use std::any::Any;
+	static FFI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+	#[test]
+	fn callback_failure_blocks_simulation_but_allows_shutdown_and_a_new_world() {
+		let _guard = FFI_TEST_LOCK.lock().unwrap();
+		auxcallback::begin_callbacks();
+		assert!(auxcallback::queue_callback(Box::new(|| Ok(())), usize::MAX).is_err());
+		let executed = std::cell::Cell::new(false);
+		assert!(guard_with_arity("/proc/test_simulation", 0, || {
+			executed.set(true);
+			Ok(())
+		})
+		.is_err());
+		assert!(!executed.get());
+		assert!(guard_with_arity("/proc/auxtools_atmos_init", 0, || {
+			auxcallback::begin_callbacks();
+			Ok(())
+		})
+		.is_err());
+		assert_eq!(
+			guard_with_arity("/proc/dogmos_perf_snapshot", 0, || Ok(7)).unwrap(),
+			7
+		);
+		guard_with_arity("/proc/dogmos_shutdown", 0, || {
+			auxcallback::clean_callbacks();
+			Ok(())
+		})
+		.unwrap();
+		let restarted = guard_with_arity("/proc/auxtools_atmos_init", 0, || {
+			auxcallback::begin_callbacks();
+			Ok(())
+		});
+		auxcallback::begin_callbacks();
+		assert!(restarted.is_ok());
+	}
 
 	#[test]
 	fn formats_owned_string_panic_payloads() {
+		let _guard = FFI_TEST_LOCK.lock().unwrap();
 		let payload: Box<dyn Any + Send> = Box::new(String::from("owned panic"));
 		assert_eq!(panic_payload_message(payload.as_ref()), "owned panic");
 	}
 
 	#[test]
 	fn formats_borrowed_string_panic_payloads() {
+		let _guard = FFI_TEST_LOCK.lock().unwrap();
 		let payload: Box<dyn Any + Send> = Box::new("borrowed panic");
 		assert_eq!(panic_payload_message(payload.as_ref()), "borrowed panic");
 	}
 
 	#[test]
 	fn formats_non_string_panic_payloads() {
+		let _guard = FFI_TEST_LOCK.lock().unwrap();
 		let payload: Box<dyn Any + Send> = Box::new(17_u32);
 		assert_eq!(
 			panic_payload_message(payload.as_ref()),
@@ -104,6 +161,7 @@ mod tests {
 
 	#[test]
 	fn guard_translates_panics_and_increments_telemetry() {
+		let _guard = FFI_TEST_LOCK.lock().unwrap();
 		let initial_count = ffi_panic_count();
 		let result: eyre::Result<()> =
 			guard_with_arity("/proc/test_guard", 0, || panic!("ffi panic"));
@@ -115,6 +173,7 @@ mod tests {
 
 	#[test]
 	fn init_guard_contains_panics_and_increments_telemetry() {
+		let _guard = FFI_TEST_LOCK.lock().unwrap();
 		let initial_count = ffi_panic_count();
 		guard_init("initialize_test", || panic!("init panic"));
 		assert!(ffi_panic_count() > initial_count);
@@ -122,6 +181,7 @@ mod tests {
 
 	#[test]
 	fn guard_records_exact_binding_arity_and_result() {
+		let _guard = FFI_TEST_LOCK.lock().unwrap();
 		let binding = "/proc/test_perf_guard";
 		let before = crate::DOGMOS_TELEMETRY
 			.snapshot(0)

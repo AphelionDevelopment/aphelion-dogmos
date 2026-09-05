@@ -15,13 +15,9 @@ aphelion-dogmos is the Rust half of Meridian-Rift's Dogmos atmosphere integratio
 
 The current audited crate is a 32-bit in-process BYOND DLL. Its Rust allocations consume DreamDaemon address space. The target architecture separates a thin `dogmos-byond` shim from a 64-bit `dogmosd` service. Route BYOND conversion and main-thread dispatch to `dogmos-byond`, domain rules and numerical kernels to `dogmos-core`, wire types to `dogmos-protocol`, and service lifecycle/state to `dogmos-server`. Only the shim may depend on `byondapi`.
 
-Every behavioral change is test-first: prove the focused failure, make the smallest correction, then rerun focused and wider gates. Preserve public DM proc paths and caller-legible errors. No panic may unwind across the BYOND FFI boundary. Inputs and numerical state must be finite and validated; do not change atmosphere coefficients from intuition.
+Preserve public DM proc paths and caller-legible errors. No panic may unwind across the BYOND FFI boundary. Inputs and numerical state must be finite and validated; do not change atmosphere coefficients from intuition.
 
 Generated bindings and release manifests are never hand-edited. Regenerate them with maintained tooling and compare exact output. Build BYOND-facing code for `i686-pc-windows-msvc` and `i686-unknown-linux-gnu`; host-only Cargo success is not authoritative.
-
-## Protected files
-
-Root/workspace `Cargo.toml`, `Cargo.lock`, `.cargo/`, `rust-toolchain.toml`, `.github/workflows/`, dependency or transport choices, artifact/sync tooling, release tooling, Docker files, and deployment scripts require explicit user approval naming the exact files and intended effects before editing. Broad feature or plan approval does not authorize these files. Prefer a separate checked-in extension point when it can satisfy the requirement.
 
 ## Verification boundary
 

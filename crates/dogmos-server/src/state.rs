@@ -1817,6 +1817,19 @@ impl ServiceState {
 		scope: CallbackScope,
 		transaction_id: u64,
 	) -> Result<(), StateError> {
+		let maximum = if scope == CallbackScope::Reaction {
+			maximum.min(
+				self.world.reaction_event_bound().saturating_add(
+					self.world
+						.pending_events(maximum)
+						.len()
+						.try_into()
+						.unwrap_or(u32::MAX),
+				),
+			)
+		} else {
+			maximum
+		};
 		self.prepare_callback_enqueue(maximum)?;
 		let first_sequence = match scope {
 			CallbackScope::General if transaction_id == 0 => self.next_callback_sequence,
@@ -2727,6 +2740,25 @@ mod tests {
 			}])
 			.unwrap();
 		(state, mixture, holder)
+	}
+
+	#[test]
+	fn reaction_transactions_reserve_for_the_inventory_instead_of_the_global_queue() {
+		let (mut state, _, _) = dm_reaction_state();
+		state.max_reaction_transactions = 64;
+		state.max_callback_events = 65_536;
+		for _ in 0..64 {
+			let transaction = state.begin_reaction_transaction().unwrap();
+			state
+				.reserve_world_event_enqueue_capacity(65_536, CallbackScope::Reaction, transaction)
+				.unwrap();
+			let capacity = state.reaction_callbacks[&transaction].callbacks.capacity();
+			assert!(
+				(3..=4).contains(&capacity),
+				"single-reaction reservation grew to {capacity}"
+			);
+		}
+		assert_eq!(state.pending_callback_count, 0);
 	}
 
 	#[test]

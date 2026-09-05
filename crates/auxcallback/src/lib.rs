@@ -3,7 +3,7 @@ use coarsetime::{Duration, Instant};
 use eyre::Result;
 use std::convert::TryInto;
 use std::sync::{
-	atomic::{AtomicUsize, Ordering},
+	atomic::{AtomicBool, AtomicUsize, Ordering},
 	RwLock,
 };
 
@@ -27,12 +27,18 @@ static CALLBACK_QUEUE_DEPTH_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 static CALLBACK_OWNED_BYTES_CURRENT: AtomicUsize = AtomicUsize::new(0);
 static CALLBACK_OWNED_BYTES_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 static CALLBACK_OWNED_BYTES_ENQUEUED: AtomicUsize = AtomicUsize::new(0);
+/// Maximum queued callbacks in the legacy 32-bit backend.
+pub const MAX_CALLBACK_ITEMS: usize = 65_536;
+/// Maximum producer-accounted callback storage; excludes allocator overhead.
+pub const MAX_CALLBACK_ACCOUNTED_BYTES: usize = 32 * 1024 * 1024;
+static CALLBACK_FAILED: AtomicBool = AtomicBool::new(false);
 static CALLBACK_STATE: RwLock<bool> = RwLock::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueCallbackError {
 	ShuttingDown,
 	Disconnected,
+	CapacityExceeded,
 }
 
 impl std::fmt::Display for QueueCallbackError {
@@ -55,6 +61,11 @@ pub struct CallbackMetrics {
 	pub enqueue_failures: usize,
 }
 
+/// Returns whether teardown has closed admission for the previous world.
+pub fn callbacks_closed() -> bool {
+	!*CALLBACK_STATE.read().expect("callback state lock poisoned")
+}
+
 /// Reopens the main-thread callback queue for a new BYOND world.
 pub fn begin_callbacks() {
 	let mut state = CALLBACK_STATE
@@ -63,6 +74,7 @@ pub fn begin_callbacks() {
 	if let Some((_, receiver)) = CALLBACK_CHANNEL.get() {
 		receiver.drain().for_each(std::mem::drop);
 	}
+	CALLBACK_FAILED.store(false, Ordering::Release);
 	CALLBACK_ENQUEUE_FAILURES.store(0, Ordering::Relaxed);
 	CALLBACK_ITEMS_ENQUEUED.store(0, Ordering::Relaxed);
 	CALLBACK_ITEMS_DRAINED.store(0, Ordering::Relaxed);
@@ -87,7 +99,9 @@ pub fn clean_callbacks() {
 }
 
 fn with_callback_receiver<T>(f: impl Fn(&flume::Receiver<DeferredCallback>) -> T) -> T {
-	f(&CALLBACK_CHANNEL.get_or_init(flume::unbounded).1)
+	f(&CALLBACK_CHANNEL
+		.get_or_init(|| flume::bounded(MAX_CALLBACK_ITEMS))
+		.1)
 }
 
 fn saturating_add(counter: &AtomicUsize, value: usize) -> usize {
@@ -109,18 +123,32 @@ fn release_owned_bytes(bytes: usize) {
 
 /// Queues a main-thread callback without silently discarding it when the channel is healthy.
 ///
-/// The callback channel is unbounded, so a live server cannot lose work to queue capacity. Once
-/// teardown begins, new callbacks are rejected and counted instead of being silently discarded.
+/// Overflow latches a fatal error until the next world. Producers never block the main thread,
+/// and the FFI boundary rejects further simulation work after a critical callback is rejected.
 pub fn queue_callback(
 	callback: DeferredFunc,
 	owned_bytes: usize,
 ) -> std::result::Result<(), QueueCallbackError> {
-	let state = CALLBACK_STATE.read().expect("callback state lock poisoned");
+	let state = CALLBACK_STATE
+		.write()
+		.expect("callback state lock poisoned");
 	if !*state {
 		saturating_add(&CALLBACK_ENQUEUE_FAILURES, 1);
 		return Err(QueueCallbackError::ShuttingDown);
 	}
 	let owned_bytes_lower_bound = owned_bytes.saturating_add(std::mem::size_of::<DeferredFunc>());
+	if CALLBACK_FAILED.load(Ordering::Acquire)
+		|| CALLBACK_CHANNEL
+			.get()
+			.is_some_and(|channel| channel.0.len() >= MAX_CALLBACK_ITEMS)
+		|| owned_bytes_lower_bound
+			> MAX_CALLBACK_ACCOUNTED_BYTES
+				.saturating_sub(CALLBACK_OWNED_BYTES_CURRENT.load(Ordering::Relaxed))
+	{
+		CALLBACK_FAILED.store(true, Ordering::Release);
+		saturating_add(&CALLBACK_ENQUEUE_FAILURES, 1);
+		return Err(QueueCallbackError::CapacityExceeded);
+	}
 	let current_owned_bytes =
 		saturating_add(&CALLBACK_OWNED_BYTES_CURRENT, owned_bytes_lower_bound);
 	let envelope = DeferredCallback {
@@ -128,13 +156,14 @@ pub fn queue_callback(
 		owned_bytes_lower_bound,
 	};
 	if CALLBACK_CHANNEL
-		.get_or_init(flume::unbounded)
+		.get_or_init(|| flume::bounded(MAX_CALLBACK_ITEMS))
 		.0
-		.send(envelope)
+		.try_send(envelope)
 		.is_err()
 	{
 		release_owned_bytes(owned_bytes_lower_bound);
 		saturating_add(&CALLBACK_ENQUEUE_FAILURES, 1);
+		CALLBACK_FAILED.store(true, Ordering::Release);
 		Err(QueueCallbackError::Disconnected)
 	} else {
 		saturating_add(&CALLBACK_ITEMS_ENQUEUED, 1);
@@ -144,6 +173,14 @@ pub fn queue_callback(
 		CALLBACK_QUEUE_DEPTH_HIGH_WATER.fetch_max(depth, Ordering::Relaxed);
 		Ok(())
 	}
+}
+
+/// Rejects simulation after callback capacity or transport failure until world reinitialization.
+pub fn ensure_callbacks_healthy() -> Result<()> {
+	if CALLBACK_FAILED.load(Ordering::Acquire) {
+		return Err(eyre::eyre!("Dogmos legacy callback queue failed: capacity exceeded or disconnected; atmosphere processing is stopped until world restart"));
+	}
+	Ok(())
 }
 
 /// Returns the number of callbacks rejected because the main-thread queue was already closed.
@@ -178,23 +215,35 @@ fn report_callback_error(error: impl std::fmt::Debug) {
 
 /// Runs every outstanding callback.
 fn process_callbacks() {
+	if ensure_callbacks_healthy().is_err() {
+		return;
+	}
 	with_callback_receiver(|receiver| {
-		receiver
-			.try_iter()
-			.filter_map(|callback| {
-				release_owned_bytes(callback.owned_bytes_lower_bound);
-				saturating_add(&CALLBACK_ITEMS_DRAINED, 1);
-				(callback.callback)().err()
-			})
-			.for_each(report_callback_error)
+		for callback in receiver.try_iter() {
+			release_owned_bytes(callback.owned_bytes_lower_bound);
+			if CALLBACK_FAILED.load(Ordering::Acquire) {
+				break;
+			}
+			saturating_add(&CALLBACK_ITEMS_DRAINED, 1);
+			if let Err(error) = (callback.callback)() {
+				report_callback_error(error);
+			}
+		}
 	})
 }
 
 /// Runs callbacks until the time limit is reached.
 fn process_callbacks_for(duration: Duration) -> bool {
+	if ensure_callbacks_healthy().is_err() {
+		return false;
+	}
 	let timer = Instant::now();
 	with_callback_receiver(|receiver| {
 		for callback in receiver.try_iter() {
+			if CALLBACK_FAILED.load(Ordering::Acquire) {
+				release_owned_bytes(callback.owned_bytes_lower_bound);
+				return false;
+			}
 			release_owned_bytes(callback.owned_bytes_lower_bound);
 			saturating_add(&CALLBACK_ITEMS_DRAINED, 1);
 			if let Err(e) = (callback.callback)() {
@@ -225,6 +274,7 @@ pub fn process_callbacks_for_millis(millis: u64) -> bool {
 /// }
 /// ```
 pub fn callback_processing_hook(time_remaining: ByondValue) -> Result<ByondValue> {
+	ensure_callbacks_healthy()?;
 	if time_remaining.is_num() {
 		let limit = time_remaining.get_number()?.max(0.0) as u64;
 		Ok(process_callbacks_for_millis(limit).into())
@@ -243,6 +293,43 @@ mod tests {
 	};
 
 	static CALLBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+	#[test]
+	fn callback_capacity_is_exact_and_failure_prevents_queued_execution() {
+		let _guard = CALLBACK_TEST_LOCK.lock().unwrap();
+		begin_callbacks();
+		let executed = Arc::new(AtomicUsize::new(0));
+		let capture = Arc::clone(&executed);
+		queue_callback(
+			Box::new(move || {
+				capture.fetch_add(1, Ordering::SeqCst);
+				Ok(())
+			}),
+			MAX_CALLBACK_ACCOUNTED_BYTES - std::mem::size_of::<DeferredFunc>(),
+		)
+		.unwrap();
+		assert_eq!(
+			queue_callback(Box::new(|| Ok(())), 1),
+			Err(QueueCallbackError::CapacityExceeded)
+		);
+		process_callbacks();
+		assert_eq!(executed.load(Ordering::SeqCst), 0);
+		assert!(ensure_callbacks_healthy().is_err());
+		clean_callbacks();
+		begin_callbacks();
+		assert!(ensure_callbacks_healthy().is_ok());
+		for _ in 0..MAX_CALLBACK_ITEMS {
+			queue_callback(Box::new(|| Ok(())), 0).unwrap();
+		}
+		assert_eq!(callback_metrics().queue_depth, MAX_CALLBACK_ITEMS);
+		assert_eq!(
+			queue_callback(Box::new(|| Ok(())), 0),
+			Err(QueueCallbackError::CapacityExceeded)
+		);
+		assert_eq!(callback_metrics().queue_depth, MAX_CALLBACK_ITEMS);
+		clean_callbacks();
+		begin_callbacks();
+	}
 
 	#[test]
 	fn queued_callbacks_are_delivered_in_order() {
@@ -338,14 +425,16 @@ mod tests {
 		begin_callbacks();
 		CALLBACK_ITEMS_ENQUEUED.store(usize::MAX, Ordering::Relaxed);
 		CALLBACK_ITEMS_DRAINED.store(usize::MAX, Ordering::Relaxed);
-		queue_callback(Box::new(|| Ok(())), usize::MAX).unwrap();
-
-		let saturated = callback_metrics();
-		assert_eq!(saturated.items_enqueued, usize::MAX);
-		assert_eq!(saturated.owned_bytes_lower_bound_current, usize::MAX);
-		assert_eq!(saturated.owned_bytes_lower_bound_high_water, usize::MAX);
-		assert_eq!(saturated.owned_bytes_lower_bound_enqueued, usize::MAX);
-
+		assert_eq!(
+			queue_callback(Box::new(|| Ok(())), usize::MAX),
+			Err(QueueCallbackError::CapacityExceeded)
+		);
+		assert!(ensure_callbacks_healthy().is_err());
+		assert_eq!(
+			queue_callback(Box::new(|| Ok(())), 0),
+			Err(QueueCallbackError::CapacityExceeded)
+		);
+		assert_eq!(callback_metrics().owned_bytes_lower_bound_current, 0);
 		clean_callbacks();
 		assert_eq!(callback_metrics().owned_bytes_lower_bound_current, 0);
 		begin_callbacks();

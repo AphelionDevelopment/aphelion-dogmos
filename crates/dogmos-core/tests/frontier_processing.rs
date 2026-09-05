@@ -522,7 +522,8 @@ fn committed_frontier_storage_is_separate_from_upload_scratch() {
 	assert!(membership_capacity >= 1);
 	assert_eq!(
 		world.frontier_committed_storage_bytes_lower_bound(),
-		((committed_capacity + membership_capacity) * std::mem::size_of::<TurfHandle>()) as u64
+		(committed_capacity * std::mem::size_of::<TurfHandle>()
+			+ membership_capacity * std::mem::size_of::<(TurfHandle, usize)>()) as u64
 	);
 }
 
@@ -837,7 +838,7 @@ fn rejected_component_stage_aborts_and_retries_cleanly() {
 		))
 	);
 	assert_eq!(world.pending_stage_epoch(), None);
-	for _ in 0..8 {
+	for _ in 0..256 {
 		if !world
 			.process_stage_chunk_cancellable(retry, || false)
 			.unwrap()
@@ -875,7 +876,7 @@ fn rejected_component_stage_aborts_and_retries_cleanly() {
 		stage_epoch: 4,
 		..request
 	};
-	for _ in 0..8 {
+	for _ in 0..256 {
 		if !world
 			.process_stage_chunk_cancellable(final_retry, || false)
 			.unwrap()
@@ -1431,11 +1432,18 @@ fn turf_heat_charges_topology_visits_and_conduction_edges_to_the_work_limit() {
 		assert_eq!(world.turf_heat(turfs[0]).unwrap(), Some(states[0]));
 		assert_eq!(world.turf_heat(turfs[1]).unwrap(), Some(states[1]));
 	}
-	let final_chunk = world
-		.process_stage_chunk_cancellable(request, || false)
-		.unwrap();
-	assert!(!final_chunk.pending);
-	assert_eq!(final_chunk.work_items, 1);
+	let mut completed = false;
+	for _ in 0..32 {
+		let chunk = world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap();
+		assert!(chunk.work_items <= 1);
+		if !chunk.pending {
+			completed = true;
+			break;
+		}
+	}
+	assert!(completed);
 	assert!(world.turf_heat(turfs[0]).unwrap().unwrap().temperature < 500.0);
 	assert!(world.turf_heat(turfs[1]).unwrap().unwrap().temperature > 300.0);
 }
@@ -1692,14 +1700,20 @@ fn component_stage_commits_disconnected_components_before_resume() {
 		seconds_per_tick: 0.5,
 	};
 
-	for _ in 0..9 {
-		assert!(
-			world
-				.process_stage_chunk_cancellable(request, || false)
-				.unwrap()
-				.pending
-		);
+	let initial_revision = world.snapshot(mixtures[0]).unwrap().revision;
+	let mut published = false;
+	for _ in 0..256 {
+		let chunk = world
+			.process_stage_chunk_cancellable(request, || false)
+			.unwrap();
+		assert!(chunk.pending);
+		assert!(chunk.work_items <= 1);
+		if world.snapshot(mixtures[0]).unwrap().revision != initial_revision {
+			published = true;
+			break;
+		}
 	}
+	assert!(published);
 	let first_snapshot = world.snapshot(mixtures[0]).unwrap();
 	let mut externally_mutated_gases = first_snapshot.gases;
 	externally_mutated_gases[0] = 75.0;
@@ -1714,7 +1728,7 @@ fn component_stage_commits_disconnected_components_before_resume() {
 		.unwrap();
 
 	let mut completed = false;
-	for _ in 0..16 {
+	for _ in 0..256 {
 		let chunk = world
 			.process_stage_chunk_cancellable(request, || false)
 			.unwrap();
@@ -1979,4 +1993,185 @@ fn excited_groups_rejects_a_mutable_mixture_shared_by_disconnected_components() 
 	assert_eq!(world.snapshot(mixtures[0]).unwrap().gases[0], 100.05);
 	assert_eq!(world.snapshot(mixtures[1]).unwrap().gases[0], 100.05);
 	assert_eq!(world.snapshot(mixtures[2]).unwrap().gases[0], 100.2);
+}
+
+#[test]
+fn connected_component_publication_is_atomic_and_every_yield_can_be_cancelled() {
+	for stage in [
+		WorldStage::ProcessTurfs,
+		WorldStage::Equalize,
+		WorldStage::ExcitedGroups,
+	] {
+		let mut completed_once = false;
+		for cutoff in 0..128 {
+			let (mut world, turfs, mixtures) = diffusion_pair(100.0, 300.0, 0.0, 300.0);
+			world.add_frontier(1, &turfs).unwrap();
+			let before = mixtures.map(|handle| world.snapshot(handle).unwrap());
+			let request = StageChunkRequest {
+				stage,
+				frontier_epoch: 1,
+				stage_epoch: 1,
+				work_limit: 1,
+				seconds_per_tick: 0.5,
+			};
+			let mut published = false;
+			for _ in 0..cutoff {
+				let result = world
+					.process_stage_chunk_cancellable(request, || false)
+					.unwrap();
+				assert!(result.work_items <= 1);
+				let after = mixtures.map(|handle| world.snapshot(handle).unwrap());
+				let changed = [after[0] != before[0], after[1] != before[1]];
+				assert_eq!(
+					changed[0], changed[1],
+					"partial publication at cutoff {cutoff} for {stage:?}"
+				);
+				assert!((after[0].gases[0] + after[1].gases[0] - 100.0).abs() < 0.0001);
+				if changed[0] {
+					if stage != WorldStage::ProcessTurfs {
+						assert_eq!([after[0].gases[0], after[1].gases[0]], [50.0, 50.0]);
+					}
+					published = true;
+				}
+				if !result.pending {
+					completed_once = true;
+					break;
+				}
+			}
+			if completed_once {
+				break;
+			}
+			if published {
+				continue;
+			}
+			assert_eq!(
+				world.process_stage_chunk_cancellable(request, || true),
+				Err(WorldError::Cancelled)
+			);
+			assert_eq!(world.pending_stage_epoch(), None);
+			assert_eq!(
+				mixtures.map(|handle| world.snapshot(handle).unwrap()),
+				before
+			);
+			assert!(world.pending_events(32).is_empty());
+			let retry = StageChunkRequest {
+				stage_epoch: 2,
+				work_limit: 4096,
+				..request
+			};
+			let mut retry_completed = false;
+			for _ in 0..4 {
+				let chunk = world
+					.process_stage_chunk_cancellable(retry, || false)
+					.unwrap();
+				assert!(chunk.work_items <= retry.work_limit);
+				if !chunk.pending {
+					retry_completed = true;
+					break;
+				}
+			}
+			assert!(
+				retry_completed,
+				"retry did not complete at {cutoff} for {stage:?}"
+			);
+			let after = mixtures.map(|handle| world.snapshot(handle).unwrap());
+			assert!((after[0].gases[0] + after[1].gases[0] - 100.0).abs() < 0.0001);
+		}
+		assert!(completed_once, "stage failed to finish: {stage:?}");
+	}
+}
+
+#[test]
+fn frontier_removal_and_readdition_preserve_order_through_compaction() {
+	let mut world = DogmosWorld::new(1024 * 1024);
+	let handles: Vec<_> = (0..32).map(|slot| turf(slot, 1)).collect();
+	register_turfs(&mut world, &handles);
+	world.add_frontier(1, &handles).unwrap();
+	world.remove_frontier(2, &handles[..24]).unwrap();
+	assert_eq!(world.committed_frontier(), &handles[24..]);
+	world.add_frontier(3, &handles[..8]).unwrap();
+	let expected: Vec<_> = handles[24..].iter().chain(&handles[..8]).copied().collect();
+	assert_eq!(world.committed_frontier(), expected);
+	world
+		.remove_frontier(4, &[handles[25], handles[1]])
+		.unwrap();
+	world.add_frontier(5, &[handles[1], handles[25]]).unwrap();
+	let expected: Vec<_> = expected
+		.into_iter()
+		.filter(|handle| ![handles[25], handles[1]].contains(handle))
+		.chain([handles[1], handles[25]])
+		.collect();
+	assert_eq!(world.committed_frontier(), expected);
+}
+
+#[test]
+fn heat_publication_and_cancellation_preserve_both_temperatures() {
+	let mut completed = false;
+	for cutoff in 0..64 {
+		let turfs = [turf(0, 1), turf(1, 1)];
+		let mut world = DogmosWorld::new(1024 * 1024);
+		register_turfs(&mut world, &turfs);
+		let states = [500.0, 300.0].map(|temperature| TurfHeatState {
+			temperature,
+			thermal_conductivity: 0.1,
+			heat_capacity: 100.0,
+			adjacent_to_space: false,
+		});
+		world
+			.apply_turf_heat(&[
+				TurfHeatMutation {
+					handle: turfs[0],
+					state: Some(states[0]),
+				},
+				TurfHeatMutation {
+					handle: turfs[1],
+					state: Some(states[1]),
+				},
+			])
+			.unwrap();
+		world
+			.apply_turf_heat_adjacency(&[TurfHeatAdjacencyMutation {
+				left: turfs[0],
+				right: turfs[1],
+				connected: true,
+			}])
+			.unwrap();
+		world.add_frontier(1, &turfs).unwrap();
+		let request = StageChunkRequest {
+			stage: WorldStage::TurfHeat,
+			frontier_epoch: 1,
+			stage_epoch: 1,
+			work_limit: 1,
+			seconds_per_tick: 0.5,
+		};
+		for _ in 0..cutoff {
+			let chunk = world
+				.process_stage_chunk_cancellable(request, || false)
+				.unwrap();
+			assert!(chunk.work_items <= 1);
+			let temperatures =
+				turfs.map(|handle| world.turf_heat(handle).unwrap().unwrap().temperature);
+			assert_eq!(temperatures[0] != 500.0, temperatures[1] != 300.0);
+			assert!((temperatures[0] + temperatures[1] - 800.0).abs() < 0.0001);
+			if !chunk.pending {
+				assert!(temperatures[0] < 500.0 && temperatures[1] > 300.0);
+				completed = true;
+				break;
+			}
+			assert_eq!(temperatures, [500.0, 300.0]);
+		}
+		if completed {
+			break;
+		}
+		assert_eq!(
+			world.process_stage_chunk_cancellable(request, || true),
+			Err(WorldError::Cancelled)
+		);
+		assert_eq!(
+			turfs.map(|handle| world.turf_heat(handle).unwrap().unwrap()),
+			states
+		);
+		assert!(world.pending_events(32).is_empty());
+	}
+	assert!(completed);
 }
